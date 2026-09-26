@@ -40,27 +40,66 @@ func main() {
 		list      = flag.Bool("list", false, "list files in the torrent and exit")
 		noPlay    = flag.Bool("no-play", false, "don't launch IINA, just serve the stream")
 		readahead = flag.Int64("readahead", 32<<20, "bytes to prioritize ahead of the read position")
+		user      = flag.String("user", "", "only search torrents from this nyaa uploader (name or profile URL)")
+		trusted   = flag.Bool("trusted", false, "only search torrents from trusted nyaa uploaders")
+		print     = flag.Bool("print", false, "print nyaa results for the search terms and exit")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <magnet | file.torrent | http(s) url>\n\nFlags:\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage:\n  %[1]s [flags] [search terms]                      search nyaa.si\n  %[1]s [flags] <magnet | file.torrent | http(s) url>\n\nFlags:\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if flag.NArg() != 1 {
-		flag.Usage()
-		os.Exit(2)
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, flag.Arg(0), options{
-		port: *port, dir: *dir, keep: *keep, index: *index,
-		list: *list, noPlay: *noPlay, readahead: *readahead,
-	}); err != nil && !errors.Is(err, context.Canceled) {
+	if *print {
+		printResults(ctx, os.Stdout, strings.Join(flag.Args(), " "), nyaaUser(*user), *trusted)
+		return
+	}
+
+	err := func() error {
+		source := strings.Join(flag.Args(), " ")
+		if !isTorrentSource(source) {
+			var err error
+			if source, err = searchInteractive(ctx, source, nyaaUser(*user), *trusted); err != nil {
+				return err
+			}
+		}
+		return run(ctx, source, options{
+			port: *port, dir: *dir, keep: *keep, index: *index,
+			list: *list, noPlay: *noPlay, readahead: *readahead,
+		})
+	}()
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errNoSelection) {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// nyaaUser accepts an uploader name or a profile URL such as
+// https://nyaa.si/user/NAME and returns the name.
+func nyaaUser(s string) string {
+	s = strings.TrimRight(s, "/")
+	if i := strings.LastIndex(s, "/user/"); i >= 0 {
+		s = s[i+len("/user/"):]
+	}
+	return s
+}
+
+// isTorrentSource reports whether s is something addTorrent can load rather
+// than search terms.
+func isTorrentSource(s string) bool {
+	for _, prefix := range []string{"magnet:", "http://", "https://"} {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	if !strings.HasSuffix(s, ".torrent") {
+		return false
+	}
+	_, err := os.Stat(s)
+	return err == nil
 }
 
 type options struct {
