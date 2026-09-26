@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -86,6 +87,7 @@ func run(ctx context.Context, source string, opts options) error {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = dataDir
 	cfg.ListenPort = 0
+	cfg.Slogger = slog.New(quietHandler{slog.NewTextHandler(clearLineWriter{os.Stderr}, &slog.HandlerOptions{Level: slog.LevelWarn})})
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
 		return fmt.Errorf("creating torrent client: %w", err)
@@ -235,6 +237,45 @@ func launchIINA(ctx context.Context, streamURL string) error {
 	cmd := exec.CommandContext(ctx, bin, "--no-stdin", "--keep-running", streamURL)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	return cmd.Run()
+}
+
+// quietHandler drops library log records caused by a cancelled context. The
+// torrent reader logs every aborted read as an error, which happens routinely
+// when the player closes a connection to seek.
+type quietHandler struct{ slog.Handler }
+
+func (h quietHandler) Handle(ctx context.Context, r slog.Record) error {
+	canceled := false
+	r.Attrs(func(a slog.Attr) bool {
+		if err, ok := a.Value.Any().(error); ok && errors.Is(err, context.Canceled) {
+			canceled = true
+			return false
+		}
+		return true
+	})
+	if canceled {
+		return nil
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h quietHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return quietHandler{h.Handler.WithAttrs(attrs)}
+}
+
+func (h quietHandler) WithGroup(name string) slog.Handler {
+	return quietHandler{h.Handler.WithGroup(name)}
+}
+
+// clearLineWriter clears the status line before each write so log output
+// doesn't get appended to it.
+type clearLineWriter struct{ w io.Writer }
+
+func (c clearLineWriter) Write(p []byte) (int, error) {
+	if _, err := io.WriteString(c.w, "\r\033[K"); err != nil {
+		return 0, err
+	}
+	return c.w.Write(p)
 }
 
 func humanBytes(n int64) string {
