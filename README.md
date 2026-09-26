@@ -10,6 +10,13 @@ go build -o peerflix .
 ./peerflix https://example.com/movie.torrent
 ```
 
+## Install
+
+```sh
+go install .                                # builds ~/go/bin/peerflix
+ln -s (pwd)/completions/peerflix.fish ~/.config/fish/completions/   # fish completions
+```
+
 ## Search nyaa.si
 
 ```sh
