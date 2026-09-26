@@ -153,6 +153,17 @@ func run(ctx context.Context, source string, opts options) error {
 	}
 	// Fetch the rest of the file in the background; readers still take priority.
 	file.Download()
+	if opts.dir != "" && file.BytesCompleted() < file.Length() {
+		// Pieces in a .part file left by an earlier run start out incomplete;
+		// rehash them so they're reused instead of downloaded again.
+		go func() {
+			for i := file.BeginPieceIndex(); i < file.EndPieceIndex(); i++ {
+				if t.Piece(i).VerifyDataContext(ctx) != nil {
+					return
+				}
+			}
+		}()
+	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", opts.port))
 	if err != nil {
