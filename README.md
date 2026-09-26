@@ -2,28 +2,31 @@
 
 Stream a torrent straight into [IINA](https://iina.io).
 
-```sh
-go build -o peerflix .
-./peerflix
-./peerflix 'magnet:?xt=urn:btih:...'
-./peerflix movie.torrent
-./peerflix https://example.com/movie.torrent
-```
-
 ## Install
 
 ```sh
 go install .                                # builds ~/go/bin/peerflix
+fish_add_path ~/go/bin                      # if it isn't on your PATH yet
 ln -s (pwd)/completions/peerflix.fish ~/.config/fish/completions/   # fish completions
+```
+
+To try it without installing, `go build -o peerflix .` and run `./peerflix`.
+
+## Usage
+
+```sh
+peerflix 'magnet:?xt=urn:btih:...'
+peerflix movie.torrent
+peerflix https://example.com/movie.torrent
 ```
 
 ## Search nyaa.si
 
 ```sh
-./peerflix                                  # type to search
-./peerflix big buck bunny                   # start with a query
-./peerflix -user NAME                       # browse/search one uploader
-./peerflix -user NAME QUERY
+peerflix                                  # type to search
+peerflix big buck bunny                   # start with a query
+peerflix -user NAME                       # browse/search one uploader
+peerflix -user NAME QUERY
 ```
 
 Search runs in [fzf](https://github.com/junegunn/fzf) 0.60 or later, which must be on your
@@ -32,7 +35,7 @@ Search runs in [fzf](https://github.com/junegunn/fzf) 0.60 or later, which must 
 `-print` writes the results for the search terms as `URL<TAB>columns` lines, so you can pipe them into your own tools:
 
 ```sh
-./peerflix -print big buck bunny | fzf --ansi -d '\t' --with-nth 2.. --nth 2 --accept-nth 1 | xargs ./peerflix
+peerflix -print big buck bunny | fzf --ansi -d '\t' --with-nth 2.. --nth 2 --accept-nth 1 | xargs peerflix
 ```
 
 Flags:
