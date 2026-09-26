@@ -33,16 +33,14 @@ var videoExts = []string{".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v", ".wmv"
 
 func main() {
 	var (
-		port      = flag.Int("port", 8888, "HTTP port to serve the stream on (0 = random)")
-		dir       = flag.String("dir", "", "download directory (default: temporary dir, removed on exit)")
-		keep      = flag.Bool("keep", false, "keep downloaded data on exit")
-		index     = flag.Int("index", -1, "file index to stream (default: largest video file)")
-		list      = flag.Bool("list", false, "list files in the torrent and exit")
-		noPlay    = flag.Bool("no-play", false, "don't launch IINA, just serve the stream")
-		readahead = flag.Int64("readahead", 32<<20, "bytes to prioritize ahead of the read position")
-		user      = flag.String("user", "", "only search torrents from this nyaa uploader (name or profile URL)")
-		trusted   = flag.Bool("trusted", false, "only search torrents from trusted nyaa uploaders")
-		print     = flag.Bool("print", false, "print nyaa results for the search terms and exit")
+		port    = flag.Int("port", 8888, "HTTP port to serve the stream on (0 = random)")
+		dir     = flag.String("dir", "", "download directory (default: temporary dir, removed on exit)")
+		index   = flag.Int("index", -1, "file index to stream (default: largest video file)")
+		list    = flag.Bool("list", false, "list files in the torrent and exit")
+		noPlay  = flag.Bool("no-play", false, "don't launch IINA, just serve the stream")
+		user    = flag.String("user", "", "only search torrents from this nyaa uploader (name or profile URL)")
+		trusted = flag.Bool("trusted", false, "only search torrents from trusted nyaa uploaders")
+		print   = flag.Bool("print", false, "print nyaa results for the search terms and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n  %[1]s [flags] [search terms]                      search nyaa.si\n  %[1]s [flags] <magnet | file.torrent | http(s) url>\n\nFlags:\n", os.Args[0])
@@ -67,8 +65,8 @@ func main() {
 			}
 		}
 		return run(ctx, source, options{
-			port: *port, dir: *dir, keep: *keep, index: *index,
-			list: *list, noPlay: *noPlay, readahead: *readahead,
+			port: *port, dir: *dir, index: *index,
+			list: *list, noPlay: *noPlay,
 		})
 	}()
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errNoSelection) {
@@ -105,9 +103,7 @@ func isTorrentSource(s string) bool {
 type options struct {
 	port, index  int
 	dir          string
-	keep         bool
 	list, noPlay bool
-	readahead    int64
 }
 
 func run(ctx context.Context, source string, opts options) error {
@@ -118,9 +114,7 @@ func run(ctx context.Context, source string, opts options) error {
 			return err
 		}
 		dataDir = tmp
-		if !opts.keep {
-			defer os.RemoveAll(tmp)
-		}
+		defer os.RemoveAll(tmp)
 	}
 
 	cfg := torrent.NewDefaultClientConfig()
@@ -167,7 +161,7 @@ func run(ctx context.Context, source string, opts options) error {
 	name := path.Base(file.DisplayPath())
 	streamURL := fmt.Sprintf("http://%s/%s", ln.Addr(), url.PathEscape(name))
 
-	srv := &http.Server{Handler: streamHandler(file, name, opts.readahead)}
+	srv := &http.Server{Handler: streamHandler(file, name)}
 	go srv.Serve(ln)
 	defer srv.Close()
 
@@ -253,13 +247,14 @@ func pickFile(files []*torrent.File, index int) (*torrent.File, error) {
 	return best, nil
 }
 
-func streamHandler(file *torrent.File, name string, readahead int64) http.Handler {
+func streamHandler(file *torrent.File, name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reader := file.NewReader()
 		defer reader.Close()
 		reader.SetContext(r.Context())
 		reader.SetResponsive()
-		reader.SetReadahead(readahead)
+		// The default readahead grows with the bytes read since the last
+		// seek: seeks fetch just what's needed, steady playback buffers more.
 		http.ServeContent(w, r, name, time.Time{}, reader.(io.ReadSeeker))
 	})
 }
