@@ -1,0 +1,35 @@
+[package]
+name = "peerflix"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+description = "Stream a torrent straight into IINA"
+repository = "https://github.com/melkir/peerflix"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+# rust-tls instead of the default native-tls, so Linux builds don't need OpenSSL.
+librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
+# The same major version and TLS backend as librqbit, so it's linked once.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "query"] }
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "process", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+[profile.release]
+# Optimize for size: the work is network and disk bound, and hashing runs in
+# aws-lc's assembly either way.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

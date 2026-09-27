@@ -1,0 +1,7 @@
+# `cargo release patch|minor|major --execute` bumps the version, commits,
+# tags vX.Y.Z and pushes; the tag triggers .github/workflows/release.yml,
+# which builds the binaries and creates the GitHub release.
+allow-branch = ["main"]
+publish = false
+tag-name = "v{{version}}"
+pre-release-commit-message = "Release v{{version}}"
