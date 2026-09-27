@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -58,7 +59,7 @@ func fakeNyaa(t *testing.T, handler http.HandlerFunc) *[]map[string]string {
 
 func TestSearchNyaa(t *testing.T) {
 	queries := fakeNyaa(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(sampleFeed))
+		fmt.Fprint(w, sampleFeed)
 	})
 	items, err := searchNyaa(t.Context(), "big buck bunny", "someone", true)
 	if err != nil {
@@ -87,7 +88,7 @@ func TestSearchNyaa(t *testing.T) {
 
 func TestSearchNyaaDefaults(t *testing.T) {
 	queries := fakeNyaa(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(sampleFeed))
+		fmt.Fprint(w, sampleFeed)
 	})
 	if _, err := searchNyaa(t.Context(), "", "", false); err != nil {
 		t.Fatal(err)
@@ -121,7 +122,7 @@ func TestInvalidItemDate(t *testing.T) {
 }
 
 func TestPrintResults(t *testing.T) {
-	fakeNyaa(t, func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(sampleFeed)) })
+	fakeNyaa(t, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, sampleFeed) })
 	var buf bytes.Buffer
 	printResults(t.Context(), &buf, "bunny", "", false)
 	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")

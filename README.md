@@ -1,5 +1,7 @@
 # peerflix
 
+[![CI](https://github.com/melkir/peerflix/actions/workflows/ci.yml/badge.svg)](https://github.com/melkir/peerflix/actions/workflows/ci.yml)
+
 Stream a torrent straight into [IINA](https://iina.io).
 
 ## Install
@@ -8,6 +10,8 @@ Stream a torrent straight into [IINA](https://iina.io).
 go install github.com/melkir/peerflix@latest   # builds ~/go/bin/peerflix
 fish_add_path ~/go/bin                         # if it isn't on your PATH yet
 ```
+
+Or download a prebuilt binary from [Releases](https://github.com/melkir/peerflix/releases).
 
 From a clone, `go install .` does the same, and
 `ln -s (pwd)/completions/peerflix.fish ~/.config/fish/completions/` adds fish completions.
@@ -51,5 +55,15 @@ Flags:
 | `-trusted` | false | only search trusted nyaa uploads |
 | `-print` | | print search results and exit |
 | `-user NAME` | | restrict search to a nyaa uploader (name or profile URL) |
+| `-version` | | print the version and exit |
 
 peerflix exits when IINA quits (or on Ctrl-C) and removes the temp data unless `-dir` is set.
+
+## Releasing
+
+Push a version tag and GitHub Actions publishes binaries for macOS and Linux with
+[GoReleaser](https://goreleaser.com):
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```

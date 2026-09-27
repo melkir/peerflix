@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"syscall"
@@ -28,6 +29,9 @@ import (
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 )
+
+// version is set at release time with -ldflags "-X main.version=...".
+var version string
 
 var videoExts = []string{".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v", ".wmv", ".flv", ".ts", ".m2ts", ".mpg", ".mpeg"}
 
@@ -41,12 +45,18 @@ func main() {
 		user    = flag.String("user", "", "only search torrents from this nyaa uploader (name or profile URL)")
 		trusted = flag.Bool("trusted", false, "only search torrents from trusted nyaa uploaders")
 		print   = flag.Bool("print", false, "print nyaa results for the search terms and exit")
+		showVer = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n  %[1]s [flags] [search terms]                      search nyaa.si\n  %[1]s [flags] <magnet | file.torrent | http(s) url>\n\nFlags:\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *showVer {
+		fmt.Println("peerflix", buildVersion())
+		return
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -73,6 +83,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// buildVersion returns the release version, or the module version recorded
+// by `go install github.com/melkir/peerflix@vX`.
+func buildVersion() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
+		return info.Main.Version
+	}
+	return "(devel)"
 }
 
 // nyaaUser accepts an uploader name or a profile URL such as
@@ -173,7 +195,7 @@ func run(ctx context.Context, source string, opts options) error {
 	streamURL := fmt.Sprintf("http://%s/%s", ln.Addr(), url.PathEscape(name))
 
 	srv := &http.Server{Handler: streamHandler(file, name)}
-	go srv.Serve(ln)
+	go func() { _ = srv.Serve(ln) }() // returns ErrServerClosed on shutdown
 	defer srv.Close()
 
 	fmt.Fprintf(os.Stderr, "Streaming %s (%s)\n%s\n", name, humanBytes(file.Length()), streamURL)
