@@ -1,15 +1,20 @@
 # peerflix
 
+[![CI](https://github.com/melkir/peerflix/actions/workflows/ci.yml/badge.svg)](https://github.com/melkir/peerflix/actions/workflows/ci.yml)
+
 Stream a torrent straight into [IINA](https://iina.io).
 
 ## Install
 
 ```sh
-go install .                                # builds ~/go/bin/peerflix
-fish_add_path ~/go/bin                      # if it isn't on your PATH yet
-ln -s (pwd)/completions/peerflix.fish ~/.config/fish/completions/   # fish completions
+go install github.com/melkir/peerflix@latest   # builds ~/go/bin/peerflix
+fish_add_path ~/go/bin                         # if it isn't on your PATH yet
 ```
 
+Or download a prebuilt binary from [Releases](https://github.com/melkir/peerflix/releases).
+
+From a clone, `go install .` does the same, and
+`ln -s (pwd)/completions/peerflix.fish ~/.config/fish/completions/` adds fish completions.
 To try it without installing, `go build -o peerflix .` and run `./peerflix`.
 
 ## Usage
@@ -50,5 +55,27 @@ Flags:
 | `-trusted` | false | only search trusted nyaa uploads |
 | `-print` | | print search results and exit |
 | `-user NAME` | | restrict search to a nyaa uploader (name or profile URL) |
+| `-version` | | print the version and exit |
 
 peerflix exits when IINA quits (or on Ctrl-C) and removes the temp data unless `-dir` is set.
+
+## Development
+
+[mise](https://mise.jdx.dev) installs the pinned Go, golangci-lint and GoReleaser versions and
+runs the same tasks as CI:
+
+```sh
+mise install          # install the tools
+mise run ci           # lint, test and build
+mise run snapshot     # build release archives into dist/ without publishing
+```
+
+To release, push a version tag; GitHub Actions publishes macOS and Linux binaries:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+## License
+
+[MIT](LICENSE)
