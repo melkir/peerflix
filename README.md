@@ -59,11 +59,23 @@ Flags:
 
 peerflix exits when IINA quits (or on Ctrl-C) and removes the temp data unless `-dir` is set.
 
-## Releasing
+## Development
 
-Push a version tag and GitHub Actions publishes binaries for macOS and Linux with
-[GoReleaser](https://goreleaser.com):
+[mise](https://mise.jdx.dev) installs the pinned Go, golangci-lint and GoReleaser versions and
+runs the same tasks as CI:
+
+```sh
+mise install          # install the tools
+mise run ci           # lint, test and build
+mise run snapshot     # build release archives into dist/ without publishing
+```
+
+To release, push a version tag; GitHub Actions publishes macOS and Linux binaries:
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
 ```
+
+## License
+
+[MIT](LICENSE)
