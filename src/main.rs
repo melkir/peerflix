@@ -22,8 +22,8 @@ use std::{
 use anyhow::{Context, bail};
 use clap::Parser;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerOptions, Session,
-    SessionOptions,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerOptions,
+    ManagedTorrent, Session, SessionOptions,
 };
 use tokio::{net::TcpListener, signal::unix::SignalKind};
 use tokio_util::sync::CancellationToken;
@@ -289,28 +289,12 @@ async fn stream_torrent(
         return Ok(());
     };
     let torrent = resp?.into_handle().context("torrent was not added")?;
-    if cancel
-        .run_until_cancelled(torrent.wait_until_initialized())
-        .await
-        .transpose()?
-        .is_none()
-    {
-        return Ok(());
-    }
 
     let listener = TcpListener::bind(("127.0.0.1", cli.port))
         .await
         .with_context(|| format!("listening on port {}", cli.port))?;
     let url = format!("http://{}/{}", listener.local_addr()?, path_escape(&name));
-    let t = torrent.clone();
-    let stream_file = stream::File {
-        name: name.clone(),
-        len: file.len,
-        open: Box::new(move || {
-            let t = t.clone();
-            Box::pin(async move { Ok(Box::pin(t.stream(id).await?) as Reader) })
-        }),
-    };
+    let stream_file = torrent_file(torrent.clone(), id, name.clone(), file.len);
     let server = tokio::spawn(stream::serve(listener, Arc::new(stream_file)));
     let _abort_server = AbortOnDrop(server);
 
@@ -326,6 +310,8 @@ async fn stream_torrent(
         Duration::from_secs(1),
     );
     let mut last_fetched = 0;
+    let mut init = torrent.wait_until_initialized();
+    let mut initialized = false;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -336,7 +322,15 @@ async fn stream_torrent(
                 eprintln!();
                 return result;
             }
+            result = &mut init, if !initialized => {
+                result.context("checking existing data")?;
+                initialized = true;
+            }
             _ = ticker.tick() => {
+                if !initialized {
+                    eprint!("\r\x1b[KChecking existing data...");
+                    continue;
+                }
                 let stats = torrent.stats();
                 let done = stats.file_progress.get(id).copied().unwrap_or(0);
                 let (fetched, live, seen) = stats.live.as_ref().map_or((last_fetched, 0, 0), |l| {
@@ -351,6 +345,22 @@ async fn stream_torrent(
                 last_fetched = fetched;
             }
         }
+    }
+}
+
+/// Serves file id of torrent. With --dir, existing data is checked first; IINA
+/// starts meanwhile and its first request waits for the check.
+fn torrent_file(torrent: Arc<ManagedTorrent>, id: usize, name: String, len: u64) -> stream::File {
+    stream::File {
+        name,
+        len,
+        open: Box::new(move || {
+            let t = torrent.clone();
+            Box::pin(async move {
+                t.wait_until_initialized().await?;
+                Ok(Box::pin(t.stream(id).await?) as Reader)
+            })
+        }),
     }
 }
 
@@ -403,7 +413,15 @@ async fn launch_iina(url: String) -> anyhow::Result<()> {
         })
         .context("IINA not found; install it with `brew install --cask iina`")?;
     let status = tokio::process::Command::new(bin)
-        .args(["--no-stdin", "--keep-running", &url])
+        .args(["--no-stdin", "--keep-running"])
+        // A bigger cache than mpv's 150 MiB ahead / 50 MiB behind absorbs
+        // stalls on a slow piece, and seeks back within it are instant.
+        .args([
+            "--mpv-cache=yes",
+            "--mpv-demuxer-max-bytes=512MiB",
+            "--mpv-demuxer-max-back-bytes=256MiB",
+        ])
+        .arg(&url)
         .kill_on_drop(true)
         .status()
         .await
@@ -602,19 +620,12 @@ mod tests {
             .unwrap()
             .into_handle()
             .unwrap();
-        torrent.wait_until_initialized().await.unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/video.mkv", listener.local_addr().unwrap());
-        let t = torrent.clone();
-        let file = stream::File {
-            name: "video.mkv".into(),
-            len: files[id].len,
-            open: Box::new(move || {
-                let t = t.clone();
-                Box::pin(async move { Ok(Box::pin(t.stream(id).await?) as Reader) })
-            }),
-        };
+        // torrent_file waits for the initial check, which is too quick here
+        // to overlap with the requests.
+        let file = torrent_file(torrent.clone(), id, "video.mkv".into(), files[id].len);
         let _server = AbortOnDrop(tokio::spawn(stream::serve(listener, Arc::new(file))));
 
         let client = reqwest::Client::new();
