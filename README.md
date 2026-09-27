@@ -5,11 +5,12 @@ Stream a torrent straight into [IINA](https://iina.io).
 ## Install
 
 ```sh
-go install .                                # builds ~/go/bin/peerflix
-fish_add_path ~/go/bin                      # if it isn't on your PATH yet
-ln -s (pwd)/completions/peerflix.fish ~/.config/fish/completions/   # fish completions
+go install github.com/melkir/peerflix@latest   # builds ~/go/bin/peerflix
+fish_add_path ~/go/bin                         # if it isn't on your PATH yet
 ```
 
+From a clone, `go install .` does the same, and
+`ln -s (pwd)/completions/peerflix.fish ~/.config/fish/completions/` adds fish completions.
 To try it without installing, `go build -o peerflix .` and run `./peerflix`.
 
 ## Usage

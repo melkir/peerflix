@@ -9,7 +9,8 @@ import (
 	"time"
 )
 
-const nyaaURL = "https://nyaa.si"
+// nyaaURL is a variable so tests can point it at a local server.
+var nyaaURL = "https://nyaa.si"
 
 type nyaaItem struct {
 	Title    string `xml:"title"`
