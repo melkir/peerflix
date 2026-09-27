@@ -413,15 +413,7 @@ async fn launch_iina(url: String) -> anyhow::Result<()> {
         })
         .context("IINA not found; install it with `brew install --cask iina`")?;
     let status = tokio::process::Command::new(bin)
-        .args(["--no-stdin", "--keep-running"])
-        // A bigger cache than mpv's 150 MiB ahead / 50 MiB behind absorbs
-        // stalls on a slow piece, and seeks back within it are instant.
-        .args([
-            "--mpv-cache=yes",
-            "--mpv-demuxer-max-bytes=512MiB",
-            "--mpv-demuxer-max-back-bytes=256MiB",
-        ])
-        .arg(&url)
+        .args(["--no-stdin", "--keep-running", &url])
         .kill_on_drop(true)
         .status()
         .await
