@@ -192,6 +192,31 @@ async fn run(cancel: &CancellationToken, source: &str, cli: &Cli) -> anyhow::Res
     result
 }
 
+/// Loads a magnet link, .torrent URL or .torrent file. librqbit can fetch
+/// URLs and read files itself, but it takes any 40 character source for a
+/// bare info hash, and nyaa's https://nyaa.si/download/NNNNNNN.torrent links
+/// are exactly that long.
+async fn load_torrent(source: &str) -> anyhow::Result<AddTorrent<'_>> {
+    if source.starts_with("magnet:") {
+        return Ok(AddTorrent::from_url(source));
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return Ok(AddTorrent::from_bytes(fetch_torrent(source).await?));
+    }
+    let data = tokio::fs::read(source)
+        .await
+        .with_context(|| format!("reading {source}"))?;
+    Ok(AddTorrent::from_bytes(data))
+}
+
+async fn fetch_torrent(url: &str) -> anyhow::Result<bytes::Bytes> {
+    let resp = reqwest::get(url).await.context("fetching torrent")?;
+    if !resp.status().is_success() {
+        bail!("fetching torrent: {}", resp.status());
+    }
+    resp.bytes().await.context("fetching torrent")
+}
+
 struct TorrentFile {
     path: String,
     len: u64,
@@ -212,10 +237,11 @@ async fn stream_torrent(
         list_only: true,
         ..Default::default()
     };
+    let Some(add) = cancel.run_until_cancelled(load_torrent(source)).await else {
+        return Ok(());
+    };
     let Some(resp) = cancel
-        .run_until_cancelled(
-            session.add_torrent(AddTorrent::from_cli_argument(source)?, Some(list_only)),
-        )
+        .run_until_cancelled(session.add_torrent(add?, Some(list_only)))
         .await
     else {
         return Ok(());
@@ -604,6 +630,27 @@ mod tests {
         assert_eq!(resp.status(), 206);
         assert_eq!(resp.text().await.unwrap(), data[20000..20010]);
         session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn loads_40_char_urls_as_torrents() {
+        let srv = testutil::FakeServer::start(200, "d4:infod4:name1:xee").await;
+        // As long as an info hash, like nyaa's download links.
+        let url = format!("{}/", srv.url);
+        let url = format!("{url}{}", "x".repeat(40 - url.len()));
+        assert_eq!(url.len(), 40);
+        match load_torrent(&url).await.unwrap() {
+            AddTorrent::TorrentFileBytes(b) => assert_eq!(&b[..], b"d4:infod4:name1:xee"),
+            AddTorrent::Url(u) => panic!("loaded as URL {u:?}"),
+        }
+
+        let srv = testutil::FakeServer::start(404, "").await;
+        let err = load_torrent(&format!("{}/a.torrent", srv.url))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("404"), "{err}");
+        assert!(load_torrent("/nonexistent/a.torrent").await.is_err());
     }
 
     #[test]
