@@ -75,7 +75,3 @@ To release, push a version tag; GitHub Actions publishes macOS and Linux binarie
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
 ```
-
-## License
-
-[MIT](LICENSE)
