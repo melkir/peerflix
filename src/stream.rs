@@ -38,6 +38,7 @@ type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 /// Serves each of files at /<escaped name>, and the first on every other path,
 /// until the task is dropped.
 pub async fn serve(listener: TcpListener, files: Arc<[File]>) {
+    let paths: Arc<[String]> = files.iter().map(|f| path_escape(&f.name)).collect();
     loop {
         let sock = match listener.accept().await {
             Ok((sock, _)) => sock,
@@ -47,17 +48,14 @@ pub async fn serve(listener: TcpListener, files: Arc<[File]>) {
                 continue;
             }
         };
-        let files = files.clone();
+        let (files, paths) = (files.clone(), paths.clone());
         tokio::spawn(async move {
             let svc = service_fn(move |req: Request<_>| {
-                let files = files.clone();
+                let (files, paths) = (files.clone(), paths.clone());
                 async move {
                     let path = req.uri().path().trim_start_matches('/');
-                    let file = files
-                        .iter()
-                        .find(|f| path_escape(&f.name) == path)
-                        .unwrap_or(&files[0]);
-                    Ok::<_, Infallible>(handle(file, &req).await)
+                    let i = paths.iter().position(|p| p == path).unwrap_or(0);
+                    Ok::<_, Infallible>(handle(&files[i], &req).await)
                 }
             });
             // Errors here are players closing connections to seek.

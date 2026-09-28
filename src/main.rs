@@ -264,7 +264,8 @@ async fn stream_torrent(
         return Ok(());
     }
 
-    let Some(id) = select_file(cancel, &files, cli.index).await? else {
+    let eps = episodes(&files);
+    let Some(id) = select_file(cancel, &files, &eps, cli.index).await? else {
         return Ok(());
     };
     let file = &files[id];
@@ -275,7 +276,7 @@ async fn stream_torrent(
     // Download just that file and its subtitles, as .part files until
     // they're complete; streams still take priority. With --dir, existing
     // data is checked and reused.
-    let subs = subtitles(&files, id);
+    let subs = subtitles(&files, id, eps.len() <= 1);
     let wanted: Vec<usize> = [id].into_iter().chain(subs.iter().copied()).collect();
     let storage = PartStorage::new(meta.output_folder.clone());
     let opts = AddTorrentOptions {
@@ -447,15 +448,15 @@ fn progress_line(stats: &TorrentStats, id: usize, len: u64, last_fetched: u64) -
 }
 
 /// Returns the file to stream: the one at index if given, else one the user
-/// picks in fzf when the torrent holds several episodes and stdin is a
-/// terminal, else the one pick_file chooses. None means peerflix was
-/// cancelled meanwhile.
+/// picks in fzf among eps, the torrent's episodes, when there are several
+/// and stdin is a terminal, else the one pick_file chooses. None means
+/// peerflix was cancelled meanwhile.
 async fn select_file(
     cancel: &CancellationToken,
     files: &[TorrentFile],
+    eps: &[usize],
     index: Option<usize>,
 ) -> anyhow::Result<Option<usize>> {
-    let eps = episodes(files);
     if index.is_some() || eps.len() < 2 || !std::io::stdin().is_terminal() {
         return pick_file(files, index).map(Some);
     }
@@ -507,14 +508,13 @@ fn episodes(files: &[TorrentFile]) -> Vec<usize> {
 /// Compares strings with runs of digits compared as numbers, so Episode 2
 /// sorts before Episode 10.
 fn natural_cmp(mut a: &str, mut b: &str) -> Ordering {
-    let digits = |s: &str| s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     loop {
         let (Some(x), Some(y)) = (a.chars().next(), b.chars().next()) else {
             return a.len().cmp(&b.len());
         };
         if x.is_ascii_digit() && y.is_ascii_digit() {
-            let (na, ra) = a.split_at(digits(a));
-            let (nb, rb) = b.split_at(digits(b));
+            let (na, ra) = a.split_at(leading_digits(a));
+            let (nb, rb) = b.split_at(leading_digits(b));
             let (na, nb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
             let ord = na.len().cmp(&nb.len()).then(na.cmp(nb));
             if ord != Ordering::Equal {
@@ -533,7 +533,7 @@ fn natural_cmp(mut a: &str, mut b: &str) -> Ordering {
 /// it (Show.S01E02.en.srt), in a folder named after it (Subs/Show.S01E02/),
 /// or tagged with the same episode, or all of them when the torrent holds a
 /// single video.
-fn subtitles(files: &[TorrentFile], id: usize) -> Vec<usize> {
+fn subtitles(files: &[TorrentFile], id: usize, single: bool) -> Vec<usize> {
     let lower_stem = |p: &str| {
         Path::new(p)
             .file_stem()
@@ -542,7 +542,6 @@ fn subtitles(files: &[TorrentFile], id: usize) -> Vec<usize> {
     let video = &files[id].path;
     let stem = lower_stem(video);
     let tag = episode_tag(&stem);
-    let single = episodes(files).len() <= 1;
     files
         .iter()
         .enumerate()
@@ -567,15 +566,19 @@ fn subtitles(files: &[TorrentFile], id: usize) -> Vec<usize> {
 /// Returns the season and episode of the first S01E02 tag in the lowercase
 /// string s.
 fn episode_tag(s: &str) -> Option<(u32, u32)> {
-    let digits = |s: &str| s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     s.match_indices('s').find_map(|(i, _)| {
         let rest = &s[i + 1..];
-        let n = digits(rest);
+        let n = leading_digits(rest);
         let season = rest[..n].parse().ok()?;
         let rest = rest[n..].strip_prefix('e')?;
-        let episode = rest[..digits(rest)].parse().ok()?;
+        let episode = rest[..leading_digits(rest)].parse().ok()?;
         Some((season, episode))
     })
+}
+
+/// Returns the length in bytes of the ASCII digits s starts with.
+fn leading_digits(s: &str) -> usize {
+    s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len()
 }
 
 fn is_subtitle(f: &TorrentFile) -> bool {
@@ -861,8 +864,10 @@ mod tests {
             ("Show/Show.S01E010.srt", 5, false),
             ("Show/notes.txt", 5, false),
         ]);
-        assert_eq!(subtitles(&fs, 0), [2, 4, 5]);
-        assert_eq!(subtitles(&fs, 1), [3]);
+        let single = episodes(&fs).len() <= 1;
+        assert!(!single);
+        assert_eq!(subtitles(&fs, 0, single), [2, 4, 5]);
+        assert_eq!(subtitles(&fs, 1, single), [3]);
 
         let prefixes = files(&[
             ("Ep 1.mkv", 1000, false),
@@ -870,14 +875,14 @@ mod tests {
             ("Ep 1.srt", 5, false),
             ("Ep 10.srt", 5, false),
         ]);
-        assert_eq!(subtitles(&prefixes, 0), [2]);
+        assert_eq!(subtitles(&prefixes, 0, false), [2]);
 
         let movie = files(&[
             ("Movie (2010)/Movie.mp4", 1000, false),
             ("Movie (2010)/Subs/English.srt", 5, false),
             ("Movie (2010)/Subs/Spanish.srt", 5, false),
         ]);
-        assert_eq!(subtitles(&movie, 0), [1, 2]);
+        assert_eq!(subtitles(&movie, 0, episodes(&movie).len() <= 1), [1, 2]);
     }
 
     #[test]

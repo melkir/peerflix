@@ -111,7 +111,8 @@ impl Endpoints {
     }
 }
 
-/// How long one source gets to answer before its results are dropped.
+/// How long one site gets to answer, all its requests included, before its
+/// results are dropped.
 const TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The user quit the search without picking a torrent.
@@ -169,12 +170,19 @@ async fn print_sites(
         let (client, ep) = (client.clone(), endpoints.clone());
         let (query, user) = (query.to_owned(), user.to_owned());
         tasks.spawn(async move {
-            let items = match site {
-                Site::Nyaa => nyaa::search(&client, &ep.nyaa, &query, &user, trusted).await,
-                Site::Yts => yts::search(&client, &ep.yts, &query).await,
-                Site::Eztv => eztv::search(&client, &ep.imdb, &ep.eztv, &query).await,
-                Site::Tpb(kind) => tpb::search(&client, &ep.tpb, &query, kind).await,
+            let search = async {
+                match site {
+                    Site::Nyaa => nyaa::search(&client, &ep.nyaa, &query, &user, trusted).await,
+                    Site::Yts => yts::search(&client, &ep.yts, &query).await,
+                    Site::Eztv => eztv::search(&client, &ep.imdb, &ep.eztv, &query).await,
+                    Site::Tpb(kind) => tpb::search(&client, &ep.tpb, &query, kind).await,
+                }
             };
+            // The client's timeout bounds each request, and EZTV makes up to
+            // three rounds of them.
+            let items = tokio::time::timeout(TIMEOUT, search)
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("{} timed out", site.name())));
             (site, items)
         });
     }
