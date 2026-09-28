@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
-use tokio::task::JoinSet;
+use tokio::{io::AsyncWriteExt, task::JoinSet};
 
 use crate::{eztv, nyaa, tpb, yts};
 
@@ -186,8 +186,8 @@ pub fn search_interactive(
 
     // fzf filters the current list on every keystroke, matching title terms
     // in the order the sources returned them, while a reload fetches the
-    // results for the new query. fzf kills a running reload when the next one starts, so
-    // the sleep debounces typing.
+    // results for the new query. fzf kills a running reload when the next
+    // one starts, so the sleep debounces typing.
     let out = Command::new("fzf")
         .args(["--ansi", "--exact", "-i", "--no-sort", "--tabstop", "1"])
         .args(["--query", initial])
@@ -209,17 +209,56 @@ pub fn search_interactive(
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output()
-        .context("running fzf (0.60 or later is required)")?;
+        .context(FZF)?;
+    fzf_choice(out)
+}
+
+/// Runs fzf over lines, each the value to return, a tab, a dimmed detail
+/// column, a tab and the text to match, and returns the chosen value, or
+/// NoSelection if the user quits.
+pub async fn choose(prompt: &str, lines: String) -> anyhow::Result<String> {
+    let mut child = tokio::process::Command::new("fzf")
+        .args(["--ansi", "--exact", "-i", "--no-sort", "--tabstop", "1"])
+        .args(["--prompt", prompt])
+        .args([
+            "--delimiter",
+            "\t",
+            "--with-nth",
+            "2..",
+            // Counted after --with-nth hides the value.
+            "--nth",
+            "2",
+            "--accept-nth",
+            "1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .context(FZF)?;
+    let mut stdin = child.stdin.take().context(FZF)?;
+    // fzf may quit before reading everything.
+    let _ = stdin.write_all(lines.as_bytes()).await;
+    drop(stdin);
+    fzf_choice(child.wait_with_output().await.context(FZF)?)
+}
+
+const FZF: &str = "running fzf (0.60 or later is required)";
+
+/// Returns what fzf printed for the accepted line, or NoSelection if the user
+/// quit or nothing matched.
+fn fzf_choice(out: std::process::Output) -> anyhow::Result<String> {
     match out.status.code() {
         Some(0) => {}
         Some(1 | 130) => return Err(NoSelection.into()), // no match, or Esc/Ctrl-C
-        _ => anyhow::bail!("running fzf (0.60 or later is required): {}", out.status),
+        _ => anyhow::bail!("{FZF}: {}", out.status),
     }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if url.is_empty() {
+    let choice = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if choice.is_empty() {
         return Err(NoSelection.into());
     }
-    Ok(url)
+    Ok(choice)
 }
 
 pub fn human_bytes(n: u64) -> String {

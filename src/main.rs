@@ -14,6 +14,8 @@ mod tpb;
 mod yts;
 
 use std::{
+    cmp::Ordering,
+    io::IsTerminal,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -250,7 +252,9 @@ async fn stream_torrent(
         return Ok(());
     }
 
-    let id = pick_file(&files, cli.index)?;
+    let Some(id) = select_file(cancel, &files, cli.index).await? else {
+        return Ok(());
+    };
     let file = &files[id];
     let name = Path::new(&file.path)
         .file_name()
@@ -390,6 +394,87 @@ fn progress_line(stats: &TorrentStats, id: usize, len: u64, last_fetched: u64) -
     (line, fetched)
 }
 
+/// Returns the file to stream: the one at index if given, else one the user
+/// picks in fzf when the torrent holds several episodes and stdin is a
+/// terminal, else the one pick_file chooses. None means peerflix was
+/// cancelled meanwhile.
+async fn select_file(
+    cancel: &CancellationToken,
+    files: &[TorrentFile],
+    index: Option<usize>,
+) -> anyhow::Result<Option<usize>> {
+    let eps = episodes(files);
+    if index.is_some() || eps.len() < 2 || !std::io::stdin().is_terminal() {
+        return pick_file(files, index).map(Some);
+    }
+    let lines: String = eps
+        .iter()
+        .map(|&i| {
+            let f = &files[i];
+            format!(
+                "{i}\t\x1b[90m{:>9}\x1b[0m  \t{}\n",
+                human_bytes(f.len),
+                f.path
+            )
+        })
+        .collect();
+    let Some(choice) = cancel
+        .run_until_cancelled(search::choose("episode> ", lines))
+        .await
+    else {
+        return Ok(None);
+    };
+    Ok(Some(choice?.parse().context("reading fzf's choice")?))
+}
+
+/// Returns the video files worth choosing between, in natural path order:
+/// those at least a tenth the size of the largest, which leaves out samples
+/// and extras.
+fn episodes(files: &[TorrentFile]) -> Vec<usize> {
+    let videos = || {
+        files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.padding && is_video(f))
+    };
+    let largest = videos().map(|(_, f)| f.len).max().unwrap_or(0);
+    let mut eps: Vec<usize> = videos()
+        .filter(|(_, f)| f.len.saturating_mul(10) >= largest)
+        .map(|(i, _)| i)
+        .collect();
+    eps.sort_by(|&a, &b| natural_cmp(&files[a].path, &files[b].path));
+    eps
+}
+
+/// Compares strings with runs of digits compared as numbers, so Episode 2
+/// sorts before Episode 10.
+fn natural_cmp(mut a: &str, mut b: &str) -> Ordering {
+    let digits = |s: &str| s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    loop {
+        let (Some(x), Some(y)) = (a.chars().next(), b.chars().next()) else {
+            return a.len().cmp(&b.len());
+        };
+        if x.is_ascii_digit() && y.is_ascii_digit() {
+            let (na, ra) = a.split_at(digits(a));
+            let (nb, rb) = b.split_at(digits(b));
+            let (na, nb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
+            let ord = na.len().cmp(&nb.len()).then(na.cmp(nb));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            (a, b) = (ra, rb);
+        } else if x != y {
+            return x.cmp(&y);
+        } else {
+            (a, b) = (&a[x.len_utf8()..], &b[y.len_utf8()..]);
+        }
+    }
+}
+
+fn is_video(f: &TorrentFile) -> bool {
+    content_type(&f.path).starts_with("video/")
+}
+
 /// Returns the index of the file at index, or of the largest video file
 /// (falling back to the largest file) when index is None.
 fn pick_file(files: &[TorrentFile], index: Option<usize>) -> anyhow::Result<usize> {
@@ -402,7 +487,6 @@ fn pick_file(files: &[TorrentFile], index: Option<usize>) -> anyhow::Result<usiz
         }
         return Ok(i);
     }
-    let is_video = |f: &TorrentFile| content_type(&f.path).starts_with("video/");
     files
         .iter()
         .enumerate()
@@ -602,6 +686,37 @@ mod tests {
         assert_eq!(resp.status(), 206);
         assert_eq!(resp.text().await.unwrap(), data[20000..20010]);
         session.stop().await;
+    }
+
+    #[test]
+    fn finds_episodes() {
+        let fs = files(&[
+            ("Show/Episode 10.mkv", 900, false),
+            ("Show/Sample/sample.mkv", 50, false),
+            ("Show/Episode 2.mkv", 1000, false),
+            (".pad/100", 100, true),
+            ("Show/Episode 1.mkv", 700, false),
+            ("Show/cover.jpg", 5000, false),
+        ]);
+        assert_eq!(episodes(&fs), [4, 2, 0]);
+        let one = files(&[("movie.mkv", 1000, false), ("sample.mkv", 20, false)]);
+        assert_eq!(episodes(&one), [0]);
+    }
+
+    #[test]
+    fn natural_order() {
+        use Ordering::*;
+        for (a, b, want) in [
+            ("ep2", "ep10", Less),
+            ("S01E09", "S01E10", Less),
+            ("S02E01", "S01E10", Greater),
+            ("ep007", "ep7", Equal),
+            ("a", "b", Less),
+            ("ep1", "ep1.5", Less),
+            ("", "", Equal),
+        ] {
+            assert_eq!(natural_cmp(a, b), want, "{a} vs {b}");
+        }
     }
 
     #[test]

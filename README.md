@@ -30,6 +30,10 @@ peerflix movie.torrent
 peerflix https://webtorrent.io/torrents/sintel.torrent
 ```
 
+When a torrent holds several episodes, such as a season pack, fzf lists them in order to pick
+one; `--index` skips the question, as does running without a terminal, which streams the largest
+video.
+
 To try it out, [WebTorrent's free torrents](https://webtorrent.io/free-torrents) are open movies
 such as Sintel and Big Buck Bunny.
 
@@ -72,7 +76,7 @@ Flags:
 
 | flag | default | |
 |---|---|---|
-| `-i, --index N` | largest video | file to stream |
+| `-i, --index N` | ask, or largest video | file to stream (see `--list`) |
 | `-l, --list` | | list files and exit |
 | `-p, --port N` | 8888 | local HTTP port (0 = random) |
 | `-d, --dir PATH` | `$TMPDIR/peerflix` | where to store data |
