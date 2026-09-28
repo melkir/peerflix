@@ -1,8 +1,8 @@
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow};
 use serde::Deserialize;
 use tokio::task::JoinSet;
 
-use crate::search::{Torrent, human_bytes, unix_date};
+use crate::search::{Torrent, get_json, human_bytes, unix_date};
 
 pub const EZTV_URL: &str = "https://eztvx.to";
 /// EZTV's API only looks shows up by IMDb ID, so titles go through IMDb's
@@ -77,12 +77,6 @@ async fn show_id(
         .map_err(|()| anyhow!("invalid IMDb URL {base:?}"))?
         .pop_if_empty()
         .extend(["suggestion", "x", &format!("{}.json", query.to_lowercase())]);
-    let resp = client.get(url).send().await.context("searching imdb")?;
-    let status = resp.status();
-    if status != reqwest::StatusCode::OK {
-        bail!("searching imdb: {status}");
-    }
-
     #[derive(Deserialize)]
     struct Suggestions {
         #[serde(default)]
@@ -94,7 +88,7 @@ async fn show_id(
         #[serde(default)]
         qid: String,
     }
-    let s: Suggestions = resp.json().await.context("parsing imdb results")?;
+    let s: Suggestions = get_json(client.get(url), "imdb").await?;
     Ok(s.d
         .into_iter()
         .find(|s| matches!(s.qid.as_str(), "tvSeries" | "tvMiniSeries"))
@@ -129,21 +123,12 @@ async fn torrents(
 }
 
 async fn page(client: &reqwest::Client, base: &str, id: &str, n: usize) -> anyhow::Result<Page> {
-    let resp = client
-        .get(format!("{base}/api/get-torrents"))
-        .query(&[
-            ("imdb_id", id.trim_start_matches("tt")),
-            ("limit", &PAGE_SIZE.to_string()),
-            ("page", &n.to_string()),
-        ])
-        .send()
-        .await
-        .context("searching eztv")?;
-    let status = resp.status();
-    if status != reqwest::StatusCode::OK {
-        bail!("searching eztv: {status}");
-    }
-    resp.json().await.context("parsing eztv results")
+    let req = client.get(format!("{base}/api/get-torrents")).query(&[
+        ("imdb_id", id.trim_start_matches("tt")),
+        ("limit", &PAGE_SIZE.to_string()),
+        ("page", &n.to_string()),
+    ]);
+    get_json(req, "eztv").await
 }
 
 impl Episode {

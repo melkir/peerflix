@@ -5,6 +5,8 @@
 //! starts as soon as the first pieces arrive and seeking works.
 
 mod eztv;
+mod files;
+mod fzf;
 mod nyaa;
 mod search;
 mod storage;
@@ -15,7 +17,6 @@ mod tpb;
 mod yts;
 
 use std::{
-    cmp::Ordering,
     io::IsTerminal,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -34,9 +35,11 @@ use tokio::{net::TcpListener, signal::unix::SignalKind};
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 use crate::{
-    search::{Category, Endpoints, NoSelection, human_bytes},
+    files::{TorrentFile, episodes, pick_file, subtitles, torrent_files},
+    fzf::NoSelection,
+    search::{Category, Endpoints, human_bytes},
     storage::PartStorage,
-    stream::{Reader, content_type, path_escape},
+    stream::{Reader, path_escape},
 };
 
 /// The release version, or the crate version for `cargo install` builds.
@@ -115,9 +118,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// Raises the soft limit on open files as far as the system allows. librqbit
-/// keeps every file of a torrent open, selected or not, so a big season pack
-/// runs out of macOS's default of 256.
+/// Raises the soft limit on open files as far as the system allows. Peer
+/// connections alone can come close to macOS's default of 256: streaming one
+/// episode of a big season pack held 151 open.
 fn raise_open_file_limit() {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
@@ -165,7 +168,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
     if !is_torrent_source(&source) {
-        source = search::search_interactive(&source, cli.category, user, cli.trusted)?;
+        source = fzf::search_interactive(&source, cli.category, user, cli.trusted)?;
     }
 
     // Installed after fzf, which handles Ctrl-C itself.
@@ -231,13 +234,6 @@ async fn run(cancel: &CancellationToken, source: &str, cli: &Cli) -> anyhow::Res
     let result = stream_torrent(cancel, &session, source, cli).await;
     session.stop().await;
     result
-}
-
-struct TorrentFile {
-    path: String,
-    len: u64,
-    /// BEP 47 padding files only exist to align the next file to a piece.
-    padding: bool,
 }
 
 async fn stream_torrent(
@@ -407,17 +403,6 @@ async fn fetch_metadata(
     }
 }
 
-fn torrent_files(meta: &ListOnlyResponse) -> Vec<TorrentFile> {
-    meta.info
-        .iter_file_details()
-        .map(|d| TorrentFile {
-            path: d.filename.to_pathbuf().to_string_lossy().into_owned(),
-            len: d.len,
-            padding: d.attrs().padding,
-        })
-        .collect()
-}
-
 /// Serves file id of torrent. With --dir, existing data is checked first; IINA
 /// starts meanwhile and librqbit holds its first request until the check ends.
 fn torrent_file(torrent: Arc<ManagedTorrent>, id: usize, name: String, len: u64) -> stream::File {
@@ -472,118 +457,12 @@ async fn select_file(
         })
         .collect();
     let Some(choice) = cancel
-        .run_until_cancelled(search::choose("episode> ", lines))
+        .run_until_cancelled(fzf::choose("episode> ", lines))
         .await
     else {
         return Ok(None);
     };
     Ok(Some(choice?.parse().context("reading fzf's choice")?))
-}
-
-/// Returns the video files worth choosing between, episodes first, each group
-/// in natural path order: those at least a tenth the size of the largest,
-/// which leaves out samples.
-fn episodes(files: &[TorrentFile]) -> Vec<usize> {
-    let videos = || {
-        files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| !f.padding && is_video(f))
-    };
-    let largest = videos().map(|(_, f)| f.len).max().unwrap_or(0);
-    let mut eps: Vec<usize> = videos()
-        .filter(|(_, f)| f.len.saturating_mul(10) >= largest)
-        .map(|(i, _)| i)
-        .collect();
-    // Episodes, tagged like S01E02, before extras such as featurettes.
-    let untagged = |i: usize| episode_tag(&files[i].path.to_lowercase()).is_none();
-    eps.sort_by(|&a, &b| {
-        untagged(a)
-            .cmp(&untagged(b))
-            .then_with(|| natural_cmp(&files[a].path, &files[b].path))
-    });
-    eps
-}
-
-/// Compares strings with runs of digits compared as numbers, so Episode 2
-/// sorts before Episode 10.
-fn natural_cmp(mut a: &str, mut b: &str) -> Ordering {
-    loop {
-        let (Some(x), Some(y)) = (a.chars().next(), b.chars().next()) else {
-            return a.len().cmp(&b.len());
-        };
-        if x.is_ascii_digit() && y.is_ascii_digit() {
-            let (na, ra) = a.split_at(leading_digits(a));
-            let (nb, rb) = b.split_at(leading_digits(b));
-            let (na, nb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
-            let ord = na.len().cmp(&nb.len()).then(na.cmp(nb));
-            if ord != Ordering::Equal {
-                return ord;
-            }
-            (a, b) = (ra, rb);
-        } else if x != y {
-            return x.cmp(&y);
-        } else {
-            (a, b) = (&a[x.len_utf8()..], &b[y.len_utf8()..]);
-        }
-    }
-}
-
-/// Returns the subtitle files that go with video file id: those named after
-/// it (Show.S01E02.en.srt), in a folder named after it (Subs/Show.S01E02/),
-/// or tagged with the same episode, or all of them when the torrent holds a
-/// single video.
-fn subtitles(files: &[TorrentFile], id: usize, single: bool) -> Vec<usize> {
-    let lower_stem = |p: &str| {
-        Path::new(p)
-            .file_stem()
-            .map_or_else(String::new, |s| s.to_string_lossy().to_lowercase())
-    };
-    let video = &files[id].path;
-    let stem = lower_stem(video);
-    let tag = episode_tag(&stem);
-    files
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| !f.padding && is_subtitle(f))
-        .filter(|(_, f)| {
-            let path = f.path.to_lowercase();
-            let named = lower_stem(&path)
-                .strip_prefix(&stem)
-                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()));
-            let in_dir = Path::new(&path)
-                .parent()
-                .is_some_and(|d| d.iter().any(|c| c.to_string_lossy() == stem));
-            single
-                || named
-                || in_dir
-                || tag.is_some_and(|t| episode_tag(&lower_stem(&path)) == Some(t))
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Returns the season and episode of the first S01E02 tag in the lowercase
-/// string s.
-fn episode_tag(s: &str) -> Option<(u32, u32)> {
-    s.match_indices('s').find_map(|(i, _)| {
-        let rest = &s[i + 1..];
-        let n = leading_digits(rest);
-        let season = rest[..n].parse().ok()?;
-        let rest = rest[n..].strip_prefix('e')?;
-        let episode = rest[..leading_digits(rest)].parse().ok()?;
-        Some((season, episode))
-    })
-}
-
-/// Returns the length in bytes of the ASCII digits s starts with.
-fn leading_digits(s: &str) -> usize {
-    s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len()
-}
-
-fn is_subtitle(f: &TorrentFile) -> bool {
-    let ext = Path::new(&f.path).extension().and_then(|e| e.to_str());
-    ext.is_some_and(|e| ["srt", "ass", "ssa", "vtt"].contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// Returns the file name to serve path under, prefixed with a number if one
@@ -610,31 +489,6 @@ fn mpv_path_list(paths: &[String]) -> String {
         .map(|p| p.replace('\\', "\\\\").replace(':', "\\:"))
         .collect();
     escaped.join(":")
-}
-
-fn is_video(f: &TorrentFile) -> bool {
-    content_type(&f.path).starts_with("video/")
-}
-
-/// Returns the index of the file at index, or of the largest video file
-/// (falling back to the largest file) when index is None.
-fn pick_file(files: &[TorrentFile], index: Option<usize>) -> anyhow::Result<usize> {
-    if let Some(i) = index {
-        if i >= files.len() {
-            bail!(
-                "file index {i} out of range (torrent has {} files)",
-                files.len()
-            );
-        }
-        return Ok(i);
-    }
-    files
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| !f.padding)
-        .max_by_key(|(_, f)| (is_video(f), f.len))
-        .map(|(i, _)| i)
-        .context("torrent has no files")
 }
 
 /// Opens the stream in IINA with the subtitle URLs and returns once the player
@@ -731,31 +585,6 @@ mod tests {
         }
     }
 
-    fn files(spec: &[(&str, u64, bool)]) -> Vec<TorrentFile> {
-        spec.iter()
-            .map(|&(path, len, padding)| TorrentFile {
-                path: path.into(),
-                len,
-                padding,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn picks_largest_video() {
-        let fs = files(&[
-            ("sample.mkv", 10, false),
-            ("movie.MP4", 100, false),
-            ("extras.zip", 1000, false),
-            (".pad/5000", 5000, true),
-            ("subs/en.srt", 4, false),
-        ]);
-        assert_eq!(pick_file(&fs, None).unwrap(), 1);
-        assert_eq!(pick_file(&fs, Some(4)).unwrap(), 4);
-        assert!(pick_file(&fs, Some(5)).is_err());
-        assert!(pick_file(&[], None).is_err());
-    }
-
     /// Seeds a torrent from local files with networking disabled and streams
     /// one of them through the HTTP server.
     #[tokio::test(flavor = "multi_thread")]
@@ -832,96 +661,8 @@ mod tests {
     }
 
     #[test]
-    fn finds_episodes() {
-        let fs = files(&[
-            ("Show/Episode 10.mkv", 900, false),
-            ("Show/Sample/sample.mkv", 50, false),
-            ("Show/Episode 2.mkv", 1000, false),
-            (".pad/100", 100, true),
-            ("Show/Episode 1.mkv", 700, false),
-            ("Show/cover.jpg", 5000, false),
-        ]);
-        assert_eq!(episodes(&fs), [4, 2, 0]);
-        let pack = files(&[
-            ("Featurettes/Making of.mkv", 900, false),
-            ("Season 1/Show - S01E02.mkv", 1000, false),
-            ("Season 1/Show - S01E01.mkv", 1000, false),
-        ]);
-        assert_eq!(episodes(&pack), [2, 1, 0]);
-        let one = files(&[("movie.mkv", 1000, false), ("sample.mkv", 20, false)]);
-        assert_eq!(episodes(&one), [0]);
-    }
-
-    #[test]
-    fn finds_subtitles() {
-        let fs = files(&[
-            ("Show/Show.S01E01.mkv", 1000, false),
-            ("Show/Show.S01E02.mkv", 1000, false),
-            ("Show/Show.S01E01.en.srt", 5, false),
-            ("Show/Show.S01E02.srt", 5, false),
-            ("Show/Subs/Show.S01E01/2_English.srt", 5, false),
-            ("Show/Subs/s01e01.French.ass", 5, false),
-            ("Show/Show.S01E010.srt", 5, false),
-            ("Show/notes.txt", 5, false),
-        ]);
-        let single = episodes(&fs).len() <= 1;
-        assert!(!single);
-        assert_eq!(subtitles(&fs, 0, single), [2, 4, 5]);
-        assert_eq!(subtitles(&fs, 1, single), [3]);
-
-        let prefixes = files(&[
-            ("Ep 1.mkv", 1000, false),
-            ("Ep 10.mkv", 1000, false),
-            ("Ep 1.srt", 5, false),
-            ("Ep 10.srt", 5, false),
-        ]);
-        assert_eq!(subtitles(&prefixes, 0, false), [2]);
-
-        let movie = files(&[
-            ("Movie (2010)/Movie.mp4", 1000, false),
-            ("Movie (2010)/Subs/English.srt", 5, false),
-            ("Movie (2010)/Subs/Spanish.srt", 5, false),
-        ]);
-        assert_eq!(subtitles(&movie, 0, episodes(&movie).len() <= 1), [1, 2]);
-    }
-
-    #[test]
-    fn episode_tags() {
-        for (s, want) in [
-            ("show.s01e02.720p", Some((1, 2))),
-            ("seasons.s1e10", Some((1, 10))),
-            ("show s01", None),
-            ("movie", None),
-        ] {
-            assert_eq!(episode_tag(s), want, "{s}");
-        }
-    }
-
-    #[test]
     fn mpv_path_lists() {
         let urls = ["http://127.0.0.1:8888/a.srt".to_owned(), r"b\c".to_owned()];
         assert_eq!(mpv_path_list(&urls), r"http\://127.0.0.1\:8888/a.srt:b\\c");
-    }
-
-    #[test]
-    fn natural_order() {
-        use Ordering::*;
-        for (a, b, want) in [
-            ("ep2", "ep10", Less),
-            ("S01E09", "S01E10", Less),
-            ("S02E01", "S01E10", Greater),
-            ("ep007", "ep7", Equal),
-            ("a", "b", Less),
-            ("ep1", "ep1.5", Less),
-            ("", "", Equal),
-        ] {
-            assert_eq!(natural_cmp(a, b), want, "{a} vs {b}");
-        }
-    }
-
-    #[test]
-    fn falls_back_to_largest_file() {
-        let fs = files(&[("small.txt", 1, false), ("big.bin", 50, false)]);
-        assert_eq!(pick_file(&fs, None).unwrap(), 1);
     }
 }

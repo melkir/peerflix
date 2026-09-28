@@ -1,12 +1,8 @@
-use std::{
-    collections::HashSet,
-    io::Write,
-    process::{Command, Stdio},
-    time::Duration,
-};
+use std::{collections::HashSet, io::Write, time::Duration};
 
-use anyhow::Context;
-use tokio::{io::AsyncWriteExt, task::JoinSet};
+use anyhow::{Context, bail};
+use serde::de::DeserializeOwned;
+use tokio::task::JoinSet;
 
 use crate::{eztv, nyaa, tpb, yts};
 
@@ -115,18 +111,6 @@ impl Endpoints {
 /// results are dropped.
 const TIMEOUT: Duration = Duration::from_secs(8);
 
-/// The user quit the search without picking a torrent.
-#[derive(Debug)]
-pub struct NoSelection;
-
-impl std::fmt::Display for NoSelection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("nothing selected")
-    }
-}
-
-impl std::error::Error for NoSelection {}
-
 /// Queries category's sites for query in parallel and writes their results
 /// as fzf input as each site answers, one tab separated line per result: the
 /// torrent URL, the date, size, health, seeders and (when the category has
@@ -161,9 +145,8 @@ async fn print_sites(
     user: &str,
     trusted: bool,
 ) -> (usize, Vec<&'static str>) {
-    let names: Vec<_> = sites.iter().map(|s| s.name()).collect();
     let Ok(client) = reqwest::Client::builder().timeout(TIMEOUT).build() else {
-        return (0, names);
+        return (0, sites.iter().map(|s| s.name()).collect());
     };
     let mut tasks = JoinSet::new();
     for &site in sites {
@@ -191,18 +174,19 @@ async fn print_sites(
     while let Some(res) = tasks.join_next().await {
         let Ok((site, Ok(items))) = res else { continue };
         answered.push(site);
-        for it in items {
+        let site_column = if sites.len() > 1 {
+            format!("  {:<4}", site.name())
+        } else {
+            String::new()
+        };
+        for mut it in items {
             if it.seeders == 0 {
                 continue;
             }
-            if !it.info_hash.is_empty() && !seen.insert(it.info_hash.clone()) {
+            let hash = std::mem::take(&mut it.info_hash);
+            if !hash.is_empty() && !seen.insert(hash) {
                 continue;
             }
-            let site_column = if sites.len() > 1 {
-                format!("  {:<4}", site.name())
-            } else {
-                String::new()
-            };
             // A closed pipe just means fzf moved on to the next query.
             let _ = writeln!(
                 w,
@@ -257,6 +241,25 @@ fn status(
     format!("{missing}{none} Tab searches {a} and {b}.")
 }
 
+/// Sends req to site and parses its JSON answer, failing unless the site
+/// answered 200 OK.
+pub async fn get_json<T: DeserializeOwned>(
+    req: reqwest::RequestBuilder,
+    site: &str,
+) -> anyhow::Result<T> {
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("searching {site}"))?;
+    let status = resp.status();
+    if status != reqwest::StatusCode::OK {
+        bail!("searching {site}: {status}");
+    }
+    resp.json()
+        .await
+        .with_context(|| format!("parsing {site} results"))
+}
+
 /// Rates a torrent by its seeders relative to its leechers.
 pub fn health(it: &Torrent) -> &'static str {
     use std::cmp::Ordering::*;
@@ -266,151 +269,6 @@ pub fn health(it: &Torrent) -> &'static str {
         (_, Equal) => "\x1b[33m●\x1b[0m",
         (_, Less) => "\x1b[38;5;208m●\x1b[0m",
     }
-}
-
-/// Runs fzf over live searches, starting in category, with nyaa optionally
-/// restricted to one uploader or to trusted uploads, and returns the chosen
-/// torrent URL or magnet, or NoSelection if the user quits. Tab and
-/// Shift-Tab switch category, keeping the query.
-pub fn search_interactive(
-    initial: &str,
-    category: Category,
-    user: &str,
-    trusted: bool,
-) -> anyhow::Result<String> {
-    let exe = std::env::current_exe()?;
-    // The prompt holds the category, as in "movies> ".
-    let mut search =
-        shell_quote(&exe.to_string_lossy()) + r#" --print --category "${FZF_PROMPT%> }""#;
-    if !user.is_empty() {
-        search += &format!(" --user {}", shell_quote(user));
-    }
-    if trusted {
-        search += " --trusted";
-    }
-    search += " -- {q}";
-
-    // fzf filters the current list on every keystroke, matching title terms
-    // in the order the sites returned them, while a reload fetches the
-    // results for the new query. fzf kills a running reload when the next
-    // one starts, so the sleep debounces typing.
-    //
-    // Each search writes a status line to PEERFLIX_STATUS, shown as the
-    // header once its results have loaded.
-    //
-    // Tab changes the prompt and reloads in one transform, since a reload
-    // chained after change-prompt still sees the old prompt. The search
-    // command comes from PEERFLIX_SEARCH so that fzf fills in its {q} at
-    // reload time, quoted, rather than inside the transform's own command.
-    let cycle = |order: [&str; 3]| {
-        format!(
-            r#"transform:case $FZF_PROMPT in {0}*) n={1};; {1}*) n={2};; *) n={0};; esac; echo "change-prompt($n> )+reload:$PEERFLIX_SEARCH""#,
-            order[0], order[1], order[2]
-        )
-    };
-    let status = std::env::temp_dir().join(format!("peerflix-{}.status", std::process::id()));
-    let out = Command::new("fzf")
-        .env("PEERFLIX_SEARCH", &search)
-        .env("PEERFLIX_STATUS", &status)
-        .args([
-            "--ansi",
-            "--exact",
-            "-i",
-            "--no-sort",
-            "--tabstop",
-            "1",
-            "--wrap",
-        ])
-        .args(["--query", initial])
-        .args(["--prompt", &format!("{}> ", category.name())])
-        .args(["--with-shell", "sh -c"])
-        .args([
-            "--delimiter",
-            "\t",
-            "--with-nth",
-            "2..",
-            "--nth",
-            "2",
-            "--accept-nth",
-            "1",
-        ])
-        .args(["--bind", "enter:accept-non-empty"])
-        .args([
-            "--bind",
-            &format!("tab:{}", cycle(["anime", "movies", "series"])),
-        ])
-        .args([
-            "--bind",
-            &format!("shift-tab:{}", cycle(["series", "movies", "anime"])),
-        ])
-        .args(["--bind", &format!("start:reload:{search}")])
-        .args(["--bind", &format!("change:reload:sleep 0.25; {search}")])
-        .args([
-            "--bind",
-            r#"load:transform-header:cat "$PEERFLIX_STATUS" 2>/dev/null"#,
-        ])
-        .stdin(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()
-        .context(FZF);
-    let _ = std::fs::remove_file(&status);
-    fzf_choice(out?)
-}
-
-/// Runs fzf over lines, each the value to return, a tab, a dimmed detail
-/// column, a tab and the text to match, and returns the chosen value, or
-/// NoSelection if the user quits.
-pub async fn choose(prompt: &str, lines: String) -> anyhow::Result<String> {
-    let mut child = tokio::process::Command::new("fzf")
-        .args([
-            "--ansi",
-            "--exact",
-            "-i",
-            "--no-sort",
-            "--tabstop",
-            "1",
-            "--wrap",
-        ])
-        .args(["--prompt", prompt])
-        .args([
-            "--delimiter",
-            "\t",
-            "--with-nth",
-            "2..",
-            // Counted after --with-nth hides the value.
-            "--nth",
-            "2",
-            "--accept-nth",
-            "1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .context(FZF)?;
-    let mut stdin = child.stdin.take().context(FZF)?;
-    // fzf may quit before reading everything.
-    let _ = stdin.write_all(lines.as_bytes()).await;
-    drop(stdin);
-    fzf_choice(child.wait_with_output().await.context(FZF)?)
-}
-
-const FZF: &str = "running fzf (0.60 or later is required)";
-
-/// Returns what fzf printed for the accepted line, or NoSelection if the user
-/// quit or nothing matched.
-fn fzf_choice(out: std::process::Output) -> anyhow::Result<String> {
-    match out.status.code() {
-        Some(0) => {}
-        Some(1 | 130) => return Err(NoSelection.into()), // no match, or Esc/Ctrl-C
-        _ => anyhow::bail!("{FZF}: {}", out.status),
-    }
-    let choice = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if choice.is_empty() {
-        return Err(NoSelection.into());
-    }
-    Ok(choice)
 }
 
 pub fn human_bytes(n: u64) -> String {
@@ -467,11 +325,6 @@ pub fn unix_date(secs: i64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}")
-}
-
-/// Quotes s for sh.
-pub fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
@@ -622,18 +475,6 @@ mod tests {
             (-86_400, "1969-12-31"),
         ] {
             assert_eq!(unix_date(secs), want, "{secs}");
-        }
-    }
-
-    #[test]
-    fn quotes_for_sh() {
-        for (s, want) in [
-            ("", "''"),
-            ("plain", "'plain'"),
-            ("/path with space", "'/path with space'"),
-            ("it's", r"'it'\''s'"),
-        ] {
-            assert_eq!(shell_quote(s), want);
         }
     }
 }

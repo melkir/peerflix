@@ -1,7 +1,6 @@
-use anyhow::{Context, bail};
 use serde::{Deserialize, Deserializer};
 
-use crate::search::{Torrent, human_bytes, magnet, unix_date};
+use crate::search::{Torrent, get_json, human_bytes, magnet, unix_date};
 
 /// The Pirate Bay's JSON API.
 pub const TPB_URL: &str = "https://apibay.org";
@@ -66,12 +65,7 @@ pub async fn search(
             .get(format!("{base}/q.php"))
             .query(&[("q", query), ("cat", kind.categories())])
     };
-    let resp = req.send().await.context("searching tpb")?;
-    let status = resp.status();
-    if status != reqwest::StatusCode::OK {
-        bail!("searching tpb: {status}");
-    }
-    let items: Vec<Item> = resp.json().await.context("parsing tpb results")?;
+    let items: Vec<Item> = get_json(req, "tpb").await?;
     Ok(items
         .into_iter()
         // No results come back as one placeholder with an all-zero hash.

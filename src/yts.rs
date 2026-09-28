@@ -1,7 +1,7 @@
-use anyhow::{Context, bail};
+use anyhow::bail;
 use serde::Deserialize;
 
-use crate::search::{Torrent, human_bytes, magnet};
+use crate::search::{Torrent, get_json, human_bytes, magnet};
 
 /// YTS's API; the yts.* sites point clients here.
 pub const YTS_URL: &str = "https://movies-api.accel.li";
@@ -53,17 +53,10 @@ pub async fn search(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let resp = client
+    let req = client
         .get(format!("{base}/api/v2/list_movies.json"))
-        .query(&[("query_term", query), ("limit", "50"), ("sort_by", "seeds")])
-        .send()
-        .await
-        .context("searching yts")?;
-    let status = resp.status();
-    if status != reqwest::StatusCode::OK {
-        bail!("searching yts: {status}");
-    }
-    let body: Response = resp.json().await.context("parsing yts results")?;
+        .query(&[("query_term", query), ("limit", "50"), ("sort_by", "seeds")]);
+    let body: Response = get_json(req, "yts").await?;
     if body.status != "ok" {
         bail!("searching yts: {}", body.status_message);
     }
