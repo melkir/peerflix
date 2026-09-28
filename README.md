@@ -27,8 +27,11 @@ To try it without installing, `cargo run --release -- <args>`.
 ```sh
 peerflix 'magnet:?xt=urn:btih:...'
 peerflix movie.torrent
-peerflix https://example.com/movie.torrent
+peerflix https://webtorrent.io/torrents/sintel.torrent
 ```
+
+To try it out, [WebTorrent's free torrents](https://webtorrent.io/free-torrents) are open movies
+such as Sintel and Big Buck Bunny.
 
 ## Search
 
