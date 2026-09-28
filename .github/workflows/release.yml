@@ -12,7 +12,7 @@ jobs:
     runs-on: macos-latest # Apple Silicon, so the build is arm64
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
       - run: cargo build --release --locked
         env:
           PEERFLIX_VERSION: ${{ github.ref_name }}

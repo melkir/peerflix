@@ -13,6 +13,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4 # also caches the tools
+      - uses: jdx/mise-action@v5 # also caches the tools
       - uses: Swatinem/rust-cache@v2 # caches ~/.cargo and target/
       - run: mise run ci
