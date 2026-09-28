@@ -23,7 +23,7 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerOptions,
-    ManagedTorrent, Session, SessionOptions,
+    ManagedTorrent, PeerConnectionOptions, Session, SessionOptions,
 };
 use tokio::{net::TcpListener, signal::unix::SignalKind};
 use tokio_util::sync::CancellationToken;
@@ -278,6 +278,14 @@ async fn stream_torrent(
         only_files: Some(vec![id]),
         overwrite: true,
         initial_peers: Some(meta.seen_peers),
+        peer_opts: Some(PeerConnectionOptions {
+            // The piece at the player's position after a seek is requested
+            // behind everything already queued to a peer. librqbit queues 128
+            // chunks (2 MiB); 32 cut long jumps in IINA from 2.6-8 s to
+            // 0.5-2.4 s without slowing the download.
+            max_request_window: Some(32),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let Some(resp) = cancel

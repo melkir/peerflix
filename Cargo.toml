@@ -33,3 +33,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[patch.crates-io]
+# librqbit 9.0.1 plus a configurable per-peer request window, so seeks are
+# served sooner. Drop this once https://github.com/ikatson/rqbit/pull/687
+# is released.
+librqbit = { git = "https://github.com/melkir/rqbit", rev = "a81cb6a5fa61eb06d30ea03a960a6a69af36399f" }
