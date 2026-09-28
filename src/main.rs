@@ -10,6 +10,7 @@ mod search;
 mod stream;
 #[cfg(test)]
 mod testutil;
+mod tpb;
 mod yts;
 
 use std::{
@@ -42,7 +43,7 @@ const VERSION: &str = match option_env!("PEERFLIX_VERSION") {
 /// Stream a torrent straight into IINA.
 ///
 /// With a magnet link, .torrent file or http(s) URL, streams it. Anything else
-/// searches nyaa.si, YTS and EZTV interactively in fzf.
+/// searches nyaa.si, YTS, EZTV and The Pirate Bay interactively in fzf.
 #[derive(Parser, Debug)]
 #[command(version = VERSION)]
 struct Cli {
@@ -470,7 +471,7 @@ mod tests {
     #[test]
     fn picks_search_sources() {
         use Source::*;
-        assert_eq!(search_sources(&[], false), [Nyaa, Yts, Eztv]);
+        assert_eq!(search_sources(&[], false), [Nyaa, Yts, Eztv, Tpb]);
         assert_eq!(search_sources(&[], true), [Nyaa]);
         assert_eq!(search_sources(&[Eztv, Yts, Eztv], true), [Eztv, Yts]);
     }

@@ -1,19 +1,10 @@
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
-use crate::search::{Torrent, human_bytes};
+use crate::search::{Torrent, human_bytes, magnet};
 
 /// YTS's API; the yts.* sites point clients here.
 pub const YTS_URL: &str = "https://movies-api.accel.li";
-
-/// YTS lists hashes only; magnets built from them get these trackers.
-pub const TRACKERS: [&str; 5] = [
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.stealth.si:80/announce",
-    "udp://tracker.torrent.eu.org:451/announce",
-    "udp://tracker.dler.org:6969/announce",
-    "udp://open.dstud.io:6969/announce",
-];
 
 #[derive(Deserialize)]
 struct Response {
@@ -103,22 +94,10 @@ pub async fn search(
     Ok(results)
 }
 
-fn magnet(hash: &str, name: &str) -> String {
-    let mut url =
-        reqwest::Url::parse(&format!("magnet:?xt=urn:btih:{hash}")).expect("magnet URLs parse");
-    let mut query = url.query_pairs_mut();
-    query.append_pair("dn", name);
-    for tr in TRACKERS {
-        query.append_pair("tr", tr);
-    }
-    drop(query);
-    url.into()
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::testutil::FakeServer;
+    use crate::{search::TRACKERS, testutil::FakeServer};
 
     pub const SAMPLE_JSON: &str = r#"{"status":"ok","status_message":"Query was successful","data":{"movie_count":1,"movies":[
         {"title_long":"Big Buck Bunny (2008)","torrents":[

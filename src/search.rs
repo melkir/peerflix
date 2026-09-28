@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io::Write,
     process::{Command, Stdio},
     time::Duration,
@@ -7,7 +8,7 @@ use std::{
 use anyhow::Context;
 use tokio::task::JoinSet;
 
-use crate::{eztv, nyaa, yts};
+use crate::{eztv, nyaa, tpb, yts};
 
 /// A site peerflix searches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -18,16 +19,19 @@ pub enum Source {
     Yts,
     /// EZTV TV shows
     Eztv,
+    /// The Pirate Bay's video torrents
+    Tpb,
 }
 
 impl Source {
-    pub const ALL: [Source; 3] = [Source::Nyaa, Source::Yts, Source::Eztv];
+    pub const ALL: [Source; 4] = [Source::Nyaa, Source::Yts, Source::Eztv, Source::Tpb];
 
     pub fn name(self) -> &'static str {
         match self {
             Source::Nyaa => "nyaa",
             Source::Yts => "yts",
             Source::Eztv => "eztv",
+            Source::Tpb => "tpb",
         }
     }
 }
@@ -51,6 +55,7 @@ pub struct Endpoints {
     pub nyaa: String,
     pub yts: String,
     pub eztv: String,
+    pub tpb: String,
     /// IMDb's title suggestions, which map EZTV queries to show IDs.
     pub imdb: String,
 }
@@ -65,6 +70,7 @@ impl Endpoints {
             nyaa: var("PEERFLIX_NYAA_URL", nyaa::NYAA_URL),
             yts: var("PEERFLIX_YTS_URL", yts::YTS_URL),
             eztv: var("PEERFLIX_EZTV_URL", eztv::EZTV_URL),
+            tpb: var("PEERFLIX_TPB_URL", tpb::TPB_URL),
             imdb: var("PEERFLIX_IMDB_URL", eztv::IMDB_URL),
         }
     }
@@ -89,7 +95,8 @@ impl std::error::Error for NoSelection {}
 /// input as each source answers, one tab separated line per result: the
 /// torrent URL, the date, size, health and source, and the title. A failed
 /// search, such as a site being unavailable or rate limiting, prints nothing.
-/// user and trusted only apply to nyaa.
+/// A magnet another source already listed is skipped. user and trusted only
+/// apply to nyaa.
 pub async fn print_results(
     w: &mut impl Write,
     endpoints: &Endpoints,
@@ -110,13 +117,18 @@ pub async fn print_results(
                 Source::Nyaa => nyaa::search(&client, &ep.nyaa, &query, &user, trusted).await,
                 Source::Yts => yts::search(&client, &ep.yts, &query).await,
                 Source::Eztv => eztv::search(&client, &ep.imdb, &ep.eztv, &query).await,
+                Source::Tpb => tpb::search(&client, &ep.tpb, &query).await,
             };
             (source, items.unwrap_or_default())
         });
     }
+    let mut seen = HashSet::new();
     while let Some(res) = tasks.join_next().await {
         let Ok((source, items)) = res else { continue };
         for it in items {
+            if info_hash(&it.url).is_some_and(|h| !seen.insert(h)) {
+                continue;
+            }
             // A closed pipe just means fzf moved on to the next query.
             let _ = writeln!(
                 w,
@@ -131,6 +143,14 @@ pub async fn print_results(
         }
         let _ = w.flush();
     }
+}
+
+/// Returns a magnet link's info hash in lowercase, or None for anything else.
+fn info_hash(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("magnet:?")?;
+    let start = rest.find("xt=urn:btih:")? + "xt=urn:btih:".len();
+    let hash = rest[start..].split('&').next()?;
+    Some(hash.to_ascii_lowercase())
 }
 
 /// Rates a torrent by its seeders relative to its leechers.
@@ -221,6 +241,43 @@ pub fn human_bytes(n: u64) -> String {
     )
 }
 
+/// The trackers put in magnets built from a bare info hash.
+pub const TRACKERS: [&str; 5] = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://open.dstud.io:6969/announce",
+];
+
+/// Builds a magnet link for an info hash, naming it name.
+pub fn magnet(hash: &str, name: &str) -> String {
+    let mut url =
+        reqwest::Url::parse(&format!("magnet:?xt=urn:btih:{hash}")).expect("magnet URLs parse");
+    let mut query = url.query_pairs_mut();
+    query.append_pair("dn", name);
+    for tr in TRACKERS {
+        query.append_pair("tr", tr);
+    }
+    drop(query);
+    url.into()
+}
+
+/// Formats a Unix time as a UTC YYYY-MM-DD date.
+pub fn unix_date(secs: i64) -> String {
+    // Howard Hinnant's civil_from_days.
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 /// Quotes s for sh.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -236,6 +293,7 @@ mod tests {
             nyaa: url.into(),
             yts: url.into(),
             eztv: url.into(),
+            tpb: url.into(),
             imdb: url.into(),
         }
     }
@@ -297,6 +355,28 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    #[tokio::test]
+    async fn skips_repeated_magnets() {
+        // YTS twice: the second copy's magnets are all repeats.
+        let srv = FakeServer::start(200, SAMPLE_JSON).await;
+        let mut buf = Vec::new();
+        let sources = [Source::Yts, Source::Yts];
+        print_results(&mut buf, &endpoints(&srv.url), &sources, "bunny", "", false).await;
+        assert_eq!(String::from_utf8(buf).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn info_hashes() {
+        for (url, want) in [
+            ("magnet:?xt=urn:btih:ABCdef&dn=x", Some("abcdef")),
+            ("magnet:?dn=x&xt=urn:btih:abc", Some("abc")),
+            ("magnet:?dn=x", None),
+            ("https://nyaa.si/download/1.torrent", None),
+        ] {
+            assert_eq!(info_hash(url).as_deref(), want, "{url}");
+        }
+    }
+
     #[test]
     fn health_colors() {
         for (seeders, leechers, color) in [
@@ -330,6 +410,18 @@ mod tests {
             (3 << 40, "3.0 TiB"),
         ] {
             assert_eq!(human_bytes(n), want);
+        }
+    }
+
+    #[test]
+    fn unix_dates() {
+        for (secs, want) in [
+            (0, "1970-01-01"),
+            (951_782_400, "2000-02-29"),
+            (1_790_612_897, "2026-09-28"),
+            (-86_400, "1969-12-31"),
+        ] {
+            assert_eq!(unix_date(secs), want, "{secs}");
         }
     }
 

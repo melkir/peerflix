@@ -41,13 +41,17 @@ peerflix --user NAME                      # browse/search one nyaa uploader
 peerflix --user NAME QUERY
 ```
 
-Search covers three sites at once, and each result is tagged with the site it came from:
+Search covers four sites at once, and each result is tagged with the site it came from:
 
 - [nyaa.si](https://nyaa.si), mostly anime: the 75 newest matches, so type an episode number to reach older ones.
 - [YTS](https://yts.bz) movies: one line per movie and quality, most seeded first.
 - [EZTV](https://eztvx.to) TV shows: EZTV only looks up shows by IMDb ID, so the query goes through
   IMDb's title suggestions first and the best matching show is listed, newest first. A trailing
   `S02`, `S02E03` or `2x03` narrows it to that season or episode.
+- [The Pirate Bay](https://thepiratebay.org) video torrents, through its [apibay](https://apibay.org)
+  API: up to 100 matches, most seeded first.
+
+A torrent that another site already listed isn't shown twice.
 
 The sites are queried in parallel, and each one's results show up as soon as it answers, so a
 slow or unreachable site (which gets 8 seconds) never holds up the others.
@@ -70,13 +74,13 @@ Flags:
 | `-p, --port N` | 8888 | local HTTP port (0 = random) |
 | `-d, --dir PATH` | `$TMPDIR/peerflix` | where to store data |
 | `-n, --no-play` | | only serve `http://127.0.0.1:PORT/<name>` |
-| `-s, --source LIST` | all | sites to search: `nyaa`, `yts`, `eztv`, comma separated |
+| `-s, --source LIST` | all | sites to search: `nyaa`, `yts`, `eztv`, `tpb`, comma separated |
 | `-t, --trusted` | | only search trusted nyaa uploads (implies `-s nyaa`) |
 | `--print` | | print search results and exit |
 | `-u, --user NAME` | | restrict search to a nyaa uploader, name or profile URL (implies `-s nyaa`) |
 | `-V, --version` | | print the version and exit |
 
-`PEERFLIX_NYAA_URL`, `PEERFLIX_YTS_URL`, `PEERFLIX_EZTV_URL` and `PEERFLIX_IMDB_URL` point search
+`PEERFLIX_NYAA_URL`, `PEERFLIX_YTS_URL`, `PEERFLIX_EZTV_URL`, `PEERFLIX_TPB_URL` and `PEERFLIX_IMDB_URL` point search
 at other hosts, such as a mirror when a site moves, or a local mock.
 
 peerflix exits when IINA quits (or on Ctrl-C). Downloaded data stays in the data directory, so
