@@ -260,10 +260,11 @@ async fn stream_torrent(
         .file_name()
         .map_or_else(|| file.path.clone(), |n| n.to_string_lossy().into_owned());
 
-    // Download just that file; streams still take priority. With --dir,
-    // existing data is checked and reused.
+    // Download just that file and its subtitles; streams still take priority.
+    // With --dir, existing data is checked and reused.
+    let subs = subtitles(&files, id);
     let opts = AddTorrentOptions {
-        only_files: Some(vec![id]),
+        only_files: Some([id].into_iter().chain(subs.iter().copied()).collect()),
         overwrite: true,
         initial_peers: Some(meta.seen_peers),
         peer_opts: Some(PeerConnectionOptions {
@@ -289,18 +290,31 @@ async fn stream_torrent(
     let listener = TcpListener::bind(("127.0.0.1", cli.port))
         .await
         .with_context(|| format!("listening on port {}", cli.port))?;
-    let url = format!("http://{}/{}", listener.local_addr()?, path_escape(&name));
-    let stream_file = torrent_file(torrent.clone(), id, name.clone(), file.len);
-    let _server =
-        AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, Arc::new(stream_file))));
+    let base = format!("http://{}", listener.local_addr()?);
+    let url = format!("{base}/{}", path_escape(&name));
+    let mut served = vec![torrent_file(torrent.clone(), id, name.clone(), file.len)];
+    for &i in &subs {
+        let sub_name = served_name(&files[i].path, &served);
+        served.push(torrent_file(torrent.clone(), i, sub_name, files[i].len));
+    }
+    let sub_urls: Vec<_> = served[1..]
+        .iter()
+        .map(|f| format!("{base}/{}", path_escape(&f.name)))
+        .collect();
+    let sub_names: Vec<_> = served[1..].iter().map(|f| f.name.as_str()).collect();
+    let sub_names = sub_names.join(", ");
+    let _server = AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, served.into())));
 
     eprintln!("Streaming {name} ({})\n{url}", human_bytes(file.len));
+    if !sub_urls.is_empty() {
+        eprintln!("Subtitles: {sub_names}");
+    }
 
     let player = async {
         if cli.no_play {
             std::future::pending().await
         } else {
-            launch_iina(url).await
+            launch_iina(url, &sub_urls).await
         }
     };
     tokio::pin!(player);
@@ -471,6 +485,86 @@ fn natural_cmp(mut a: &str, mut b: &str) -> Ordering {
     }
 }
 
+/// Returns the subtitle files that go with video file id: those named after
+/// it (Show.S01E02.en.srt), in a folder named after it (Subs/Show.S01E02/),
+/// or tagged with the same episode, or all of them when the torrent holds a
+/// single video.
+fn subtitles(files: &[TorrentFile], id: usize) -> Vec<usize> {
+    let lower_stem = |p: &str| {
+        Path::new(p)
+            .file_stem()
+            .map_or_else(String::new, |s| s.to_string_lossy().to_lowercase())
+    };
+    let video = &files[id].path;
+    let stem = lower_stem(video);
+    let tag = episode_tag(&stem);
+    let single = episodes(files).len() <= 1;
+    files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.padding && is_subtitle(f))
+        .filter(|(_, f)| {
+            let path = f.path.to_lowercase();
+            let named = lower_stem(&path)
+                .strip_prefix(&stem)
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()));
+            let in_dir = Path::new(&path)
+                .parent()
+                .is_some_and(|d| d.iter().any(|c| c.to_string_lossy() == stem));
+            single
+                || named
+                || in_dir
+                || tag.is_some_and(|t| episode_tag(&lower_stem(&path)) == Some(t))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Returns the season and episode of the first S01E02 tag in the lowercase
+/// string s.
+fn episode_tag(s: &str) -> Option<(u32, u32)> {
+    let digits = |s: &str| s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    s.match_indices('s').find_map(|(i, _)| {
+        let rest = &s[i + 1..];
+        let n = digits(rest);
+        let season = rest[..n].parse().ok()?;
+        let rest = rest[n..].strip_prefix('e')?;
+        let episode = rest[..digits(rest)].parse().ok()?;
+        Some((season, episode))
+    })
+}
+
+fn is_subtitle(f: &TorrentFile) -> bool {
+    let ext = Path::new(&f.path).extension().and_then(|e| e.to_str());
+    ext.is_some_and(|e| ["srt", "ass", "ssa", "vtt"].contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// Returns the file name to serve path under, prefixed with a number if one
+/// of served already has it.
+fn served_name(path: &str, served: &[stream::File]) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_owned(), |n| n.to_string_lossy().into_owned());
+    let taken = |n: &str| served.iter().any(|f| f.name == n);
+    if !taken(&name) {
+        return name;
+    }
+    (2..)
+        .map(|k| format!("{k}-{name}"))
+        .find(|n| !taken(n))
+        .expect("an unused name")
+}
+
+/// Joins paths into an mpv path list: colon separated, with a backslash
+/// escaping a colon or backslash within a path.
+fn mpv_path_list(paths: &[String]) -> String {
+    let escaped: Vec<_> = paths
+        .iter()
+        .map(|p| p.replace('\\', "\\\\").replace(':', "\\:"))
+        .collect();
+    escaped.join(":")
+}
+
 fn is_video(f: &TorrentFile) -> bool {
     content_type(&f.path).starts_with("video/")
 }
@@ -496,8 +590,9 @@ fn pick_file(files: &[TorrentFile], index: Option<usize>) -> anyhow::Result<usiz
         .context("torrent has no files")
 }
 
-/// Opens the stream in IINA and returns once the player quits.
-async fn launch_iina(url: String) -> anyhow::Result<()> {
+/// Opens the stream in IINA with the subtitle URLs and returns once the player
+/// quits.
+async fn launch_iina(url: String, subs: &[String]) -> anyhow::Result<()> {
     let bin = std::env::var_os("PATH")
         .and_then(|path| {
             std::env::split_paths(&path)
@@ -509,8 +604,13 @@ async fn launch_iina(url: String) -> anyhow::Result<()> {
             app.is_file().then_some(app)
         })
         .context("IINA not found; install it with `brew install --cask iina`")?;
-    let status = tokio::process::Command::new(bin)
-        .args(["--no-stdin", "--keep-running", &url])
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(["--no-stdin", "--keep-running"]);
+    if !subs.is_empty() {
+        cmd.arg(format!("--mpv-sub-files={}", mpv_path_list(subs)));
+    }
+    let status = cmd
+        .arg(&url)
         .kill_on_drop(true)
         .status()
         .await
@@ -671,7 +771,8 @@ mod tests {
         // librqbit's stream() waits for the initial check, which is too quick
         // here to overlap with the requests.
         let file = torrent_file(torrent.clone(), id, "video.mkv".into(), files[id].len);
-        let _server = AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, Arc::new(file))));
+        let _server =
+            AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, Arc::new([file]))));
 
         let client = reqwest::Client::new();
         let resp = client.get(&url).send().await.unwrap();
@@ -701,6 +802,55 @@ mod tests {
         assert_eq!(episodes(&fs), [4, 2, 0]);
         let one = files(&[("movie.mkv", 1000, false), ("sample.mkv", 20, false)]);
         assert_eq!(episodes(&one), [0]);
+    }
+
+    #[test]
+    fn finds_subtitles() {
+        let fs = files(&[
+            ("Show/Show.S01E01.mkv", 1000, false),
+            ("Show/Show.S01E02.mkv", 1000, false),
+            ("Show/Show.S01E01.en.srt", 5, false),
+            ("Show/Show.S01E02.srt", 5, false),
+            ("Show/Subs/Show.S01E01/2_English.srt", 5, false),
+            ("Show/Subs/s01e01.French.ass", 5, false),
+            ("Show/Show.S01E010.srt", 5, false),
+            ("Show/notes.txt", 5, false),
+        ]);
+        assert_eq!(subtitles(&fs, 0), [2, 4, 5]);
+        assert_eq!(subtitles(&fs, 1), [3]);
+
+        let prefixes = files(&[
+            ("Ep 1.mkv", 1000, false),
+            ("Ep 10.mkv", 1000, false),
+            ("Ep 1.srt", 5, false),
+            ("Ep 10.srt", 5, false),
+        ]);
+        assert_eq!(subtitles(&prefixes, 0), [2]);
+
+        let movie = files(&[
+            ("Movie (2010)/Movie.mp4", 1000, false),
+            ("Movie (2010)/Subs/English.srt", 5, false),
+            ("Movie (2010)/Subs/Spanish.srt", 5, false),
+        ]);
+        assert_eq!(subtitles(&movie, 0), [1, 2]);
+    }
+
+    #[test]
+    fn episode_tags() {
+        for (s, want) in [
+            ("show.s01e02.720p", Some((1, 2))),
+            ("seasons.s1e10", Some((1, 10))),
+            ("show s01", None),
+            ("movie", None),
+        ] {
+            assert_eq!(episode_tag(s), want, "{s}");
+        }
+    }
+
+    #[test]
+    fn mpv_path_lists() {
+        let urls = ["http://127.0.0.1:8888/a.srt".to_owned(), r"b\c".to_owned()];
+        assert_eq!(mpv_path_list(&urls), r"http\://127.0.0.1\:8888/a.srt:b\\c");
     }
 
     #[test]

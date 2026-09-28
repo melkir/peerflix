@@ -1,5 +1,5 @@
-//! Serves one file over HTTP with range support, which is what players need
-//! to start playback early and to seek.
+//! Serves files over HTTP with range support, which is what players need to
+//! start playback early and to seek.
 
 use std::{convert::Infallible, io::SeekFrom, path::Path, pin::Pin, sync::Arc, time::Duration};
 
@@ -35,8 +35,9 @@ pub struct File {
 
 type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 
-/// Serves file on every path until the task is dropped.
-pub async fn serve(listener: TcpListener, file: Arc<File>) {
+/// Serves each of files at /<escaped name>, and the first on every other path,
+/// until the task is dropped.
+pub async fn serve(listener: TcpListener, files: Arc<[File]>) {
     loop {
         let sock = match listener.accept().await {
             Ok((sock, _)) => sock,
@@ -46,11 +47,18 @@ pub async fn serve(listener: TcpListener, file: Arc<File>) {
                 continue;
             }
         };
-        let file = file.clone();
+        let files = files.clone();
         tokio::spawn(async move {
-            let svc = service_fn(move |req| {
-                let file = file.clone();
-                async move { Ok::<_, Infallible>(handle(&file, &req).await) }
+            let svc = service_fn(move |req: Request<_>| {
+                let files = files.clone();
+                async move {
+                    let path = req.uri().path().trim_start_matches('/');
+                    let file = files
+                        .iter()
+                        .find(|f| path_escape(&f.name) == path)
+                        .unwrap_or(&files[0]);
+                    Ok::<_, Infallible>(handle(file, &req).await)
+                }
             });
             // Errors here are players closing connections to seek.
             let _ = http1::Builder::new()
@@ -202,6 +210,7 @@ pub fn content_type(name: &str) -> &'static str {
         "flac" => "audio/flac",
         "m4a" => "audio/mp4",
         "srt" | "ass" | "ssa" | "txt" => "text/plain; charset=utf-8",
+        "vtt" => "text/vtt; charset=utf-8",
         _ => "application/octet-stream",
     }
 }
@@ -257,18 +266,40 @@ mod tests {
         assert_eq!(path_escape("a/b?é"), "a%2Fb%3F%C3%A9");
     }
 
-    async fn serve_bytes(data: &'static [u8]) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/video.mkv", listener.local_addr().unwrap());
-        let file = File {
-            name: "video.mkv".into(),
+    fn bytes_file(name: &str, data: &'static [u8]) -> File {
+        File {
+            name: name.into(),
             len: data.len() as u64,
             open: Box::new(move || {
                 Box::pin(async move { Ok(Box::pin(std::io::Cursor::new(data)) as Reader) })
             }),
-        };
-        tokio::spawn(serve(listener, Arc::new(file)));
+        }
+    }
+
+    async fn serve_bytes(data: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        tokio::spawn(serve(listener, Arc::new([bytes_file("video.mkv", data)])));
         url
+    }
+
+    #[tokio::test]
+    async fn serves_files_by_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let files = [
+            bytes_file("video.mkv", b"video"),
+            bytes_file("Show E01.en.srt", b"subs"),
+        ];
+        tokio::spawn(serve(listener, Arc::new(files)));
+        for (path, want) in [
+            ("/video.mkv", "video"),
+            ("/Show%20E01.en.srt", "subs"),
+            ("/anything", "video"),
+        ] {
+            let body = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(body.text().await.unwrap(), want, "{path}");
+        }
     }
 
     #[tokio::test]

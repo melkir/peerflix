@@ -34,6 +34,11 @@ When a torrent holds several episodes, such as a season pack, fzf lists them in 
 one; `--index` skips the question, as does running without a terminal, which streams the largest
 video.
 
+Subtitle files (`.srt`, `.ass`, `.ssa`, `.vtt`) that come with the video in the torrent are
+downloaded along with it and loaded in IINA: those named after the episode
+(`Show.S01E03.en.srt`), in a folder named after it (`Subs/Show.S01E03/`) or tagged with the same
+`S01E03`, or all of them when the torrent holds a single video.
+
 To try it out, [WebTorrent's free torrents](https://webtorrent.io/free-torrents) are open movies
 such as Sintel and Big Buck Bunny.
 
