@@ -167,7 +167,7 @@ fn parse_range(header: Option<&str>, len: u64) -> Range {
         },
         (Some(start), None, false) if last.is_empty() => Range::Partial(start, len).nonempty(len),
         (Some(start), Some(end), false) if start <= end => {
-            Range::Partial(start, (end + 1).min(len)).nonempty(len)
+            Range::Partial(start, end.saturating_add(1).min(len)).nonempty(len)
         }
         _ => Range::Full,
     }
@@ -231,6 +231,7 @@ mod tests {
             (Some("bytes=0-9"), Partial(0, 10)),
             (Some("bytes=90-"), Partial(90, 100)),
             (Some("bytes=90-500"), Partial(90, 100)),
+            (Some("bytes=5-18446744073709551615"), Partial(5, 100)),
             (Some("bytes=-10"), Partial(90, 100)),
             (Some("bytes=-500"), Partial(0, 100)),
             (Some("bytes=100-"), Unsatisfiable),

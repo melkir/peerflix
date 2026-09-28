@@ -272,7 +272,7 @@ async fn stream_torrent(
         .file_name()
         .map_or_else(|| file.path.clone(), |n| n.to_string_lossy().into_owned());
 
-    // Download just that file; streams still take priority. With -dir,
+    // Download just that file; streams still take priority. With --dir,
     // existing data is checked and reused.
     let opts = AddTorrentOptions {
         only_files: Some(vec![id]),

@@ -161,7 +161,7 @@ pub(crate) mod tests {
         search(&srv.url, "", "", false).await.unwrap();
         let q = srv.queries().remove(0);
         assert_eq!(q.get("f").map(String::as_str), Some("0"));
-        assert!(!q.contains_key("u"), "user set without -user");
+        assert!(!q.contains_key("u"), "user set without --user");
     }
 
     #[tokio::test]
