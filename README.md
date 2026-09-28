@@ -7,10 +7,12 @@ Stream a torrent straight into [IINA](https://iina.io).
 ## Install
 
 ```sh
+mise use -g github:melkir/peerflix                                 # prebuilt Apple Silicon binary
 cargo install --locked --git https://github.com/melkir/peerflix   # builds ~/.cargo/bin/peerflix
 ```
 
-Or download a prebuilt Apple Silicon binary from [Releases](https://github.com/melkir/peerflix/releases).
+[mise](https://mise.jdx.dev) fetches the binary from [Releases](https://github.com/melkir/peerflix/releases)
+and `mise upgrade` keeps it current; you can also download it from there by hand.
 
 From a clone, `cargo install --locked --path .` does the same, and
 `ln -s (pwd)/completions/peerflix.fish ~/.config/fish/completions/` adds fish completions.
