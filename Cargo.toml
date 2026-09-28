@@ -35,7 +35,9 @@ panic = "abort"
 strip = true
 
 [patch.crates-io]
-# librqbit 9.0.1 plus a configurable per-peer request window, so seeks are
-# served sooner. Drop this once https://github.com/ikatson/rqbit/pull/687
-# is released.
-librqbit = { git = "https://github.com/melkir/rqbit", rev = "a81cb6a5fa61eb06d30ea03a960a6a69af36399f" }
+# librqbit 9.0.1 plus fixes from https://github.com/melkir/rqbit/tree/peerflix.
+# Drop this once they're released:
+# - ikatson/rqbit#687: configurable per-peer request window, for faster seeks
+# - ikatson/rqbit#688: 40 character .torrent URLs aren't taken for info hashes
+# - ikatson/rqbit#689: stream() waits for the initial data check
+librqbit = { git = "https://github.com/melkir/rqbit", rev = "53f836cc2a8e6968468106da8a45043e490a909e" }

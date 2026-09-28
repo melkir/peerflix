@@ -18,7 +18,8 @@ pub struct FakeServer {
 }
 
 impl FakeServer {
-    pub async fn start(status: u16, body: &'static str) -> Self {
+    pub async fn start(status: u16, body: impl Into<Bytes>) -> Self {
+        let body = body.into();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let queries = Arc::new(Mutex::new(Vec::new()));
@@ -27,17 +28,19 @@ impl FakeServer {
             loop {
                 let (sock, _) = listener.accept().await.unwrap();
                 let recorded = recorded.clone();
+                let body = body.clone();
                 let svc = service_fn(move |req: hyper::Request<_>| {
                     let url = reqwest::Url::parse(&format!("http://x{}", req.uri())).unwrap();
                     recorded
                         .lock()
                         .unwrap()
                         .push(url.query_pairs().into_owned().collect());
+                    let body = body.clone();
                     async move {
                         Ok::<_, Infallible>(
                             Response::builder()
                                 .status(status)
-                                .body(Full::new(Bytes::from_static(body.as_bytes())))
+                                .body(Full::new(body))
                                 .unwrap(),
                         )
                     }
