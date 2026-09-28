@@ -86,6 +86,7 @@ pub async fn search(
                     .unwrap_or("0001-01-01")
                     .to_owned(),
                 size: human_bytes(it.size_bytes),
+                info_hash: it.hash.to_ascii_lowercase(),
                 seeders: it.seeds,
                 leechers: it.peers,
             });
@@ -117,6 +118,7 @@ pub(crate) mod tests {
         assert_eq!((it.seeders, it.leechers), (12, 3));
         assert_eq!(it.size, "1.8 GiB");
         assert_eq!(it.date, "2015-11-01");
+        assert_eq!(it.info_hash, "0123456789abcdef0123456789abcdef01234567");
         assert_eq!(items[1].title, "Big Buck Bunny (2008) [2160p web]");
         assert_eq!(items[1].date, "0001-01-01");
 

@@ -47,6 +47,9 @@ pub struct Torrent {
     pub size: String,
     pub seeders: u32,
     pub leechers: u32,
+    /// The info hash in lowercase hex, or empty if the source doesn't give
+    /// one.
+    pub info_hash: String,
 }
 
 /// The base URL each source is queried at.
@@ -95,8 +98,8 @@ impl std::error::Error for NoSelection {}
 /// input as each source answers, one tab separated line per result: the
 /// torrent URL, the date, size, health and source, and the title. A failed
 /// search, such as a site being unavailable or rate limiting, prints nothing.
-/// A magnet another source already listed is skipped. user and trusted only
-/// apply to nyaa.
+/// A torrent another source already listed, going by info hash, is skipped.
+/// user and trusted only apply to nyaa.
 pub async fn print_results(
     w: &mut impl Write,
     endpoints: &Endpoints,
@@ -126,7 +129,7 @@ pub async fn print_results(
     while let Some(res) = tasks.join_next().await {
         let Ok((source, items)) = res else { continue };
         for it in items {
-            if info_hash(&it.url).is_some_and(|h| !seen.insert(h)) {
+            if !it.info_hash.is_empty() && !seen.insert(it.info_hash.clone()) {
                 continue;
             }
             // A closed pipe just means fzf moved on to the next query.
@@ -143,14 +146,6 @@ pub async fn print_results(
         }
         let _ = w.flush();
     }
-}
-
-/// Returns a magnet link's info hash in lowercase, or None for anything else.
-fn info_hash(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("magnet:?")?;
-    let start = rest.find("xt=urn:btih:")? + "xt=urn:btih:".len();
-    let hash = rest[start..].split('&').next()?;
-    Some(hash.to_ascii_lowercase())
 }
 
 /// Rates a torrent by its seeders relative to its leechers.
@@ -402,18 +397,6 @@ mod tests {
         let sources = [Source::Yts, Source::Yts];
         print_results(&mut buf, &endpoints(&srv.url), &sources, "bunny", "", false).await;
         assert_eq!(String::from_utf8(buf).unwrap().lines().count(), 2);
-    }
-
-    #[test]
-    fn info_hashes() {
-        for (url, want) in [
-            ("magnet:?xt=urn:btih:ABCdef&dn=x", Some("abcdef")),
-            ("magnet:?dn=x&xt=urn:btih:abc", Some("abc")),
-            ("magnet:?dn=x", None),
-            ("https://nyaa.si/download/1.torrent", None),
-        ] {
-            assert_eq!(info_hash(url).as_deref(), want, "{url}");
-        }
     }
 
     #[test]

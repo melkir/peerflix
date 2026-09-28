@@ -16,6 +16,8 @@ pub struct Item {
     // The nyaa: namespace elements; quick-xml matches them by local name.
     pub seeders: u32,
     pub leechers: u32,
+    #[serde(rename = "infoHash")]
+    pub info_hash: String,
     pub size: String,
 }
 
@@ -100,6 +102,7 @@ impl From<Item> for Torrent {
             size: it.size,
             seeders: it.seeders,
             leechers: it.leechers,
+            info_hash: it.info_hash.to_ascii_lowercase(),
         }
     }
 }
@@ -150,7 +153,9 @@ pub(crate) mod tests {
         assert_eq!((it.seeders, it.leechers), (42, 3));
         assert_eq!(it.size, "1.2 GiB");
         assert_eq!(it.date, "2026-09-26");
+        assert_eq!(it.info_hash, "0123456789abcdef0123456789abcdef01234567");
         assert_eq!((items[1].seeders, items[1].leechers), (0, 0));
+        assert_eq!(items[1].info_hash, "");
 
         let q = srv.queries().remove(0);
         for (k, want) in [

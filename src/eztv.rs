@@ -30,6 +30,7 @@ struct Page {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Item {
+    hash: String,
     magnet_url: String,
     title: String,
     season: String,
@@ -162,6 +163,7 @@ impl From<Item> for Torrent {
             size: human_bytes(it.size_bytes.parse().unwrap_or(0)),
             seeders: it.seeds,
             leechers: it.peers,
+            info_hash: it.hash.to_ascii_lowercase(),
         }
     }
 }
@@ -209,7 +211,7 @@ mod tests {
     use crate::testutil::FakeServer;
 
     const SAMPLE_JSON: &str = r#"{"imdb_id":"0944947","torrents_count":2,"limit":100,"page":1,"torrents":[
-        {"magnet_url":"magnet:?xt=urn:btih:a017ac9bf02de9e36f1f9177bdb60612186b0b0d","title":"Game of Thrones S01E10 2160p UHD BluRay x265-SCOTLUHD EZTV","season":"1","episode":"10","seeds":7,"peers":2,"size_bytes":"1726335609","date_released_unix":1790612897},
+        {"hash":"A017AC9BF02DE9E36F1F9177BDB60612186B0B0D","magnet_url":"magnet:?xt=urn:btih:a017ac9bf02de9e36f1f9177bdb60612186b0b0d","title":"Game of Thrones S01E10 2160p UHD BluRay x265-SCOTLUHD EZTV","season":"1","episode":"10","seeds":7,"peers":2,"size_bytes":"1726335609","date_released_unix":1790612897},
         {"magnet_url":"magnet:?xt=urn:btih:b017ac9bf02de9e36f1f9177bdb60612186b0b0d","title":"Game of Thrones S02E01 720p","season":"2","episode":"1","seeds":0,"peers":0,"size_bytes":"","date_released_unix":0}
     ]}"#;
 
@@ -232,6 +234,7 @@ mod tests {
         assert_eq!((it.seeders, it.leechers), (7, 2));
         assert_eq!(it.size, "1.6 GiB");
         assert_eq!(it.date, "2026-09-28");
+        assert_eq!(it.info_hash, "a017ac9bf02de9e36f1f9177bdb60612186b0b0d");
 
         let q = srv.queries().remove(0);
         for (k, want) in [("imdb_id", "0944947"), ("limit", "100"), ("page", "1")] {

@@ -52,6 +52,7 @@ pub async fn search(
             size: human_bytes(it.size.parse().unwrap_or(0)),
             seeders: it.seeders.parse().unwrap_or(0),
             leechers: it.leechers.parse().unwrap_or(0),
+            info_hash: it.info_hash.to_ascii_lowercase(),
             title: it.name,
         })
         .collect())
@@ -87,6 +88,7 @@ mod tests {
         assert_eq!((it.seeders, it.leechers), (892, 94));
         assert_eq!(it.size, "1.9 GiB");
         assert_eq!(it.date, "2012-06-13");
+        assert_eq!(it.info_hash, "224bf45881252643dfc2e71abc7b2660a21c68c4");
         let bad = &items[1];
         assert_eq!(
             (bad.seeders, bad.leechers, bad.size.as_str()),
