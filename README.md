@@ -4,6 +4,10 @@
 
 Stream a torrent straight into [IINA](https://iina.io).
 
+<img width="800" height="450" alt="peerflix demo: search, pick a torrent, and it plays in IINA" src="https://github.com/user-attachments/assets/e9a69810-ebc9-4a66-8468-88c7ca1a0085" />
+
+<sub>The demo searches a local feed of Blender Studio open movies (CC BY) instead of nyaa.</sub>
+
 ## Install
 
 ```sh
