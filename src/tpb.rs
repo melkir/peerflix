@@ -6,8 +6,23 @@ use crate::search::{Torrent, human_bytes, magnet, unix_date};
 /// The Pirate Bay's JSON API.
 pub const TPB_URL: &str = "https://apibay.org";
 
-/// The Video category and its subcategories (movies, TV, HD, 4K...).
-const VIDEO: &str = "200";
+/// Which of The Pirate Bay's video categories to search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Movies,
+    Tv,
+}
+
+impl Kind {
+    /// The category IDs: SD, HD and 4K movies or TV shows, leaving out
+    /// DVD images and 3D.
+    fn categories(self) -> &'static str {
+        match self {
+            Kind::Movies => "201,207,211",
+            Kind::Tv => "205,208,212",
+        }
+    }
+}
 
 /// apibay sends every field as a string.
 #[derive(Default, Deserialize)]
@@ -21,19 +36,20 @@ struct Item {
     added: String,
 }
 
-/// Searches The Pirate Bay's video torrents, most seeded first. An empty
+/// Searches The Pirate Bay's movies or TV shows, most seeded first. An empty
 /// query returns nothing.
 pub async fn search(
     client: &reqwest::Client,
     base: &str,
     query: &str,
+    kind: Kind,
 ) -> anyhow::Result<Vec<Torrent>> {
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
     let resp = client
         .get(format!("{base}/q.php"))
-        .query(&[("q", query), ("cat", VIDEO)])
+        .query(&[("q", query), ("cat", kind.categories())])
         .send()
         .await
         .context("searching tpb")?;
@@ -73,9 +89,14 @@ mod tests {
     #[tokio::test]
     async fn search_parses_results() {
         let srv = FakeServer::start(200, SAMPLE_JSON).await;
-        let items = search(&reqwest::Client::new(), &srv.url, "big buck bunny")
-            .await
-            .unwrap();
+        let items = search(
+            &reqwest::Client::new(),
+            &srv.url,
+            "big buck bunny",
+            Kind::Movies,
+        )
+        .await
+        .unwrap();
         assert_eq!(items.len(), 2);
         let it = &items[0];
         assert_eq!(it.title, "Big Buck Bunny (2008) 1080p BrRip x264");
@@ -96,7 +117,7 @@ mod tests {
         );
 
         let q = srv.queries().remove(0);
-        for (k, want) in [("q", "big buck bunny"), ("cat", "200")] {
+        for (k, want) in [("q", "big buck bunny"), ("cat", "201,207,211")] {
             assert_eq!(q.get(k).map(String::as_str), Some(want), "query {k}");
         }
     }
@@ -104,20 +125,26 @@ mod tests {
     #[tokio::test]
     async fn no_results() {
         let srv = FakeServer::start(200, NO_RESULTS).await;
-        let items = search(&reqwest::Client::new(), &srv.url, "nothing")
+        let items = search(&reqwest::Client::new(), &srv.url, "nothing", Kind::Tv)
             .await
             .unwrap();
         assert!(items.is_empty());
 
-        let items = search(&reqwest::Client::new(), &srv.url, "").await.unwrap();
+        let items = search(&reqwest::Client::new(), &srv.url, "", Kind::Tv)
+            .await
+            .unwrap();
         assert!(items.is_empty());
         assert_eq!(srv.queries().len(), 1, "empty query was sent");
+        assert_eq!(
+            srv.queries()[0].get("cat").map(String::as_str),
+            Some("205,208,212")
+        );
     }
 
     #[tokio::test]
     async fn search_errors() {
         let srv = FakeServer::start(502, "").await;
-        let err = search(&reqwest::Client::new(), &srv.url, "x")
+        let err = search(&reqwest::Client::new(), &srv.url, "x", Kind::Tv)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("502"), "{err}");

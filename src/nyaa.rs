@@ -5,6 +5,10 @@ use crate::search::Torrent;
 
 pub const NYAA_URL: &str = "https://nyaa.si";
 
+/// The Anime category and its subcategories, which leaves out nyaa's music,
+/// books, live action and software.
+const ANIME: &str = "1_0";
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Item {
@@ -50,8 +54,8 @@ fn parse_rfc1123z(s: &str) -> Option<String> {
     valid.then(|| format!("{year}-{month:02}-{day}"))
 }
 
-/// Queries nyaa's RSS feed across all categories, which returns up to 75
-/// results sorted newest first. A non-empty user restricts results to that
+/// Queries nyaa's RSS feed for anime, which returns up to 75 results sorted
+/// newest first. A non-empty user restricts results to that
 /// uploader; trusted excludes uploads from untrusted users.
 pub async fn search(
     client: &reqwest::Client,
@@ -61,7 +65,7 @@ pub async fn search(
     trusted: bool,
 ) -> anyhow::Result<Vec<Torrent>> {
     let filter = if trusted { "2" } else { "0" };
-    let mut params = vec![("page", "rss"), ("q", query), ("c", "0_0"), ("f", filter)];
+    let mut params = vec![("page", "rss"), ("q", query), ("c", ANIME), ("f", filter)];
     if !user.is_empty() {
         params.push(("u", user));
     }
@@ -161,7 +165,7 @@ pub(crate) mod tests {
         for (k, want) in [
             ("page", "rss"),
             ("q", "big buck bunny"),
-            ("c", "0_0"),
+            ("c", "1_0"),
             ("f", "2"),
             ("u", "someone"),
         ] {

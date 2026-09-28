@@ -9,7 +9,7 @@ complete -c peerflix -s l -l list -d 'List files in the torrent and exit'
 complete -c peerflix -s n -l no-play -d "Don't launch IINA, just serve the stream"
 complete -c peerflix -s p -l port -x -d 'HTTP port to serve the stream on'
 complete -c peerflix -l print -d 'Print search results and exit'
-complete -c peerflix -s s -l source -x -a 'nyaa yts eztv tpb' -d 'Sites to search, comma separated'
+complete -c peerflix -s c -l category -x -a 'anime movies series' -d 'Category to start searching in'
 complete -c peerflix -s t -l trusted -d 'Only search trusted nyaa uploaders'
 complete -c peerflix -s u -l user -x -d 'Only search this nyaa uploader'
 complete -c peerflix -s h -l help -d 'Print help'

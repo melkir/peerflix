@@ -10,28 +10,51 @@ use tokio::{io::AsyncWriteExt, task::JoinSet};
 
 use crate::{eztv, nyaa, tpb, yts};
 
-/// A site peerflix searches.
+/// What to search for, each from the sites that have it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum Source {
-    /// nyaa.si, mostly anime
-    Nyaa,
-    /// YTS movies
-    Yts,
-    /// EZTV TV shows
-    Eztv,
-    /// The Pirate Bay's video torrents
-    Tpb,
+pub enum Category {
+    /// nyaa.si's anime
+    Anime,
+    /// YTS, and The Pirate Bay's movies
+    Movies,
+    /// EZTV, and The Pirate Bay's TV shows
+    Series,
 }
 
-impl Source {
-    pub const ALL: [Source; 4] = [Source::Nyaa, Source::Yts, Source::Eztv, Source::Tpb];
-
+impl Category {
     pub fn name(self) -> &'static str {
         match self {
-            Source::Nyaa => "nyaa",
-            Source::Yts => "yts",
-            Source::Eztv => "eztv",
-            Source::Tpb => "tpb",
+            Category::Anime => "anime",
+            Category::Movies => "movies",
+            Category::Series => "series",
+        }
+    }
+
+    fn sites(self) -> &'static [Site] {
+        match self {
+            Category::Anime => &[Site::Nyaa],
+            Category::Movies => &[Site::Yts, Site::Tpb(tpb::Kind::Movies)],
+            Category::Series => &[Site::Eztv, Site::Tpb(tpb::Kind::Tv)],
+        }
+    }
+}
+
+/// A site peerflix searches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Site {
+    Nyaa,
+    Yts,
+    Eztv,
+    Tpb(tpb::Kind),
+}
+
+impl Site {
+    fn name(self) -> &'static str {
+        match self {
+            Site::Nyaa => "nyaa",
+            Site::Yts => "yts",
+            Site::Eztv => "eztv",
+            Site::Tpb(_) => "tpb",
         }
     }
 }
@@ -94,16 +117,27 @@ impl std::fmt::Display for NoSelection {
 
 impl std::error::Error for NoSelection {}
 
-/// Queries sources for query in parallel and writes their results as fzf
-/// input as each source answers, one tab separated line per result: the
-/// torrent URL, the date, size, health and source, and the title. A failed
+/// Queries category's sites for query in parallel and writes their results
+/// as fzf input as each site answers, one tab separated line per result: the
+/// torrent URL, the date, size, health and site, and the title. A failed
 /// search, such as a site being unavailable or rate limiting, prints nothing.
-/// A torrent another source already listed, going by info hash, is skipped.
+/// A torrent another site already listed, going by info hash, is skipped.
 /// user and trusted only apply to nyaa.
 pub async fn print_results(
     w: &mut impl Write,
     endpoints: &Endpoints,
-    sources: &[Source],
+    category: Category,
+    query: &str,
+    user: &str,
+    trusted: bool,
+) {
+    print_sites(w, endpoints, category.sites(), query, user, trusted).await;
+}
+
+async fn print_sites(
+    w: &mut impl Write,
+    endpoints: &Endpoints,
+    sites: &[Site],
     query: &str,
     user: &str,
     trusted: bool,
@@ -112,22 +146,22 @@ pub async fn print_results(
         return;
     };
     let mut tasks = JoinSet::new();
-    for &source in sources {
+    for &site in sites {
         let (client, ep) = (client.clone(), endpoints.clone());
         let (query, user) = (query.to_owned(), user.to_owned());
         tasks.spawn(async move {
-            let items = match source {
-                Source::Nyaa => nyaa::search(&client, &ep.nyaa, &query, &user, trusted).await,
-                Source::Yts => yts::search(&client, &ep.yts, &query).await,
-                Source::Eztv => eztv::search(&client, &ep.imdb, &ep.eztv, &query).await,
-                Source::Tpb => tpb::search(&client, &ep.tpb, &query).await,
+            let items = match site {
+                Site::Nyaa => nyaa::search(&client, &ep.nyaa, &query, &user, trusted).await,
+                Site::Yts => yts::search(&client, &ep.yts, &query).await,
+                Site::Eztv => eztv::search(&client, &ep.imdb, &ep.eztv, &query).await,
+                Site::Tpb(kind) => tpb::search(&client, &ep.tpb, &query, kind).await,
             };
-            (source, items.unwrap_or_default())
+            (site, items.unwrap_or_default())
         });
     }
     let mut seen = HashSet::new();
     while let Some(res) = tasks.join_next().await {
-        let Ok((source, items)) = res else { continue };
+        let Ok((site, items)) = res else { continue };
         for it in items {
             if !it.info_hash.is_empty() && !seen.insert(it.info_hash.clone()) {
                 continue;
@@ -140,7 +174,7 @@ pub async fn print_results(
                 it.date,
                 it.size,
                 health(&it),
-                source.name(),
+                site.name(),
                 it.title
             );
         }
@@ -159,18 +193,20 @@ pub fn health(it: &Torrent) -> &'static str {
     }
 }
 
-/// Runs fzf over live searches of sources, with nyaa optionally restricted to
-/// one uploader or to trusted uploads, and returns the chosen torrent URL or
-/// magnet, or NoSelection if the user quits.
+/// Runs fzf over live searches, starting in category, with nyaa optionally
+/// restricted to one uploader or to trusted uploads, and returns the chosen
+/// torrent URL or magnet, or NoSelection if the user quits. Tab and
+/// Shift-Tab switch category, keeping the query.
 pub fn search_interactive(
     initial: &str,
-    sources: &[Source],
+    category: Category,
     user: &str,
     trusted: bool,
 ) -> anyhow::Result<String> {
     let exe = std::env::current_exe()?;
-    let names: Vec<_> = sources.iter().map(|s| s.name()).collect();
-    let mut search = shell_quote(&exe.to_string_lossy()) + " --print --source " + &names.join(",");
+    // The prompt holds the category, as in "movies> ".
+    let mut search =
+        shell_quote(&exe.to_string_lossy()) + r#" --print --category "${FZF_PROMPT%> }""#;
     if !user.is_empty() {
         search += &format!(" --user {}", shell_quote(user));
     }
@@ -180,13 +216,26 @@ pub fn search_interactive(
     search += " -- {q}";
 
     // fzf filters the current list on every keystroke, matching title terms
-    // in the order the sources returned them, while a reload fetches the
+    // in the order the sites returned them, while a reload fetches the
     // results for the new query. fzf kills a running reload when the next
     // one starts, so the sleep debounces typing.
+    //
+    // Tab changes the prompt and reloads in one transform, since a reload
+    // chained after change-prompt still sees the old prompt. The search
+    // command comes from PEERFLIX_SEARCH so that fzf fills in its {q} at
+    // reload time, quoted, rather than inside the transform's own command.
+    let cycle = |order: [&str; 3]| {
+        format!(
+            r#"transform:case $FZF_PROMPT in {0}*) n={1};; {1}*) n={2};; *) n={0};; esac; echo "change-prompt($n> )+reload:$PEERFLIX_SEARCH""#,
+            order[0], order[1], order[2]
+        )
+    };
     let out = Command::new("fzf")
+        .env("PEERFLIX_SEARCH", &search)
         .args(["--ansi", "--exact", "-i", "--no-sort", "--tabstop", "1"])
         .args(["--query", initial])
-        .args(["--prompt", "search> "])
+        .args(["--prompt", &format!("{}> ", category.name())])
+        .args(["--header", "tab: anime · movies · series"])
         .args(["--with-shell", "sh -c"])
         .args([
             "--delimiter",
@@ -199,6 +248,14 @@ pub fn search_interactive(
             "1",
         ])
         .args(["--bind", "enter:accept-non-empty"])
+        .args([
+            "--bind",
+            &format!("tab:{}", cycle(["anime", "movies", "series"])),
+        ])
+        .args([
+            "--bind",
+            &format!("shift-tab:{}", cycle(["series", "movies", "anime"])),
+        ])
         .args(["--bind", &format!("start:reload:{search}")])
         .args(["--bind", &format!("change:reload:sleep 0.25; {search}")])
         .stdin(Stdio::inherit())
@@ -339,7 +396,7 @@ mod tests {
         print_results(
             &mut buf,
             &endpoints(&srv.url),
-            &[Source::Nyaa],
+            Category::Anime,
             "bunny",
             "",
             false,
@@ -362,12 +419,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_source_leaves_the_others() {
+    async fn failed_site_leaves_the_others() {
         // nyaa can't parse YTS's JSON, so only YTS's results are printed.
         let srv = FakeServer::start(200, SAMPLE_JSON).await;
         let mut buf = Vec::new();
-        let sources = [Source::Nyaa, Source::Yts];
-        print_results(&mut buf, &endpoints(&srv.url), &sources, "bunny", "", false).await;
+        let sites = [Site::Nyaa, Site::Yts];
+        print_sites(&mut buf, &endpoints(&srv.url), &sites, "bunny", "", false).await;
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.lines().count(), 2, "{out}");
         assert!(out.lines().all(|l| l.contains("yts")), "{out}");
@@ -376,17 +433,11 @@ mod tests {
     #[tokio::test]
     async fn failed_search_prints_nothing() {
         let srv = FakeServer::start(503, "").await;
-        let mut buf = Vec::new();
-        print_results(
-            &mut buf,
-            &endpoints(&srv.url),
-            &Source::ALL,
-            "bunny",
-            "",
-            false,
-        )
-        .await;
-        assert!(buf.is_empty());
+        for category in [Category::Anime, Category::Movies, Category::Series] {
+            let mut buf = Vec::new();
+            print_results(&mut buf, &endpoints(&srv.url), category, "bunny", "", false).await;
+            assert!(buf.is_empty(), "{category:?}");
+        }
     }
 
     #[tokio::test]
@@ -394,8 +445,8 @@ mod tests {
         // YTS twice: the second copy's magnets are all repeats.
         let srv = FakeServer::start(200, SAMPLE_JSON).await;
         let mut buf = Vec::new();
-        let sources = [Source::Yts, Source::Yts];
-        print_results(&mut buf, &endpoints(&srv.url), &sources, "bunny", "", false).await;
+        let sites = [Site::Yts, Site::Yts];
+        print_sites(&mut buf, &endpoints(&srv.url), &sites, "bunny", "", false).await;
         assert_eq!(String::from_utf8(buf).unwrap().lines().count(), 2);
     }
 

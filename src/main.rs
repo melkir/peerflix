@@ -34,7 +34,7 @@ use tokio::{net::TcpListener, signal::unix::SignalKind};
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 use crate::{
-    search::{Endpoints, NoSelection, Source, human_bytes},
+    search::{Category, Endpoints, NoSelection, human_bytes},
     storage::PartStorage,
     stream::{Reader, content_type, path_escape},
 };
@@ -48,7 +48,7 @@ const VERSION: &str = match option_env!("PEERFLIX_VERSION") {
 /// Stream a torrent straight into IINA.
 ///
 /// With a magnet link, .torrent file or http(s) URL, streams it. Anything else
-/// searches nyaa.si, YTS, EZTV and The Pirate Bay interactively in fzf.
+/// searches for anime, movies or series interactively in fzf.
 #[derive(Parser, Debug)]
 #[command(version = VERSION)]
 struct Cli {
@@ -76,18 +76,11 @@ struct Cli {
     #[arg(short, long)]
     no_play: bool,
 
-    /// Sites to search, comma separated [default: all, or nyaa with --user or
-    /// --trusted]
-    #[arg(
-        short = 's',
-        long = "source",
-        value_name = "SOURCE",
-        value_enum,
-        value_delimiter = ','
-    )]
-    sources: Vec<Source>,
+    /// What to search for; Tab switches between them in the search
+    #[arg(short, long, value_enum, default_value_t = Category::Anime)]
+    category: Category,
 
-    /// Only search torrents from this nyaa uploader (name or profile URL)
+    /// Only search anime from this nyaa uploader (name or profile URL)
     #[arg(short, long)]
     user: Option<String>,
 
@@ -153,13 +146,12 @@ fn raise_open_file_limit() {
 
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let user = nyaa_user(cli.user.as_deref().unwrap_or(""));
-    let sources = search_sources(&cli.sources, !user.is_empty() || cli.trusted);
     let mut source = cli.source.join(" ");
     if cli.print {
         search::print_results(
             &mut std::io::stdout().lock(),
             &Endpoints::from_env(),
-            &sources,
+            cli.category,
             &source,
             user,
             cli.trusted,
@@ -168,7 +160,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
     if !is_torrent_source(&source) {
-        source = search::search_interactive(&source, &sources, user, cli.trusted)?;
+        source = search::search_interactive(&source, cli.category, user, cli.trusted)?;
     }
 
     // Installed after fzf, which handles Ctrl-C itself.
@@ -185,25 +177,6 @@ async fn cancel_on_signal(cancel: CancellationToken) {
         _ = term.recv() => {}
     }
     cancel.cancel();
-}
-
-/// Returns the sources to search, without repeats: those given, or else all
-/// of them, or only nyaa when nyaa's uploader filters are on.
-fn search_sources(given: &[Source], nyaa_filters: bool) -> Vec<Source> {
-    if given.is_empty() {
-        return if nyaa_filters {
-            vec![Source::Nyaa]
-        } else {
-            Source::ALL.to_vec()
-        };
-    }
-    let mut sources = Vec::new();
-    for &s in given {
-        if !sources.contains(&s) {
-            sources.push(s);
-        }
-    }
-    sources
 }
 
 /// Accepts an uploader name or a profile URL such as
@@ -700,24 +673,16 @@ mod tests {
             "--user",
             "bob",
             "--trusted",
-            "--source",
-            "yts,eztv",
+            "--category",
+            "series",
             "--",
             "-dash query",
         ])
         .unwrap();
         assert!(cli.print && cli.trusted);
         assert_eq!(cli.user.as_deref(), Some("bob"));
-        assert_eq!(cli.sources, [Source::Yts, Source::Eztv]);
+        assert_eq!(cli.category, Category::Series);
         assert_eq!(cli.source, ["-dash query"]);
-    }
-
-    #[test]
-    fn picks_search_sources() {
-        use Source::*;
-        assert_eq!(search_sources(&[], false), [Nyaa, Yts, Eztv, Tpb]);
-        assert_eq!(search_sources(&[], true), [Nyaa]);
-        assert_eq!(search_sources(&[Eztv, Yts, Eztv], true), [Eztv, Yts]);
     }
 
     #[test]
