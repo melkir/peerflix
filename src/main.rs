@@ -192,31 +192,6 @@ async fn run(cancel: &CancellationToken, source: &str, cli: &Cli) -> anyhow::Res
     result
 }
 
-/// Loads a magnet link, .torrent URL or .torrent file. librqbit can fetch
-/// URLs and read files itself, but it takes any 40 character source for a
-/// bare info hash, and nyaa's https://nyaa.si/download/NNNNNNN.torrent links
-/// are exactly that long.
-async fn load_torrent(source: &str) -> anyhow::Result<AddTorrent<'_>> {
-    if source.starts_with("magnet:") {
-        return Ok(AddTorrent::from_url(source));
-    }
-    if source.starts_with("http://") || source.starts_with("https://") {
-        return Ok(AddTorrent::from_bytes(fetch_torrent(source).await?));
-    }
-    let data = tokio::fs::read(source)
-        .await
-        .with_context(|| format!("reading {source}"))?;
-    Ok(AddTorrent::from_bytes(data))
-}
-
-async fn fetch_torrent(url: &str) -> anyhow::Result<bytes::Bytes> {
-    let resp = reqwest::get(url).await.context("fetching torrent")?;
-    if !resp.status().is_success() {
-        bail!("fetching torrent: {}", resp.status());
-    }
-    resp.bytes().await.context("fetching torrent")
-}
-
 struct TorrentFile {
     path: String,
     len: u64,
@@ -237,11 +212,9 @@ async fn stream_torrent(
         list_only: true,
         ..Default::default()
     };
-    let Some(add) = cancel.run_until_cancelled(load_torrent(source)).await else {
-        return Ok(());
-    };
+    let add = AddTorrent::from_cli_argument(source)?;
     let Some(resp) = cancel
-        .run_until_cancelled(session.add_torrent(add?, Some(list_only)))
+        .run_until_cancelled(session.add_torrent(add, Some(list_only)))
         .await
     else {
         return Ok(());
@@ -357,17 +330,14 @@ async fn stream_torrent(
 }
 
 /// Serves file id of torrent. With --dir, existing data is checked first; IINA
-/// starts meanwhile and its first request waits for the check.
+/// starts meanwhile and librqbit holds its first request until the check ends.
 fn torrent_file(torrent: Arc<ManagedTorrent>, id: usize, name: String, len: u64) -> stream::File {
     stream::File {
         name,
         len,
         open: Box::new(move || {
             let t = torrent.clone();
-            Box::pin(async move {
-                t.wait_until_initialized().await?;
-                Ok(Box::pin(t.stream(id).await?) as Reader)
-            })
+            Box::pin(async move { Ok(Box::pin(t.stream(id).await?) as Reader) })
         }),
     }
 }
@@ -643,25 +613,45 @@ mod tests {
         session.stop().await;
     }
 
-    #[tokio::test]
-    async fn loads_40_char_urls_as_torrents() {
-        let srv = testutil::FakeServer::start(200, "d4:infod4:name1:xee").await;
-        // As long as an info hash, like nyaa's download links.
+    /// nyaa's download links are 40 characters long, like an info hash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lists_torrents_from_40_char_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("video.mkv"), "x".repeat(1000)).unwrap();
+        let spawner = librqbit::spawn_utils::BlockingSpawner::new(1);
+        let created =
+            librqbit::create_torrent(&dir.path().join("video.mkv"), Default::default(), &spawner)
+                .await
+                .unwrap();
+        let srv = testutil::FakeServer::start(200, created.as_bytes().unwrap()).await;
         let url = format!("{}/", srv.url);
         let url = format!("{url}{}", "x".repeat(40 - url.len()));
         assert_eq!(url.len(), 40);
-        match load_torrent(&url).await.unwrap() {
-            AddTorrent::TorrentFileBytes(b) => assert_eq!(&b[..], b"d4:infod4:name1:xee"),
-            AddTorrent::Url(u) => panic!("loaded as URL {u:?}"),
-        }
 
-        let srv = testutil::FakeServer::start(404, "").await;
-        let err = load_torrent(&format!("{}/a.torrent", srv.url))
+        let session = Session::new_with_opts(
+            dir.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                listen: None,
+                disable_trackers: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let list_only = AddTorrentOptions {
+            list_only: true,
+            ..Default::default()
+        };
+        let resp = session
+            .add_torrent(
+                AddTorrent::from_cli_argument(&url).unwrap(),
+                Some(list_only),
+            )
             .await
-            .err()
             .unwrap();
-        assert!(err.to_string().contains("404"), "{err}");
-        assert!(load_torrent("/nonexistent/a.torrent").await.is_err());
+        assert!(matches!(resp, AddTorrentResponse::ListOnly(_)));
+        session.stop().await;
     }
 
     #[test]
