@@ -111,9 +111,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let user = nyaa_user(cli.user.as_deref().unwrap_or(""));
     let mut source = cli.source.join(" ");
     if cli.print {
+        // PEERFLIX_NYAA_URL points search at another nyaa-compatible feed,
+        // such as a local mock for demos.
+        let base = std::env::var("PEERFLIX_NYAA_URL");
         search::print_results(
             &mut std::io::stdout().lock(),
-            nyaa::NYAA_URL,
+            base.as_deref().unwrap_or(nyaa::NYAA_URL),
             &source,
             user,
             cli.trusted,
