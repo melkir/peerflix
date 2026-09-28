@@ -7,6 +7,7 @@
 mod eztv;
 mod nyaa;
 mod search;
+mod storage;
 mod stream;
 #[cfg(test)]
 mod testutil;
@@ -27,12 +28,14 @@ use clap::Parser;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
     ListenerOptions, ManagedTorrent, PeerConnectionOptions, Session, SessionOptions, TorrentStats,
+    storage::StorageFactoryExt,
 };
 use tokio::{net::TcpListener, signal::unix::SignalKind};
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 use crate::{
     search::{Endpoints, NoSelection, Source, human_bytes},
+    storage::PartStorage,
     stream::{Reader, content_type, path_escape},
 };
 
@@ -291,11 +294,17 @@ async fn stream_torrent(
         .file_name()
         .map_or_else(|| file.path.clone(), |n| n.to_string_lossy().into_owned());
 
-    // Download just that file and its subtitles; streams still take priority.
-    // With --dir, existing data is checked and reused.
+    // Download just that file and its subtitles, as .part files until
+    // they're complete; streams still take priority. With --dir, existing
+    // data is checked and reused.
     let subs = subtitles(&files, id);
+    let wanted: Vec<usize> = [id].into_iter().chain(subs.iter().copied()).collect();
+    let storage = PartStorage::new(meta.output_folder.clone());
     let opts = AddTorrentOptions {
-        only_files: Some([id].into_iter().chain(subs.iter().copied()).collect()),
+        only_files: Some(wanted.clone()),
+        // Where librqbit would put it anyway, spelled out as storage uses it.
+        output_folder: Some(meta.output_folder.to_string_lossy().into_owned()),
+        storage_factory: Some(storage.clone().boxed()),
         overwrite: true,
         initial_peers: Some(meta.seen_peers),
         peer_opts: Some(PeerConnectionOptions {
@@ -356,13 +365,16 @@ async fn stream_torrent(
     let mut last_fetched = 0;
     let mut init = torrent.wait_until_initialized();
     let mut initialized = false;
+    let mut downloading = wanted;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
+                complete_files(&storage, &torrent.stats(), &files, &mut downloading);
                 eprintln!();
                 return Ok(());
             }
             result = &mut player => {
+                complete_files(&storage, &torrent.stats(), &files, &mut downloading);
                 eprintln!();
                 return result;
             }
@@ -375,12 +387,29 @@ async fn stream_torrent(
                     eprint!("\r\x1b[KChecking existing data...");
                     continue;
                 }
-                let (line, fetched) = progress_line(&torrent.stats(), id, file.len, last_fetched);
+                let stats = torrent.stats();
+                complete_files(&storage, &stats, &files, &mut downloading);
+                let (line, fetched) = progress_line(&stats, id, file.len, last_fetched);
                 eprint!("\r\x1b[K{line}");
                 last_fetched = fetched;
             }
         }
     }
+}
+
+/// Drops their .part suffix from the downloading files that have finished,
+/// and removes them from downloading.
+fn complete_files(
+    storage: &PartStorage,
+    stats: &TorrentStats,
+    files: &[TorrentFile],
+    downloading: &mut Vec<usize>,
+) {
+    downloading.retain(|&i| {
+        let done = stats.file_progress.get(i) == Some(&files[i].len);
+        // A failed rename is retried on the next tick.
+        !(done && storage.complete(i).is_ok())
+    });
 }
 
 /// Resolves the torrent's metadata without adding it, so nothing is
@@ -785,9 +814,12 @@ mod tests {
         let id = pick_file(&files, None).unwrap();
         assert_eq!(files[id].path, "video.mkv");
 
+        let storage = PartStorage::new(meta.output_folder.clone());
         let opts = AddTorrentOptions {
             only_files: Some(vec![id]),
             overwrite: true,
+            output_folder: Some(meta.output_folder.to_string_lossy().into_owned()),
+            storage_factory: Some(storage.boxed()),
             ..Default::default()
         };
         let torrent = session

@@ -96,8 +96,10 @@ Flags:
 at other hosts, such as a mirror when a site moves, or a local mock.
 
 peerflix exits when IINA quits (or on Ctrl-C). Downloaded data stays in the data directory, so
-playing the same torrent again checks and reuses it instead of downloading it again. macOS clears
-`$TMPDIR` of files unused for a few days; use `--dir` to keep data somewhere else.
+playing the same torrent again checks and reuses it instead of downloading it again. Only the files
+being downloaded are created there, named `NAME.part` until they're complete; a neighbouring file
+that shares a piece with them can also be left as a small `.part`. macOS clears `$TMPDIR` of files
+unused for a few days; use `--dir` to keep data somewhere else.
 
 ## Development
 
