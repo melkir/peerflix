@@ -64,7 +64,8 @@ struct Cli {
     #[arg(short, long)]
     dir: Option<PathBuf>,
 
-    /// File index to stream [default: largest video file]
+    /// File index to stream [default: ask when there are several episodes,
+    /// otherwise the largest video]
     #[arg(short, long)]
     index: Option<usize>,
 
@@ -84,7 +85,7 @@ struct Cli {
     #[arg(short, long)]
     user: Option<String>,
 
-    /// Only search torrents from trusted nyaa uploaders
+    /// Only search anime from trusted nyaa uploaders
     #[arg(short, long)]
     trusted: bool,
 
@@ -148,7 +149,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let user = nyaa_user(cli.user.as_deref().unwrap_or(""));
     let mut source = cli.source.join(" ");
     if cli.print {
-        search::print_results(
+        let status = search::print_results(
             &mut std::io::stdout().lock(),
             &Endpoints::from_env(),
             cli.category,
@@ -157,6 +158,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             cli.trusted,
         )
         .await;
+        // The interactive search shows it as its header.
+        if let Some(path) = std::env::var_os("PEERFLIX_STATUS") {
+            let _ = std::fs::write(path, status);
+        }
         return Ok(());
     }
     if !is_torrent_source(&source) {
@@ -434,7 +439,7 @@ fn progress_line(stats: &TorrentStats, id: usize, len: u64, last_fetched: u64) -
         (s.fetched_bytes, s.peer_stats.live, s.peer_stats.seen)
     });
     let line = format!(
-        "{:5.1}%  {}/s  peers {live}/{seen}",
+        "{:5.1}%  {:>10}/s  {live} peers, {seen} seen",
         100.0 * done as f64 / len.max(1) as f64,
         human_bytes(fetched.saturating_sub(last_fetched)),
     );
@@ -474,9 +479,9 @@ async fn select_file(
     Ok(Some(choice?.parse().context("reading fzf's choice")?))
 }
 
-/// Returns the video files worth choosing between, in natural path order:
-/// those at least a tenth the size of the largest, which leaves out samples
-/// and extras.
+/// Returns the video files worth choosing between, episodes first, each group
+/// in natural path order: those at least a tenth the size of the largest,
+/// which leaves out samples.
 fn episodes(files: &[TorrentFile]) -> Vec<usize> {
     let videos = || {
         files
@@ -489,7 +494,13 @@ fn episodes(files: &[TorrentFile]) -> Vec<usize> {
         .filter(|(_, f)| f.len.saturating_mul(10) >= largest)
         .map(|(i, _)| i)
         .collect();
-    eps.sort_by(|&a, &b| natural_cmp(&files[a].path, &files[b].path));
+    // Episodes, tagged like S01E02, before extras such as featurettes.
+    let untagged = |i: usize| episode_tag(&files[i].path.to_lowercase()).is_none();
+    eps.sort_by(|&a, &b| {
+        untagged(a)
+            .cmp(&untagged(b))
+            .then_with(|| natural_cmp(&files[a].path, &files[b].path))
+    });
     eps
 }
 
@@ -828,6 +839,12 @@ mod tests {
             ("Show/cover.jpg", 5000, false),
         ]);
         assert_eq!(episodes(&fs), [4, 2, 0]);
+        let pack = files(&[
+            ("Featurettes/Making of.mkv", 900, false),
+            ("Season 1/Show - S01E02.mkv", 1000, false),
+            ("Season 1/Show - S01E01.mkv", 1000, false),
+        ]);
+        assert_eq!(episodes(&pack), [2, 1, 0]);
         let one = files(&[("movie.mkv", 1000, false), ("sample.mkv", 20, false)]);
         assert_eq!(episodes(&one), [0]);
     }

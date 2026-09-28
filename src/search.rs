@@ -30,6 +30,15 @@ impl Category {
         }
     }
 
+    /// The other two categories, in Tab order.
+    fn others(self) -> [Category; 2] {
+        match self {
+            Category::Anime => [Category::Movies, Category::Series],
+            Category::Movies => [Category::Series, Category::Anime],
+            Category::Series => [Category::Anime, Category::Movies],
+        }
+    }
+
     fn sites(self) -> &'static [Site] {
         match self {
             Category::Anime => &[Site::Nyaa],
@@ -119,11 +128,15 @@ impl std::error::Error for NoSelection {}
 
 /// Queries category's sites for query in parallel and writes their results
 /// as fzf input as each site answers, one tab separated line per result: the
-/// torrent URL, the date, size, health and site, and the title. A failed
-/// search, such as a site being unavailable or rate limiting, prints nothing.
-/// Dead torrents, with no seeders, are left out, and so is a torrent another
-/// site already listed, going by info hash. user and trusted only apply to
-/// nyaa.
+/// torrent URL, the date, size, health, seeders and (when the category has
+/// several sites) site, and the title. A failed search, such as a site being
+/// unavailable or rate limiting, prints nothing. Dead torrents, with no
+/// seeders, are left out, and so is a torrent another site already listed,
+/// going by info hash. user and trusted only apply to nyaa.
+///
+/// Returns a status line for the search's header: which sites didn't answer,
+/// or where else to look when nothing was found, or nothing when all went
+/// well.
 pub async fn print_results(
     w: &mut impl Write,
     endpoints: &Endpoints,
@@ -131,10 +144,14 @@ pub async fn print_results(
     query: &str,
     user: &str,
     trusted: bool,
-) {
-    print_sites(w, endpoints, category.sites(), query, user, trusted).await;
+) -> String {
+    let sites = category.sites();
+    let (printed, failed) = print_sites(w, endpoints, sites, query, user, trusted).await;
+    status(category, query, printed, &failed, sites.len())
 }
 
+/// Returns the number of results printed and the names of the sites that
+/// failed.
 async fn print_sites(
     w: &mut impl Write,
     endpoints: &Endpoints,
@@ -142,9 +159,10 @@ async fn print_sites(
     query: &str,
     user: &str,
     trusted: bool,
-) {
+) -> (usize, Vec<&'static str>) {
+    let names: Vec<_> = sites.iter().map(|s| s.name()).collect();
     let Ok(client) = reqwest::Client::builder().timeout(TIMEOUT).build() else {
-        return;
+        return (0, names);
     };
     let mut tasks = JoinSet::new();
     for &site in sites {
@@ -157,12 +175,14 @@ async fn print_sites(
                 Site::Eztv => eztv::search(&client, &ep.imdb, &ep.eztv, &query).await,
                 Site::Tpb(kind) => tpb::search(&client, &ep.tpb, &query, kind).await,
             };
-            (site, items.unwrap_or_default())
+            (site, items)
         });
     }
     let mut seen = HashSet::new();
+    let (mut printed, mut answered) = (0, Vec::new());
     while let Some(res) = tasks.join_next().await {
-        let Ok((site, items)) = res else { continue };
+        let Ok((site, Ok(items))) = res else { continue };
+        answered.push(site);
         for it in items {
             if it.seeders == 0 {
                 continue;
@@ -170,20 +190,63 @@ async fn print_sites(
             if !it.info_hash.is_empty() && !seen.insert(it.info_hash.clone()) {
                 continue;
             }
+            let site_column = if sites.len() > 1 {
+                format!("  {:<4}", site.name())
+            } else {
+                String::new()
+            };
             // A closed pipe just means fzf moved on to the next query.
             let _ = writeln!(
                 w,
-                "{}\t\x1b[90m{}  {:>10}\x1b[0m  {} \x1b[90m{:<4}\x1b[0m \t{}",
+                "{}\t\x1b[90m{}  {:>10}\x1b[0m  {} {:>5}\x1b[90m seeds{site_column}\x1b[0m \t{}",
                 it.url,
                 it.date,
                 it.size,
                 health(&it),
-                site.name(),
+                it.seeders,
                 it.title
             );
+            printed += 1;
         }
         let _ = w.flush();
     }
+    let failed = sites
+        .iter()
+        .filter(|s| !answered.contains(s))
+        .map(|s| s.name())
+        .collect();
+    (printed, failed)
+}
+
+/// The header line for a search that printed printed results, with failed
+/// naming the sites, out of sites, that didn't answer.
+fn status(
+    category: Category,
+    query: &str,
+    printed: usize,
+    failed: &[&str],
+    sites: usize,
+) -> String {
+    let failed_sites = failed.join(" and ");
+    if failed.len() == sites {
+        return format!("{failed_sites} didn't answer. Check your connection and try again.");
+    }
+    let missing = if failed.is_empty() {
+        String::new()
+    } else {
+        format!("{failed_sites} didn't answer. ")
+    };
+    if printed > 0 {
+        return missing.trim_end().to_owned();
+    }
+    let [a, b] = category.others().map(Category::name);
+    let query = query.trim();
+    let none = if query.is_empty() {
+        format!("No {} to show.", category.name())
+    } else {
+        format!("No {} results for \"{query}\".", category.name())
+    };
+    format!("{missing}{none} Tab searches {a} and {b}.")
 }
 
 /// Rates a torrent by its seeders relative to its leechers.
@@ -224,6 +287,9 @@ pub fn search_interactive(
     // results for the new query. fzf kills a running reload when the next
     // one starts, so the sleep debounces typing.
     //
+    // Each search writes a status line to PEERFLIX_STATUS, shown as the
+    // header once its results have loaded.
+    //
     // Tab changes the prompt and reloads in one transform, since a reload
     // chained after change-prompt still sees the old prompt. The search
     // command comes from PEERFLIX_SEARCH so that fzf fills in its {q} at
@@ -234,9 +300,19 @@ pub fn search_interactive(
             order[0], order[1], order[2]
         )
     };
+    let status = std::env::temp_dir().join(format!("peerflix-{}.status", std::process::id()));
     let out = Command::new("fzf")
         .env("PEERFLIX_SEARCH", &search)
-        .args(["--ansi", "--exact", "-i", "--no-sort", "--tabstop", "1"])
+        .env("PEERFLIX_STATUS", &status)
+        .args([
+            "--ansi",
+            "--exact",
+            "-i",
+            "--no-sort",
+            "--tabstop",
+            "1",
+            "--wrap",
+        ])
         .args(["--query", initial])
         .args(["--prompt", &format!("{}> ", category.name())])
         .args(["--with-shell", "sh -c"])
@@ -261,11 +337,16 @@ pub fn search_interactive(
         ])
         .args(["--bind", &format!("start:reload:{search}")])
         .args(["--bind", &format!("change:reload:sleep 0.25; {search}")])
+        .args([
+            "--bind",
+            r#"load:transform-header:cat "$PEERFLIX_STATUS" 2>/dev/null"#,
+        ])
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output()
-        .context(FZF)?;
-    fzf_choice(out)
+        .context(FZF);
+    let _ = std::fs::remove_file(&status);
+    fzf_choice(out?)
 }
 
 /// Runs fzf over lines, each the value to return, a tab, a dimmed detail
@@ -273,7 +354,15 @@ pub fn search_interactive(
 /// NoSelection if the user quits.
 pub async fn choose(prompt: &str, lines: String) -> anyhow::Result<String> {
     let mut child = tokio::process::Command::new("fzf")
-        .args(["--ansi", "--exact", "-i", "--no-sort", "--tabstop", "1"])
+        .args([
+            "--ansi",
+            "--exact",
+            "-i",
+            "--no-sort",
+            "--tabstop",
+            "1",
+            "--wrap",
+        ])
         .args(["--prompt", prompt])
         .args([
             "--delimiter",
@@ -415,10 +504,12 @@ mod tests {
         assert!(
             fields[1].contains("2026-09-26")
                 && fields[1].contains("1.2 GiB")
-                && fields[1].contains("nyaa"),
+                && fields[1].contains("42\x1b[90m seeds"),
             "{:?}",
             fields[1]
         );
+        // Anime has one site, so no site column.
+        assert!(!fields[1].contains("nyaa"), "{:?}", fields[1]);
         assert_eq!(fields[2], "[Group] Big Buck Bunny - 01 [1080p].mkv");
     }
 
@@ -453,6 +544,29 @@ mod tests {
         print_sites(&mut buf, &endpoints(&srv.url), &sites, "bunny", "", false).await;
         // One of YTS's two torrents in the sample is dead.
         assert_eq!(String::from_utf8(buf).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn statuses() {
+        use Category::*;
+        assert_eq!(status(Movies, "x", 5, &[], 2), "");
+        assert_eq!(status(Movies, "x", 5, &["tpb"], 2), "tpb didn't answer.");
+        assert_eq!(
+            status(Movies, "x", 0, &["yts", "tpb"], 2),
+            "yts and tpb didn't answer. Check your connection and try again."
+        );
+        assert_eq!(
+            status(Anime, "inception ", 0, &[], 1),
+            "No anime results for \"inception\". Tab searches movies and series."
+        );
+        assert_eq!(
+            status(Series, "x", 0, &["tpb"], 2),
+            "tpb didn't answer. No series results for \"x\". Tab searches anime and movies."
+        );
+        assert_eq!(
+            status(Movies, "", 0, &[], 2),
+            "No movies to show. Tab searches series and anime."
+        );
     }
 
     #[test]
