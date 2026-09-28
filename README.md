@@ -69,7 +69,9 @@ what you typed. The prompt shows the current one:
 Before you type anything, anime lists nyaa's newest uploads, movies The Pirate Bay's top 100 HD
 movies, and series its top 100 HD TV shows.
 
-Each result shows its date, size and seeders, and in movies and series the site it came from.
+Each result shows its date, size and number of seeders, and in movies and series the site it
+came from. The seeder count is green when seeders outnumber leechers, yellow when they're even,
+and orange when leechers outnumber them.
 Dead torrents, which have no seeders, are left out. When a search finds nothing, or a site
 doesn't answer, a line above the results says so. The sites of a category are queried in parallel,
 and each one's results show up as soon as it answers, so a slow or unreachable site (which gets 8

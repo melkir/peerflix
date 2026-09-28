@@ -113,11 +113,11 @@ const TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Queries category's sites for query in parallel and writes their results
 /// as fzf input as each site answers, one tab separated line per result: the
-/// torrent URL, the date, size, health, seeders and (when the category has
-/// several sites) site, and the title. A failed search, such as a site being
-/// unavailable or rate limiting, prints nothing. Dead torrents, with no
-/// seeders, are left out, and so is a torrent another site already listed,
-/// going by info hash. user and trusted only apply to nyaa.
+/// torrent URL, the date, size, seeders (colored by health) and, when the
+/// category has several sites, site, and the title. A failed search, such as
+/// a site being unavailable or rate limiting, prints nothing. Dead torrents,
+/// with no seeders, are left out, and so is a torrent another site already
+/// listed, going by info hash. user and trusted only apply to nyaa.
 ///
 /// Returns a status line for the search's header: which sites didn't answer,
 /// or where else to look when nothing was found, or nothing when all went
@@ -190,7 +190,7 @@ async fn print_sites(
             // A closed pipe just means fzf moved on to the next query.
             let _ = writeln!(
                 w,
-                "{}\t\x1b[90m{}  {:>10}\x1b[0m  {} {:>5}\x1b[90m seeds{site_column}\x1b[0m \t{}",
+                "{}\t\x1b[90m{}  {:>10}\x1b[0m  {}{:>5}\x1b[90m{site_column}\x1b[0m \t{}",
                 it.url,
                 it.date,
                 it.size,
@@ -260,14 +260,15 @@ pub async fn get_json<T: DeserializeOwned>(
         .with_context(|| format!("parsing {site} results"))
 }
 
-/// Rates a torrent by its seeders relative to its leechers.
-pub fn health(it: &Torrent) -> &'static str {
+/// Rates a torrent by its seeders relative to its leechers, as the color to
+/// print its seeder count in.
+fn health(it: &Torrent) -> &'static str {
     use std::cmp::Ordering::*;
     match (it.seeders, it.seeders.cmp(&it.leechers)) {
-        (0, _) => "\x1b[31m●\x1b[0m",
-        (_, Greater) => "\x1b[32m●\x1b[0m",
-        (_, Equal) => "\x1b[33m●\x1b[0m",
-        (_, Less) => "\x1b[38;5;208m●\x1b[0m",
+        (0, _) => "\x1b[31m",
+        (_, Greater) => "\x1b[32m",
+        (_, Equal) => "\x1b[33m",
+        (_, Less) => "\x1b[38;5;208m",
     }
 }
 
@@ -365,7 +366,8 @@ mod tests {
         assert!(
             fields[1].contains("2026-09-26")
                 && fields[1].contains("1.2 GiB")
-                && fields[1].contains("42\x1b[90m seeds"),
+                // 42 seeders and 3 leechers: green.
+                && fields[1].contains("\x1b[32m   42"),
             "{:?}",
             fields[1]
         );
@@ -445,7 +447,7 @@ mod tests {
                 ..Torrent::default()
             };
             assert!(
-                health(&it).starts_with(color),
+                health(&it) == color,
                 "{seeders} seeders, {leechers} leechers"
             );
         }
