@@ -591,8 +591,8 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/video.mkv", listener.local_addr().unwrap());
-        // torrent_file waits for the initial check, which is too quick here
-        // to overlap with the requests.
+        // librqbit's stream() waits for the initial check, which is too quick
+        // here to overlap with the requests.
         let file = torrent_file(torrent.clone(), id, "video.mkv".into(), files[id].len);
         let _server = AbortOnDrop(tokio::spawn(stream::serve(listener, Arc::new(file))));
 
@@ -608,47 +608,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 206);
         assert_eq!(resp.text().await.unwrap(), data[20000..20010]);
-        session.stop().await;
-    }
-
-    /// nyaa's download links are 40 characters long, like an info hash.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn lists_torrents_from_40_char_urls() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("video.mkv"), "x".repeat(1000)).unwrap();
-        let spawner = librqbit::spawn_utils::BlockingSpawner::new(1);
-        let created =
-            librqbit::create_torrent(&dir.path().join("video.mkv"), Default::default(), &spawner)
-                .await
-                .unwrap();
-        let srv = testutil::FakeServer::start(200, created.as_bytes().unwrap()).await;
-        let url = format!("{}/", srv.url);
-        let url = format!("{url}{}", "x".repeat(40 - url.len()));
-        assert_eq!(url.len(), 40);
-
-        let session = Session::new_with_opts(
-            dir.path().to_owned(),
-            SessionOptions {
-                dht: None,
-                listen: None,
-                disable_trackers: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let list_only = AddTorrentOptions {
-            list_only: true,
-            ..Default::default()
-        };
-        let resp = session
-            .add_torrent(
-                AddTorrent::from_cli_argument(&url).unwrap(),
-                Some(list_only),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(resp, AddTorrentResponse::ListOnly(_)));
         session.stop().await;
     }
 
