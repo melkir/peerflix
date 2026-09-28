@@ -235,7 +235,6 @@ pub fn search_interactive(
         .args(["--ansi", "--exact", "-i", "--no-sort", "--tabstop", "1"])
         .args(["--query", initial])
         .args(["--prompt", &format!("{}> ", category.name())])
-        .args(["--header", "tab: anime · movies · series"])
         .args(["--with-shell", "sh -c"])
         .args([
             "--delimiter",

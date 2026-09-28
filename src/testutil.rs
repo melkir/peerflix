@@ -11,9 +11,10 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 /// An HTTP server that answers every request with the same status and body,
-/// and records each request's query.
+/// and records each request's path and query.
 pub struct FakeServer {
     pub url: String,
+    paths: Arc<Mutex<Vec<String>>>,
     queries: Arc<Mutex<Vec<HashMap<String, String>>>>,
 }
 
@@ -23,14 +24,16 @@ impl FakeServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let queries = Arc::new(Mutex::new(Vec::new()));
-        let recorded = queries.clone();
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let (recorded, recorded_paths) = (queries.clone(), paths.clone());
         tokio::spawn(async move {
             loop {
                 let (sock, _) = listener.accept().await.unwrap();
-                let recorded = recorded.clone();
+                let (recorded, recorded_paths) = (recorded.clone(), recorded_paths.clone());
                 let body = body.clone();
                 let svc = service_fn(move |req: hyper::Request<_>| {
                     let url = reqwest::Url::parse(&format!("http://x{}", req.uri())).unwrap();
+                    recorded_paths.lock().unwrap().push(url.path().to_owned());
                     recorded
                         .lock()
                         .unwrap()
@@ -48,7 +51,15 @@ impl FakeServer {
                 tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(sock), svc));
             }
         });
-        Self { url, queries }
+        Self {
+            url,
+            paths,
+            queries,
+        }
+    }
+
+    pub fn paths(&self) -> Vec<String> {
+        self.paths.lock().unwrap().clone()
     }
 
     pub fn queries(&self) -> Vec<HashMap<String, String>> {

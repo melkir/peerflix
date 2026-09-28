@@ -42,7 +42,8 @@ struct Item {
 }
 
 /// Searches EZTV for the show IMDb suggests for query, newest first. A
-/// trailing S01E02, S01 or 1x02 keeps only that season or episode.
+/// trailing S01E02, S01 or 1x02 keeps only that season or episode. Without a
+/// show, lists the newest episodes of every show.
 pub async fn search(
     client: &reqwest::Client,
     imdb: &str,
@@ -50,13 +51,19 @@ pub async fn search(
     query: &str,
 ) -> anyhow::Result<Vec<Torrent>> {
     let (show, wanted) = split_episode(query);
-    if show.is_empty() {
-        return Ok(Vec::new());
-    }
-    let Some(id) = show_id(client, imdb, show).await? else {
-        return Ok(Vec::new());
+    let id = if show.is_empty() {
+        String::new()
+    } else {
+        match show_id(client, imdb, show).await? {
+            Some(id) => id,
+            None => return Ok(Vec::new()),
+        }
     };
-    let pages = if wanted.is_some() { MAX_PAGES } else { 1 };
+    let pages = if wanted.is_some() && !id.is_empty() {
+        MAX_PAGES
+    } else {
+        1
+    };
     let items = torrents(client, base, &id, pages).await?;
     Ok(items
         .into_iter()
@@ -101,8 +108,9 @@ async fn show_id(
         .map(|s| s.id))
 }
 
-/// Fetches up to max_pages pages of the show's torrents, newest first; pages
-/// after the first are fetched in parallel.
+/// Fetches up to max_pages pages of the torrents of the show with IMDb ID id,
+/// or of every show if id is empty, newest first; pages after the first are
+/// fetched in parallel.
 async fn torrents(
     client: &reqwest::Client,
     base: &str,
@@ -129,13 +137,14 @@ async fn torrents(
 }
 
 async fn page(client: &reqwest::Client, base: &str, id: &str, n: usize) -> anyhow::Result<Page> {
+    let (limit, n) = (PAGE_SIZE.to_string(), n.to_string());
+    let mut params = vec![("limit", limit.as_str()), ("page", n.as_str())];
+    if !id.is_empty() {
+        params.push(("imdb_id", id.trim_start_matches("tt")));
+    }
     let resp = client
         .get(format!("{base}/api/get-torrents"))
-        .query(&[
-            ("imdb_id", id.trim_start_matches("tt")),
-            ("limit", &PAGE_SIZE.to_string()),
-            ("page", &n.to_string()),
-        ])
+        .query(&params)
         .send()
         .await
         .context("searching eztv")?;
@@ -240,6 +249,18 @@ mod tests {
         for (k, want) in [("imdb_id", "0944947"), ("limit", "100"), ("page", "1")] {
             assert_eq!(q.get(k).map(String::as_str), Some(want), "query {k}");
         }
+    }
+
+    #[tokio::test]
+    async fn empty_query_lists_latest() {
+        let srv = FakeServer::start(200, SAMPLE_JSON).await;
+        let client = reqwest::Client::new();
+        let items = search(&client, &srv.url, &srv.url, " ").await.unwrap();
+        assert_eq!(items.len(), 2);
+        let q = srv.queries();
+        assert_eq!(q.len(), 1, "looked up a show: {q:?}");
+        assert!(!q[0].contains_key("imdb_id"), "{q:?}");
+        assert_eq!(srv.paths(), ["/api/get-torrents"]);
     }
 
     #[tokio::test]
