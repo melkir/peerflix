@@ -58,7 +58,7 @@ struct Cli {
     #[arg(short, long, default_value_t = 8888)]
     port: u16,
 
-    /// Download directory [default: temporary dir, removed on exit]
+    /// Download directory, reused across runs [default: $TMPDIR/peerflix]
     #[arg(short, long)]
     dir: Option<PathBuf>,
 
@@ -94,7 +94,8 @@ fn main() -> ExitCode {
         .build()
         .expect("starting the tokio runtime");
     let result = rt.block_on(async_main(cli));
-    // Don't wait on librqbit's blocking disk tasks; the data is disposable.
+    // Don't wait on librqbit's blocking disk tasks; the next run's data check
+    // catches any piece they didn't finish writing.
     rt.shutdown_timeout(Duration::from_secs(1));
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -159,14 +160,11 @@ fn is_torrent_source(s: &str) -> bool {
 }
 
 async fn run(cancel: &CancellationToken, source: &str, cli: &Cli) -> anyhow::Result<()> {
-    // Declared first so it's removed after the session has closed its files.
-    let tmp;
+    // Kept after exit so a later run resumes from it. macOS clears $TMPDIR
+    // of files that go unused for a few days.
     let data_dir = match &cli.dir {
         Some(dir) => dir.clone(),
-        None => {
-            tmp = tempfile::Builder::new().prefix("peerflix-").tempdir()?;
-            tmp.path().to_owned()
-        }
+        None => std::env::temp_dir().join("peerflix"),
     };
 
     let session = Session::new_with_opts(

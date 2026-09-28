@@ -51,15 +51,16 @@ Flags:
 | `-i, --index N` | largest video | file to stream |
 | `-l, --list` | | list files and exit |
 | `-p, --port N` | 8888 | local HTTP port (0 = random) |
-| `-d, --dir PATH` | temp dir | where to store data |
+| `-d, --dir PATH` | `$TMPDIR/peerflix` | where to store data |
 | `-n, --no-play` | | only serve `http://127.0.0.1:PORT/<name>` |
 | `-t, --trusted` | | only search trusted nyaa uploads |
 | `--print` | | print search results and exit |
 | `-u, --user NAME` | | restrict search to a nyaa uploader (name or profile URL) |
 | `-V, --version` | | print the version and exit |
 
-peerflix exits when IINA quits (or on Ctrl-C) and removes the temp data unless `--dir` is set.
-With `--dir`, data from an earlier run is checked and reused.
+peerflix exits when IINA quits (or on Ctrl-C). Downloaded data stays in the data directory, so
+playing the same torrent again checks and reuses it instead of downloading it again. macOS clears
+`$TMPDIR` of files unused for a few days; use `--dir` to keep data somewhere else.
 
 ## Development
 
