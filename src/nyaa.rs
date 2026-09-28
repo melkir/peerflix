@@ -1,6 +1,8 @@
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
+use crate::search::Torrent;
+
 pub const NYAA_URL: &str = "https://nyaa.si";
 
 #[derive(Debug, Default, Deserialize)]
@@ -9,16 +11,11 @@ pub struct Item {
     pub title: String,
     #[serde(rename = "link")]
     pub torrent: String,
-    #[serde(rename = "guid")]
-    pub view: String,
     #[serde(rename = "pubDate")]
     pub pub_date: String,
     // The nyaa: namespace elements; quick-xml matches them by local name.
     pub seeders: u32,
     pub leechers: u32,
-    #[serde(rename = "infoHash")]
-    pub info_hash: String,
-    pub category: String,
     pub size: String,
 }
 
@@ -55,17 +52,18 @@ fn parse_rfc1123z(s: &str) -> Option<String> {
 /// results sorted newest first. A non-empty user restricts results to that
 /// uploader; trusted excludes uploads from untrusted users.
 pub async fn search(
+    client: &reqwest::Client,
     base: &str,
     query: &str,
     user: &str,
     trusted: bool,
-) -> anyhow::Result<Vec<Item>> {
+) -> anyhow::Result<Vec<Torrent>> {
     let filter = if trusted { "2" } else { "0" };
     let mut params = vec![("page", "rss"), ("q", query), ("c", "0_0"), ("f", filter)];
     if !user.is_empty() {
         params.push(("u", user));
     }
-    let resp = reqwest::Client::new()
+    let resp = client
         .get(format!("{base}/"))
         .query(&params)
         .send()
@@ -90,7 +88,20 @@ pub async fn search(
         item: Vec<Item>,
     }
     let rss: Rss = quick_xml::de::from_str(&body).context("parsing nyaa results")?;
-    Ok(rss.channel.item)
+    Ok(rss.channel.item.into_iter().map(Torrent::from).collect())
+}
+
+impl From<Item> for Torrent {
+    fn from(it: Item) -> Self {
+        Torrent {
+            date: it.date(),
+            url: it.torrent,
+            title: it.title,
+            size: it.size,
+            seeders: it.seeders,
+            leechers: it.leechers,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -128,20 +139,18 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn search_parses_feed() {
         let srv = FakeServer::start(200, SAMPLE_FEED).await;
-        let items = search(&srv.url, "big buck bunny", "someone", true)
+        let client = reqwest::Client::new();
+        let items = search(&client, &srv.url, "big buck bunny", "someone", true)
             .await
             .unwrap();
         assert_eq!(items.len(), 2);
         let it = &items[0];
         assert_eq!(it.title, "[Group] Big Buck Bunny - 01 [1080p].mkv");
-        assert_eq!(it.torrent, "https://nyaa.si/download/1.torrent");
-        assert_eq!(it.view, "https://nyaa.si/view/1");
+        assert_eq!(it.url, "https://nyaa.si/download/1.torrent");
         assert_eq!((it.seeders, it.leechers), (42, 3));
-        assert_eq!(it.info_hash, "0123456789abcdef0123456789abcdef01234567");
-        assert_eq!(it.category, "Anime - English-translated");
         assert_eq!(it.size, "1.2 GiB");
-        assert_eq!(it.date(), "2026-09-26");
-        assert_eq!(items[1].info_hash, "");
+        assert_eq!(it.date, "2026-09-26");
+        assert_eq!((items[1].seeders, items[1].leechers), (0, 0));
 
         let q = srv.queries().remove(0);
         for (k, want) in [
@@ -158,7 +167,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn search_defaults() {
         let srv = FakeServer::start(200, SAMPLE_FEED).await;
-        search(&srv.url, "", "", false).await.unwrap();
+        search(&reqwest::Client::new(), &srv.url, "", "", false)
+            .await
+            .unwrap();
         let q = srv.queries().remove(0);
         assert_eq!(q.get("f").map(String::as_str), Some("0"));
         assert!(!q.contains_key("u"), "user set without --user");
@@ -167,14 +178,18 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn search_errors() {
         let srv = FakeServer::start(404, "").await;
-        let err = search(&srv.url, "", "nobody", false).await.unwrap_err();
+        let err = search(&reqwest::Client::new(), &srv.url, "", "nobody", false)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains(r#"user "nobody" not found"#),
             "{err}"
         );
 
         let srv = FakeServer::start(429, "").await;
-        let err = search(&srv.url, "x", "", false).await.unwrap_err();
+        let err = search(&reqwest::Client::new(), &srv.url, "x", "", false)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("429"), "{err}");
     }
 

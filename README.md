@@ -6,7 +6,7 @@ Stream a torrent straight into [IINA](https://iina.io).
 
 <img width="800" height="450" alt="peerflix demo: search, pick a torrent, and it plays in IINA" src="https://github.com/user-attachments/assets/e9a69810-ebc9-4a66-8468-88c7ca1a0085" />
 
-<sub>The demo searches a local feed of Blender Studio open movies (CC BY) instead of nyaa.</sub>
+<sub>The demo searches a local feed of Blender Studio open movies (CC BY) instead of the real sites.</sub>
 
 ## Install
 
@@ -30,17 +30,30 @@ peerflix movie.torrent
 peerflix https://example.com/movie.torrent
 ```
 
-## Search nyaa.si
+## Search
 
 ```sh
 peerflix                                  # type to search
 peerflix big buck bunny                   # start with a query
-peerflix --user NAME                      # browse/search one uploader
+peerflix -s yts inception                 # search only some sites
+peerflix house of the dragon s02          # one season (or S02E03, 2x03) of a show
+peerflix --user NAME                      # browse/search one nyaa uploader
 peerflix --user NAME QUERY
 ```
 
+Search covers three sites at once, and each result is tagged with the site it came from:
+
+- [nyaa.si](https://nyaa.si), mostly anime: the 75 newest matches, so type an episode number to reach older ones.
+- [YTS](https://yts.bz) movies: one line per movie and quality, most seeded first.
+- [EZTV](https://eztvx.to) TV shows: EZTV only looks up shows by IMDb ID, so the query goes through
+  IMDb's title suggestions first and the best matching show is listed, newest first. A trailing
+  `S02`, `S02E03` or `2x03` narrows it to that season or episode.
+
+The sites are queried in parallel, and each one's results show up as soon as it answers, so a
+slow or unreachable site (which gets 8 seconds) never holds up the others.
+
 Search runs in [fzf](https://github.com/junegunn/fzf) 0.60 or later, which must be on your
-`PATH`. Each keystroke instantly filters the loaded results by title (space separated terms, matches highlighted) while nyaa is re-queried in the background for the new query. Enter streams the selection to IINA, Esc quits. Each nyaa search returns its 75 newest matches, so type an episode number to reach older ones.
+`PATH`. Each keystroke instantly filters the loaded results by title (space separated terms, matches highlighted) while the sites are re-queried in the background for the new query. Enter streams the selection to IINA, Esc quits.
 
 `--print` writes the results for the search terms as `URL<TAB>columns` lines, so you can pipe them into your own tools:
 
@@ -57,10 +70,14 @@ Flags:
 | `-p, --port N` | 8888 | local HTTP port (0 = random) |
 | `-d, --dir PATH` | `$TMPDIR/peerflix` | where to store data |
 | `-n, --no-play` | | only serve `http://127.0.0.1:PORT/<name>` |
-| `-t, --trusted` | | only search trusted nyaa uploads |
+| `-s, --source LIST` | all | sites to search: `nyaa`, `yts`, `eztv`, comma separated |
+| `-t, --trusted` | | only search trusted nyaa uploads (implies `-s nyaa`) |
 | `--print` | | print search results and exit |
-| `-u, --user NAME` | | restrict search to a nyaa uploader (name or profile URL) |
+| `-u, --user NAME` | | restrict search to a nyaa uploader, name or profile URL (implies `-s nyaa`) |
 | `-V, --version` | | print the version and exit |
+
+`PEERFLIX_NYAA_URL`, `PEERFLIX_YTS_URL`, `PEERFLIX_EZTV_URL` and `PEERFLIX_IMDB_URL` point search
+at other hosts, such as a mirror when a site moves, or a local mock.
 
 peerflix exits when IINA quits (or on Ctrl-C). Downloaded data stays in the data directory, so
 playing the same torrent again checks and reuses it instead of downloading it again. macOS clears

@@ -4,11 +4,13 @@
 //! reads prioritize the pieces around the player's read position, so playback
 //! starts as soon as the first pieces arrive and seeking works.
 
+mod eztv;
 mod nyaa;
 mod search;
 mod stream;
 #[cfg(test)]
 mod testutil;
+mod yts;
 
 use std::{
     path::{Path, PathBuf},
@@ -27,7 +29,7 @@ use tokio::{net::TcpListener, signal::unix::SignalKind};
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 use crate::{
-    search::NoSelection,
+    search::{Endpoints, NoSelection, Source, human_bytes},
     stream::{Reader, content_type, path_escape},
 };
 
@@ -40,11 +42,11 @@ const VERSION: &str = match option_env!("PEERFLIX_VERSION") {
 /// Stream a torrent straight into IINA.
 ///
 /// With a magnet link, .torrent file or http(s) URL, streams it. Anything else
-/// searches nyaa.si interactively in fzf.
+/// searches nyaa.si, YTS and EZTV interactively in fzf.
 #[derive(Parser, Debug)]
 #[command(version = VERSION)]
 struct Cli {
-    /// Magnet link, .torrent file or URL, or nyaa search terms
+    /// Magnet link, .torrent file or URL, or search terms
     #[arg(value_name = "SOURCE | QUERY")]
     source: Vec<String>,
 
@@ -68,6 +70,17 @@ struct Cli {
     #[arg(short, long)]
     no_play: bool,
 
+    /// Sites to search, comma separated [default: all, or nyaa with --user or
+    /// --trusted]
+    #[arg(
+        short = 's',
+        long = "source",
+        value_name = "SOURCE",
+        value_enum,
+        value_delimiter = ','
+    )]
+    sources: Vec<Source>,
+
     /// Only search torrents from this nyaa uploader (name or profile URL)
     #[arg(short, long)]
     user: Option<String>,
@@ -76,7 +89,7 @@ struct Cli {
     #[arg(short, long)]
     trusted: bool,
 
-    /// Print nyaa results for the search terms as fzf input and exit
+    /// Print results for the search terms as fzf input and exit
     #[arg(long)]
     print: bool,
 }
@@ -103,14 +116,13 @@ fn main() -> ExitCode {
 
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let user = nyaa_user(cli.user.as_deref().unwrap_or(""));
+    let sources = search_sources(&cli.sources, !user.is_empty() || cli.trusted);
     let mut source = cli.source.join(" ");
     if cli.print {
-        // PEERFLIX_NYAA_URL points search at another nyaa-compatible feed,
-        // such as a local mock for demos.
-        let base = std::env::var("PEERFLIX_NYAA_URL");
         search::print_results(
             &mut std::io::stdout().lock(),
-            base.as_deref().unwrap_or(nyaa::NYAA_URL),
+            &Endpoints::from_env(),
+            &sources,
             &source,
             user,
             cli.trusted,
@@ -119,7 +131,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
     if !is_torrent_source(&source) {
-        source = search::search_interactive(&source, user, cli.trusted)?;
+        source = search::search_interactive(&source, &sources, user, cli.trusted)?;
     }
 
     // Installed after fzf, which handles Ctrl-C itself.
@@ -136,6 +148,25 @@ async fn cancel_on_signal(cancel: CancellationToken) {
         _ = term.recv() => {}
     }
     cancel.cancel();
+}
+
+/// Returns the sources to search, without repeats: those given, or else all
+/// of them, or only nyaa when nyaa's uploader filters are on.
+fn search_sources(given: &[Source], nyaa_filters: bool) -> Vec<Source> {
+    if given.is_empty() {
+        return if nyaa_filters {
+            vec![Source::Nyaa]
+        } else {
+            Source::ALL.to_vec()
+        };
+    }
+    let mut sources = Vec::new();
+    for &s in given {
+        if !sources.contains(&s) {
+            sources.push(s);
+        }
+    }
+    sources
 }
 
 /// Accepts an uploader name or a profile URL such as
@@ -405,25 +436,6 @@ async fn launch_iina(url: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn human_bytes(n: u64) -> String {
-    const UNIT: u64 = 1024;
-    if n < UNIT {
-        return format!("{n} B");
-    }
-    let (mut div, mut exp) = (UNIT, 0);
-    let mut m = n / UNIT;
-    while m >= UNIT {
-        div *= UNIT;
-        exp += 1;
-        m /= UNIT;
-    }
-    format!(
-        "{:.1} {}iB",
-        n as f64 / div as f64,
-        "KMGTPE".as_bytes()[exp] as char
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,13 +455,24 @@ mod tests {
             "--user",
             "bob",
             "--trusted",
+            "--source",
+            "yts,eztv",
             "--",
             "-dash query",
         ])
         .unwrap();
         assert!(cli.print && cli.trusted);
         assert_eq!(cli.user.as_deref(), Some("bob"));
+        assert_eq!(cli.sources, [Source::Yts, Source::Eztv]);
         assert_eq!(cli.source, ["-dash query"]);
+    }
+
+    #[test]
+    fn picks_search_sources() {
+        use Source::*;
+        assert_eq!(search_sources(&[], false), [Nyaa, Yts, Eztv]);
+        assert_eq!(search_sources(&[], true), [Nyaa]);
+        assert_eq!(search_sources(&[Eztv, Yts, Eztv], true), [Eztv, Yts]);
     }
 
     #[test]
@@ -481,21 +504,6 @@ mod tests {
             (dir.path().join("x.mkv").to_str().unwrap(), false),
         ] {
             assert_eq!(is_torrent_source(s), want, "{s:?}");
-        }
-    }
-
-    #[test]
-    fn human_sizes() {
-        for (n, want) in [
-            (0, "0 B"),
-            (1023, "1023 B"),
-            (1024, "1.0 KiB"),
-            (1536, "1.5 KiB"),
-            (1 << 20, "1.0 MiB"),
-            (5 << 30, "5.0 GiB"),
-            (3 << 40, "3.0 TiB"),
-        ] {
-            assert_eq!(human_bytes(n), want);
         }
     }
 
