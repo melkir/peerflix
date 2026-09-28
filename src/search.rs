@@ -121,8 +121,9 @@ impl std::error::Error for NoSelection {}
 /// as fzf input as each site answers, one tab separated line per result: the
 /// torrent URL, the date, size, health and site, and the title. A failed
 /// search, such as a site being unavailable or rate limiting, prints nothing.
-/// A torrent another site already listed, going by info hash, is skipped.
-/// user and trusted only apply to nyaa.
+/// Dead torrents, with no seeders, are left out, and so is a torrent another
+/// site already listed, going by info hash. user and trusted only apply to
+/// nyaa.
 pub async fn print_results(
     w: &mut impl Write,
     endpoints: &Endpoints,
@@ -163,6 +164,9 @@ async fn print_sites(
     while let Some(res) = tasks.join_next().await {
         let Ok((site, items)) = res else { continue };
         for it in items {
+            if it.seeders == 0 {
+                continue;
+            }
             if !it.info_hash.is_empty() && !seen.insert(it.info_hash.clone()) {
                 continue;
             }
@@ -403,7 +407,8 @@ mod tests {
         .await;
         let out = String::from_utf8(buf).unwrap();
         let lines: Vec<_> = out.lines().collect();
-        assert_eq!(lines.len(), 2, "{out}");
+        // The sample's other torrent is dead.
+        assert_eq!(lines.len(), 1, "{out}");
         let fields: Vec<_> = lines[0].split('\t').collect();
         assert_eq!(fields.len(), 3, "{:?}", lines[0]);
         assert_eq!(fields[0], "https://nyaa.si/download/1.torrent");
@@ -425,7 +430,7 @@ mod tests {
         let sites = [Site::Nyaa, Site::Yts];
         print_sites(&mut buf, &endpoints(&srv.url), &sites, "bunny", "", false).await;
         let out = String::from_utf8(buf).unwrap();
-        assert_eq!(out.lines().count(), 2, "{out}");
+        assert_eq!(out.lines().count(), 1, "{out}");
         assert!(out.lines().all(|l| l.contains("yts")), "{out}");
     }
 
@@ -446,7 +451,8 @@ mod tests {
         let mut buf = Vec::new();
         let sites = [Site::Yts, Site::Yts];
         print_sites(&mut buf, &endpoints(&srv.url), &sites, "bunny", "", false).await;
-        assert_eq!(String::from_utf8(buf).unwrap().lines().count(), 2);
+        // One of YTS's two torrents in the sample is dead.
+        assert_eq!(String::from_utf8(buf).unwrap().lines().count(), 1);
     }
 
     #[test]

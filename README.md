@@ -67,9 +67,10 @@ what you typed. The prompt shows the current one:
   results to that season or episode.
 
 Before you type anything, anime lists nyaa's newest uploads, movies The Pirate Bay's top 100 HD
-movies, and series EZTV's newest episodes with The Pirate Bay's top 100 HD TV shows.
+movies, and series its top 100 HD TV shows.
 
-Each result is tagged with the site it came from. The sites of a category are queried in parallel,
+Each result is tagged with the site it came from, and dead torrents, which have no seeders, are
+left out. The sites of a category are queried in parallel,
 and each one's results show up as soon as it answers, so a slow or unreachable site (which gets 8
 seconds) never holds up the other. A torrent the other site already listed isn't shown twice.
 
