@@ -11,9 +11,7 @@ mod stream;
 mod testutil;
 
 use std::{
-    future::Future,
     path::{Path, PathBuf},
-    pin::Pin,
     process::ExitCode,
     sync::Arc,
     time::Duration,
@@ -22,15 +20,15 @@ use std::{
 use anyhow::{Context, bail};
 use clap::Parser;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerOptions,
-    ManagedTorrent, PeerConnectionOptions, Session, SessionOptions,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
+    ListenerOptions, ManagedTorrent, PeerConnectionOptions, Session, SessionOptions, TorrentStats,
 };
 use tokio::{net::TcpListener, signal::unix::SignalKind};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 use crate::{
     search::NoSelection,
-    stream::{Reader, path_escape},
+    stream::{Reader, content_type, path_escape},
 };
 
 /// The release version, or the crate version for `cargo install` builds.
@@ -38,10 +36,6 @@ const VERSION: &str = match option_env!("PEERFLIX_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
-
-const VIDEO_EXTS: &[&str] = &[
-    "mkv", "mp4", "avi", "mov", "webm", "m4v", "wmv", "flv", "ts", "m2ts", "mpg", "mpeg",
-];
 
 /// Stream a torrent straight into IINA.
 ///
@@ -207,31 +201,15 @@ async fn stream_torrent(
     cli: &Cli,
 ) -> anyhow::Result<()> {
     eprintln!("Fetching torrent metadata...");
-    // Resolve the metadata without adding the torrent, so nothing is
-    // downloaded until a file is picked.
-    let list_only = AddTorrentOptions {
-        list_only: true,
-        ..Default::default()
-    };
     let add = AddTorrent::from_cli_argument(source)?;
-    let Some(resp) = cancel
-        .run_until_cancelled(session.add_torrent(add, Some(list_only)))
+    let Some(meta) = cancel
+        .run_until_cancelled(fetch_metadata(session, add))
         .await
     else {
         return Ok(());
     };
-    let AddTorrentResponse::ListOnly(meta) = resp? else {
-        bail!("torrent was added instead of listed");
-    };
-    let files: Vec<_> = meta
-        .info
-        .iter_file_details()
-        .map(|d| TorrentFile {
-            path: d.filename.to_pathbuf().to_string_lossy().into_owned(),
-            len: d.len,
-            padding: d.attrs().padding,
-        })
-        .collect();
+    let meta = meta?;
+    let files = torrent_files(&meta);
 
     if cli.list {
         for (i, f) in files.iter().enumerate().filter(|(_, f)| !f.padding) {
@@ -277,16 +255,19 @@ async fn stream_torrent(
         .with_context(|| format!("listening on port {}", cli.port))?;
     let url = format!("http://{}/{}", listener.local_addr()?, path_escape(&name));
     let stream_file = torrent_file(torrent.clone(), id, name.clone(), file.len);
-    let server = tokio::spawn(stream::serve(listener, Arc::new(stream_file)));
-    let _abort_server = AbortOnDrop(server);
+    let _server =
+        AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, Arc::new(stream_file))));
 
     eprintln!("Streaming {name} ({})\n{url}", human_bytes(file.len));
 
-    let mut player: Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> = if cli.no_play {
-        Box::pin(std::future::pending())
-    } else {
-        Box::pin(launch_iina(url))
+    let player = async {
+        if cli.no_play {
+            std::future::pending().await
+        } else {
+            launch_iina(url).await
+        }
     };
+    tokio::pin!(player);
     let mut ticker = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(1),
         Duration::from_secs(1),
@@ -313,21 +294,39 @@ async fn stream_torrent(
                     eprint!("\r\x1b[KChecking existing data...");
                     continue;
                 }
-                let stats = torrent.stats();
-                let done = stats.file_progress.get(id).copied().unwrap_or(0);
-                let (fetched, live, seen) = stats.live.as_ref().map_or((last_fetched, 0, 0), |l| {
-                    let s = &l.snapshot;
-                    (s.fetched_bytes, s.peer_stats.live, s.peer_stats.seen)
-                });
-                eprint!(
-                    "\r\x1b[K{:5.1}%  {}/s  peers {live}/{seen}",
-                    100.0 * done as f64 / file.len.max(1) as f64,
-                    human_bytes(fetched.saturating_sub(last_fetched)),
-                );
+                let (line, fetched) = progress_line(&torrent.stats(), id, file.len, last_fetched);
+                eprint!("\r\x1b[K{line}");
                 last_fetched = fetched;
             }
         }
     }
+}
+
+/// Resolves the torrent's metadata without adding it, so nothing is
+/// downloaded until a file is picked.
+async fn fetch_metadata(
+    session: &Arc<Session>,
+    add: AddTorrent<'_>,
+) -> anyhow::Result<ListOnlyResponse> {
+    let opts = AddTorrentOptions {
+        list_only: true,
+        ..Default::default()
+    };
+    match session.add_torrent(add, Some(opts)).await? {
+        AddTorrentResponse::ListOnly(meta) => Ok(meta),
+        _ => bail!("torrent was added instead of listed"),
+    }
+}
+
+fn torrent_files(meta: &ListOnlyResponse) -> Vec<TorrentFile> {
+    meta.info
+        .iter_file_details()
+        .map(|d| TorrentFile {
+            path: d.filename.to_pathbuf().to_string_lossy().into_owned(),
+            len: d.len,
+            padding: d.attrs().padding,
+        })
+        .collect()
 }
 
 /// Serves file id of torrent. With --dir, existing data is checked first; IINA
@@ -343,12 +342,20 @@ fn torrent_file(torrent: Arc<ManagedTorrent>, id: usize, name: String, len: u64)
     }
 }
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+/// Returns the status line for file id of len bytes, and the torrent's
+/// fetched byte count to pass back as last_fetched on the next tick.
+fn progress_line(stats: &TorrentStats, id: usize, len: u64, last_fetched: u64) -> (String, u64) {
+    let done = stats.file_progress.get(id).copied().unwrap_or(0);
+    let (fetched, live, seen) = stats.live.as_ref().map_or((last_fetched, 0, 0), |l| {
+        let s = &l.snapshot;
+        (s.fetched_bytes, s.peer_stats.live, s.peer_stats.seen)
+    });
+    let line = format!(
+        "{:5.1}%  {}/s  peers {live}/{seen}",
+        100.0 * done as f64 / len.max(1) as f64,
+        human_bytes(fetched.saturating_sub(last_fetched)),
+    );
+    (line, fetched)
 }
 
 /// Returns the index of the file at index, or of the largest video file
@@ -363,12 +370,7 @@ fn pick_file(files: &[TorrentFile], index: Option<usize>) -> anyhow::Result<usiz
         }
         return Ok(i);
     }
-    let is_video = |f: &TorrentFile| {
-        Path::new(&f.path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| VIDEO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-    };
+    let is_video = |f: &TorrentFile| content_type(&f.path).starts_with("video/");
     files
         .iter()
         .enumerate()
@@ -554,29 +556,8 @@ mod tests {
         .await
         .unwrap();
         let add = AddTorrent::from_bytes(created.as_bytes().unwrap());
-        let meta = match session
-            .add_torrent(
-                add,
-                Some(AddTorrentOptions {
-                    list_only: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap()
-        {
-            AddTorrentResponse::ListOnly(meta) => meta,
-            _ => panic!("torrent was added instead of listed"),
-        };
-        let files: Vec<_> = meta
-            .info
-            .iter_file_details()
-            .map(|d| TorrentFile {
-                path: d.filename.to_pathbuf().to_string_lossy().into_owned(),
-                len: d.len,
-                padding: false,
-            })
-            .collect();
+        let meta = fetch_metadata(&session, add).await.unwrap();
+        let files = torrent_files(&meta);
         let id = pick_file(&files, None).unwrap();
         assert_eq!(files[id].path, "video.mkv");
 
@@ -597,7 +578,7 @@ mod tests {
         // librqbit's stream() waits for the initial check, which is too quick
         // here to overlap with the requests.
         let file = torrent_file(torrent.clone(), id, "video.mkv".into(), files[id].len);
-        let _server = AbortOnDrop(tokio::spawn(stream::serve(listener, Arc::new(file))));
+        let _server = AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, Arc::new(file))));
 
         let client = reqwest::Client::new();
         let resp = client.get(&url).send().await.unwrap();

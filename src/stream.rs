@@ -182,7 +182,7 @@ impl Range {
     }
 }
 
-fn content_type(name: &str) -> &'static str {
+pub fn content_type(name: &str) -> &'static str {
     let ext = Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
