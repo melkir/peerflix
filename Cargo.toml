@@ -17,7 +17,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 # rust-tls instead of the default native-tls, so Linux builds don't need OpenSSL.
 librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"] }
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 # The same major version and TLS backend as librqbit, so it's linked once.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "query"] }
 serde = { version = "1", features = ["derive"] }
