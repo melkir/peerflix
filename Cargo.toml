@@ -15,6 +15,8 @@ futures-util = { version = "0.3", default-features = false }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# For setrlimit, to raise the open file limit.
+libc = "0.2"
 # rust-tls instead of the default native-tls, so Linux builds don't need OpenSSL.
 librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"] }
 quick-xml = { version = "0.41", features = ["serialize"] }

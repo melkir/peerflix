@@ -99,6 +99,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    raise_open_file_limit();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -113,6 +114,36 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Raises the soft limit on open files as far as the system allows. librqbit
+/// keeps every file of a torrent open, selected or not, so a big season pack
+/// runs out of macOS's default of 256.
+fn raise_open_file_limit() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit only read and write lim.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        // macOS refuses more than kern.maxfilesperproc even when the hard
+        // limit is unlimited, so fall back to OPEN_MAX, which it always takes.
+        for want in [lim.rlim_max, 10240] {
+            if want <= lim.rlim_cur {
+                return;
+            }
+            let new = libc::rlimit {
+                rlim_cur: want,
+                rlim_max: lim.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &new) == 0 {
+                return;
+            }
         }
     }
 }
