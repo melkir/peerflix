@@ -271,17 +271,51 @@ async fn stream_torrent(
     let Some(id) = select_file(cancel, &files, &eps, cli.index).await? else {
         return Ok(());
     };
-    let file = &files[id];
-    let name = served_name(&file.path, &[]);
-
-    // Download just that file and its subtitles, as .part files until
-    // they're complete; streams still take priority. With --dir, existing
-    // data is checked and reused.
     let subs = subtitles(&files, id, eps.len() <= 1);
     let wanted: Vec<usize> = [id].into_iter().chain(subs.iter().copied()).collect();
+
     let storage = PartStorage::new(meta.output_folder.clone());
+    let Some(torrent) = cancel
+        .run_until_cancelled(add_torrent(session, meta, &storage, &wanted))
+        .await
+    else {
+        return Ok(());
+    };
+    let torrent = torrent?;
+
+    let listener = bind_listener(cli.port).await?;
+    let stream = serve_files(listener, &torrent, &files, id, &subs)?;
+    eprintln!(
+        "Streaming {} ({})\n{}",
+        stream.name,
+        human_bytes(files[id].len),
+        stream.url
+    );
+    if !stream.sub_names.is_empty() {
+        eprintln!("Subtitles: {}", stream.sub_names.join(", "));
+    }
+
+    let player = async {
+        if cli.no_play {
+            std::future::pending().await
+        } else {
+            player::launch_iina(stream.url.clone(), &stream.sub_urls).await
+        }
+    };
+    watch(cancel, player, &torrent, &storage, &files, id, wanted).await
+}
+
+/// Adds the torrent to download just the wanted files, as .part files until
+/// they're complete; streams still take priority. With --dir, existing data
+/// is checked and reused.
+async fn add_torrent(
+    session: &Arc<Session>,
+    meta: ListOnlyResponse,
+    storage: &PartStorage,
+    wanted: &[usize],
+) -> anyhow::Result<Arc<ManagedTorrent>> {
     let opts = AddTorrentOptions {
-        only_files: Some(wanted.clone()),
+        only_files: Some(wanted.to_vec()),
         // Where librqbit would put it anyway, spelled out as storage uses it.
         output_folder: Some(meta.output_folder.to_string_lossy().into_owned()),
         storage_factory: Some(storage.clone().boxed()),
@@ -297,44 +331,66 @@ async fn stream_torrent(
         }),
         ..Default::default()
     };
-    let Some(resp) = cancel
-        .run_until_cancelled(
-            session.add_torrent(AddTorrent::from_bytes(meta.torrent_bytes), Some(opts)),
-        )
-        .await
-    else {
-        return Ok(());
-    };
-    let torrent = resp?.into_handle().context("torrent was not added")?;
+    session
+        .add_torrent(AddTorrent::from_bytes(meta.torrent_bytes), Some(opts))
+        .await?
+        .into_handle()
+        .context("torrent was not added")
+}
 
-    let listener = bind_listener(cli.port).await?;
+/// The stream being served, until dropped.
+struct Stream {
+    /// The name file id is served under.
+    name: String,
+    url: String,
+    /// The names and URLs of the subtitles served alongside.
+    sub_names: Vec<String>,
+    sub_urls: Vec<String>,
+    _server: AbortOnDropHandle<()>,
+}
+
+/// Starts serving file id of torrent and its subtitles subs on listener.
+fn serve_files(
+    listener: TcpListener,
+    torrent: &Arc<ManagedTorrent>,
+    files: &[TorrentFile],
+    id: usize,
+    subs: &[usize],
+) -> anyhow::Result<Stream> {
     let base = format!("http://{}", listener.local_addr()?);
-    let url = format!("{base}/{}", path_escape(&name));
-    let mut served = vec![torrent_file(torrent.clone(), id, name.clone(), file.len)];
-    for &i in &subs {
+    let name = served_name(&files[id].path, &[]);
+    let mut served = vec![torrent_file(
+        torrent.clone(),
+        id,
+        name.clone(),
+        files[id].len,
+    )];
+    for &i in subs {
         let sub_name = served_name(&files[i].path, &served);
         served.push(torrent_file(torrent.clone(), i, sub_name, files[i].len));
     }
-    let sub_urls: Vec<_> = served[1..]
-        .iter()
-        .map(|f| format!("{base}/{}", path_escape(&f.name)))
-        .collect();
-    let sub_names: Vec<_> = served[1..].iter().map(|f| f.name.as_str()).collect();
-    let sub_names = sub_names.join(", ");
-    let _server = AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, served.into())));
+    let url_of = |name: &str| format!("{base}/{}", path_escape(name));
+    Ok(Stream {
+        url: url_of(&name),
+        sub_urls: served[1..].iter().map(|f| url_of(&f.name)).collect(),
+        sub_names: served[1..].iter().map(|f| f.name.clone()).collect(),
+        name,
+        _server: AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, served.into()))),
+    })
+}
 
-    eprintln!("Streaming {name} ({})\n{url}", human_bytes(file.len));
-    if !sub_urls.is_empty() {
-        eprintln!("Subtitles: {sub_names}");
-    }
-
-    let player = async {
-        if cli.no_play {
-            std::future::pending().await
-        } else {
-            player::launch_iina(url, &sub_urls).await
-        }
-    };
+/// Shows progress and renames finished files until cancelled or the player
+/// quits, and returns the player's result. downloading is the ids of the
+/// files being downloaded, of which id is the one streamed.
+async fn watch(
+    cancel: &CancellationToken,
+    player: impl Future<Output = anyhow::Result<()>>,
+    torrent: &ManagedTorrent,
+    storage: &PartStorage,
+    files: &[TorrentFile],
+    id: usize,
+    mut downloading: Vec<usize>,
+) -> anyhow::Result<()> {
     tokio::pin!(player);
     let mut ticker = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(1),
@@ -345,18 +401,17 @@ async fn stream_torrent(
     let mut last_fetched = 0;
     let mut init = torrent.wait_until_initialized();
     let mut initialized = false;
-    let mut downloading = wanted;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                complete_files(&storage, &torrent.stats(), &files, &mut downloading);
+                complete_files(storage, &torrent.stats(), files, &mut downloading);
                 if tty {
                     eprintln!();
                 }
                 return Ok(());
             }
             result = &mut player => {
-                complete_files(&storage, &torrent.stats(), &files, &mut downloading);
+                complete_files(storage, &torrent.stats(), files, &mut downloading);
                 if tty {
                     eprintln!();
                 }
@@ -374,8 +429,8 @@ async fn stream_torrent(
                     continue;
                 }
                 let stats = torrent.stats();
-                complete_files(&storage, &stats, &files, &mut downloading);
-                let (line, fetched) = progress_line(&stats, id, file.len, last_fetched);
+                complete_files(storage, &stats, files, &mut downloading);
+                let (line, fetched) = progress_line(&stats, id, files[id].len, last_fetched);
                 if tty {
                     eprint!("\r\x1b[K{line}");
                 }
