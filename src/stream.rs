@@ -1,7 +1,17 @@
 //! Serves files over HTTP with range support, which is what players need to
 //! start playback early and to seek.
 
-use std::{convert::Infallible, io::SeekFrom, path::Path, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    io::SeekFrom,
+    path::Path,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use futures_util::{TryStreamExt, future::BoxFuture};
@@ -35,9 +45,32 @@ pub struct File {
 
 type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 
+/// Counts the connections a server has open, to tell whether a player is
+/// still watching.
+#[derive(Clone, Debug, Default)]
+pub struct Connections(Arc<AtomicUsize>);
+
+impl Connections {
+    pub fn count(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Counts one more connection until the returned guard is dropped.
+    fn open(&self) -> impl Drop + Send + 'static {
+        struct Open(Connections);
+        impl Drop for Open {
+            fn drop(&mut self) {
+                self.0.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Open(self.clone())
+    }
+}
+
 /// Serves each of files at `/<escaped name>`, and the first on every other path,
-/// until the task is dropped.
-pub async fn serve(listener: TcpListener, files: Arc<[File]>) {
+/// until the task is dropped, counting the open connections in connections.
+pub async fn serve(listener: TcpListener, files: Arc<[File]>, connections: Connections) {
     let paths: Arc<[String]> = files.iter().map(|f| path_escape(&f.name)).collect();
     loop {
         let sock = match listener.accept().await {
@@ -49,7 +82,9 @@ pub async fn serve(listener: TcpListener, files: Arc<[File]>) {
             }
         };
         let (files, paths) = (files.clone(), paths.clone());
+        let open = connections.open();
         tokio::spawn(async move {
+            let _open = open;
             let svc = service_fn(move |req: Request<_>| {
                 let (files, paths) = (files.clone(), paths.clone());
                 async move {
@@ -317,7 +352,8 @@ mod tests {
     async fn serve_bytes(data: &'static [u8]) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/video.mkv", listener.local_addr().unwrap());
-        tokio::spawn(serve(listener, Arc::new([bytes_file("video.mkv", data)])));
+        let files = Arc::new([bytes_file("video.mkv", data)]);
+        tokio::spawn(serve(listener, files, Connections::default()));
         url
     }
 
@@ -329,7 +365,7 @@ mod tests {
             bytes_file("video.mkv", b"video"),
             bytes_file("Show E01.en.srt", b"subs"),
         ];
-        tokio::spawn(serve(listener, Arc::new(files)));
+        tokio::spawn(serve(listener, Arc::new(files), Connections::default()));
         for (path, want) in [
             ("/video.mkv", "video"),
             ("/Show%20E01.en.srt", "subs"),
@@ -338,6 +374,32 @@ mod tests {
             let body = reqwest::get(format!("{base}{path}")).await.unwrap();
             assert_eq!(body.text().await.unwrap(), want, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn counts_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Connections::default();
+        let files = Arc::new([bytes_file("video.mkv", b"video")]);
+        tokio::spawn(serve(listener, files, connections.clone()));
+        // Waits up to a second for the count to reach want.
+        let settles_at = async |want| {
+            for _ in 0..100 {
+                if connections.count() == want {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        };
+        let a = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let b = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(settles_at(2).await, "{}", connections.count());
+        drop(a);
+        assert!(settles_at(1).await, "{}", connections.count());
+        drop(b);
+        assert!(settles_at(0).await, "{}", connections.count());
     }
 
     #[tokio::test]

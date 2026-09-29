@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use peerflix::{
     search::{Category, Endpoints},
+    stream::Connections,
     torrent::{
         self, add_torrent, complete_files, fetch_metadata,
         files::{TorrentFile, episodes, pick_file, subtitles, torrent_files},
@@ -36,6 +37,10 @@ use crate::cli::{
 /// The port the stream is served on unless --port says otherwise.
 const DEFAULT_PORT: u16 = 8888;
 
+/// How long a stream served with --json goes without a player connected
+/// before peerflix exits.
+const IDLE: Duration = Duration::from_secs(30);
+
 /// The release version, or the crate version for `cargo install` builds.
 const VERSION: &str = match option_env!("PEERFLIX_VERSION") {
     Some(v) => v,
@@ -46,6 +51,9 @@ const VERSION: &str = match option_env!("PEERFLIX_VERSION") {
 ///
 /// With a magnet link, .torrent file or http(s) URL, streams it. Anything else
 /// searches for anime, movies or series interactively in fzf.
+///
+/// With --json, prints JSON for another program instead: search results, the
+/// torrent's files with --list, or the stream's URLs, for the program to play.
 #[derive(Parser, Debug)]
 #[command(version = VERSION)]
 struct Cli {
@@ -95,7 +103,9 @@ struct Cli {
     #[arg(long)]
     print: bool,
 
-    /// Print results for the search terms as JSON and exit
+    /// Print JSON for programs: search results, --list's files, or the stream's
+    /// URLs once it's served, then serve it without launching IINA until no
+    /// player has been connected for 30 seconds
     #[arg(long, conflicts_with = "print")]
     json: bool,
 }
@@ -154,7 +164,7 @@ fn raise_open_file_limit() {
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let user = nyaa_user(cli.user.as_deref().unwrap_or(""));
     let mut source = cli.source.join(" ");
-    if cli.json {
+    if cli.json && !is_torrent_source(&source) {
         let providers = cli
             .category
             .providers(&Endpoints::from_env(), user, cli.trusted);
@@ -248,15 +258,20 @@ async fn stream_torrent(
     let meta = meta?;
     let files = torrent_files(&meta);
 
+    let eps = episodes(&files);
     if cli.list {
+        if cli.json {
+            return json::print_files(&mut std::io::stdout().lock(), &files, &eps);
+        }
         for (i, f) in files.iter().enumerate().filter(|(_, f)| !f.padding) {
             println!("{i:3}  {:>9}  {}", human_bytes(f.len), f.path);
         }
         return Ok(());
     }
 
-    let eps = episodes(&files);
-    let Some(id) = select_file(cancel, &files, &eps, cli.index).await? else {
+    // A program reading JSON picks with --index, having listed the files.
+    let ask = !cli.json;
+    let Some(id) = select_file(cancel, &files, &eps, cli.index, ask).await? else {
         return Ok(());
     };
     let subs = subtitles(&files, id, eps.len() <= 1);
@@ -282,9 +297,16 @@ async fn stream_torrent(
     if !stream.sub_names.is_empty() {
         eprintln!("Subtitles: {}", stream.sub_names.join(", "));
     }
+    if cli.json {
+        json::print_stream(&mut std::io::stdout().lock(), &stream)?;
+    }
 
     let player = async {
-        if cli.no_play {
+        if cli.json {
+            // The program that asked plays it; when it's done, no one is.
+            idle(&stream.connections).await;
+            Ok(())
+        } else if cli.no_play {
             std::future::pending().await
         } else {
             player::launch_iina(stream.url.clone(), &stream.sub_urls).await
@@ -354,6 +376,21 @@ async fn watch(
     }
 }
 
+/// Returns once no player has been connected to the stream for IDLE, with
+/// the time before the first one connects counting too.
+async fn idle(connections: &Connections) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let mut since = tokio::time::Instant::now();
+    loop {
+        ticker.tick().await;
+        if connections.count() > 0 {
+            since = tokio::time::Instant::now();
+        } else if since.elapsed() >= IDLE {
+            return;
+        }
+    }
+}
+
 /// Binds the stream's port on localhost. Without an explicit port, that's
 /// DEFAULT_PORT, or a random one when it's taken.
 async fn bind_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
@@ -384,16 +421,17 @@ fn progress_line(stats: &TorrentStats, id: usize, len: u64, last_fetched: u64) -
 }
 
 /// Returns the file to stream: the one at index if given, else one the user
-/// picks in fzf among eps, the torrent's episodes, when there are several
-/// and stdin is a terminal, else the one pick_file chooses. None means
-/// peerflix was cancelled meanwhile.
+/// picks in fzf among eps, the torrent's episodes, when there are several,
+/// ask is set and stdin is a terminal, else the one pick_file chooses. None
+/// means peerflix was cancelled meanwhile.
 async fn select_file(
     cancel: &CancellationToken,
     files: &[TorrentFile],
     eps: &[usize],
     index: Option<usize>,
+    ask: bool,
 ) -> anyhow::Result<Option<usize>> {
-    if index.is_some() || eps.len() < 2 || !std::io::stdin().is_terminal() {
+    if index.is_some() || eps.len() < 2 || !ask || !std::io::stdin().is_terminal() {
         return pick_file(files, index).map(Some);
     }
     let lines: String = eps

@@ -17,7 +17,7 @@ use librqbit::{
 use tokio::net::TcpListener;
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
-use crate::stream::{self, Reader, path_escape};
+use crate::stream::{self, Connections, Reader, path_escape};
 use files::TorrentFile;
 use storage::PartStorage;
 
@@ -105,6 +105,8 @@ pub struct Stream {
     /// The names and URLs of the subtitles served alongside.
     pub sub_names: Vec<String>,
     pub sub_urls: Vec<String>,
+    /// The connections players have open to the stream.
+    pub connections: Connections,
     _server: AbortOnDropHandle<()>,
 }
 
@@ -128,13 +130,19 @@ pub fn serve_files(
         let sub_name = served_name(&files[i].path, &served);
         served.push(torrent_file(torrent.clone(), i, sub_name, files[i].len));
     }
+    let connections = Connections::default();
     let url_of = |name: &str| format!("{base}/{}", path_escape(name));
     Ok(Stream {
         url: url_of(&name),
         sub_urls: served[1..].iter().map(|f| url_of(&f.name)).collect(),
         sub_names: served[1..].iter().map(|f| f.name.clone()).collect(),
         name,
-        _server: AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, served.into()))),
+        connections: connections.clone(),
+        _server: AbortOnDropHandle::new(tokio::spawn(stream::serve(
+            listener,
+            served.into(),
+            connections,
+        ))),
     })
 }
 
@@ -244,8 +252,11 @@ mod tests {
         // librqbit's stream() waits for the initial check, which is too quick
         // here to overlap with the requests.
         let file = torrent_file(torrent.clone(), id, "video.mkv".into(), files[id].len);
-        let _server =
-            AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, Arc::new([file]))));
+        let _server = AbortOnDropHandle::new(tokio::spawn(stream::serve(
+            listener,
+            Arc::new([file]),
+            Connections::default(),
+        )));
 
         let client = reqwest::Client::new();
         let resp = client.get(&url).send().await.unwrap();

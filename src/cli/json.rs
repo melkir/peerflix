@@ -1,4 +1,4 @@
-//! Search results as JSON, for programs that run peerflix to search, such as
+//! JSON output, for programs that run peerflix to search and stream, such as
 //! a player's plugin.
 
 use std::{io::Write, sync::Arc};
@@ -6,6 +6,8 @@ use std::{io::Write, sync::Arc};
 use peerflix::{
     providers::{Provider, Query, Torrent},
     search::{self, Failed},
+    torrent::{Stream, files::TorrentFile},
+    util::human_bytes,
 };
 use serde::Serialize;
 
@@ -41,6 +43,78 @@ pub async fn print_results(
     .await;
     serde_json::to_writer(&mut *w, &Output { results, failed })?;
     writeln!(w)?;
+    Ok(())
+}
+
+/// Writes the torrent's files, leaving out padding, and eps, the ids of its
+/// episodes in order, as a JSON object: files, each with its index, path and
+/// size, and episodes.
+pub fn print_files(w: &mut impl Write, files: &[TorrentFile], eps: &[usize]) -> anyhow::Result<()> {
+    #[derive(Serialize)]
+    struct File<'a> {
+        index: usize,
+        path: &'a str,
+        size: String,
+    }
+    #[derive(Serialize)]
+    struct Files<'a> {
+        files: Vec<File<'a>>,
+        episodes: &'a [usize],
+    }
+    let files = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.padding)
+        .map(|(index, f)| File {
+            index,
+            path: &f.path,
+            size: human_bytes(f.len),
+        })
+        .collect();
+    serde_json::to_writer(
+        &mut *w,
+        &Files {
+            files,
+            episodes: eps,
+        },
+    )?;
+    writeln!(w)?;
+    Ok(())
+}
+
+/// Writes the stream being served as a JSON line: its name and url, its
+/// subtitles, each with a name and url, and peerflix's pid, to stop it with.
+pub fn print_stream(w: &mut impl Write, stream: &Stream) -> anyhow::Result<()> {
+    #[derive(Serialize)]
+    struct Subtitle<'a> {
+        name: &'a str,
+        url: &'a str,
+    }
+    #[derive(Serialize)]
+    struct Served<'a> {
+        name: &'a str,
+        url: &'a str,
+        subtitles: Vec<Subtitle<'a>>,
+        pid: u32,
+    }
+    let subtitles = stream
+        .sub_names
+        .iter()
+        .zip(&stream.sub_urls)
+        .map(|(name, url)| Subtitle { name, url })
+        .collect();
+    serde_json::to_writer(
+        &mut *w,
+        &Served {
+            name: &stream.name,
+            url: &stream.url,
+            subtitles,
+            pid: std::process::id(),
+        },
+    )?;
+    // The program reads it as soon as it's written, while peerflix serves.
+    writeln!(w)?;
+    w.flush()?;
     Ok(())
 }
 
@@ -94,6 +168,33 @@ mod tests {
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             "{\"results\":[],\"unanswered\":[],\"errors\":[]}\n"
+        );
+    }
+
+    #[test]
+    fn prints_files() {
+        let file = |path: &str, len, padding| TorrentFile {
+            path: path.into(),
+            len,
+            padding,
+        };
+        let files = [
+            file("Pioneer.One.S01E01.mkv", 400 << 20, false),
+            file(".pad/1", 100, true),
+            file("Pioneer.One.S01E02.mkv", 400 << 20, false),
+        ];
+        let mut buf = Vec::new();
+        print_files(&mut buf, &files, &[0, 2]).unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "files": [
+                    {"index": 0, "path": "Pioneer.One.S01E01.mkv", "size": "400.0 MiB"},
+                    {"index": 2, "path": "Pioneer.One.S01E02.mkv", "size": "400.0 MiB"},
+                ],
+                "episodes": [0, 2],
+            })
         );
     }
 }

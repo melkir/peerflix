@@ -97,6 +97,14 @@ and `errors` (messages).
 peerflix --json -c movies tt1254207 | jq -r '.results[0].url' | xargs peerflix
 ```
 
+With a torrent, `--json` is for programs that play it themselves, such as the IINA plugin below:
+
+- `--json --list SOURCE` writes its `files`, each with its `index`, `path` and `size`, and
+  `episodes`, the indexes of the videos worth choosing between, in order.
+- `--json SOURCE` (with `-i` to pick a file) streams without launching IINA, and once the stream is
+  served writes one line with its `name`, `url`, `subtitles` (each a `name` and `url`) and
+  peerflix's `pid`. It serves until no player has been connected for 30 seconds, or until killed.
+
 Flags:
 
 | flag | default | |
@@ -110,7 +118,7 @@ Flags:
 | `-c, --category NAME` | anime | category to start searching in: `anime`, `movies` or `series` |
 | `-t, --trusted` | | only search trusted nyaa uploads (anime) |
 | `--print` | | print search results and exit |
-| `--json` | | print search results as JSON and exit |
+| `--json` | | print JSON for programs: search results, `--list`'s files, or the stream's URLs |
 | `-u, --user NAME` | | restrict anime search to a nyaa uploader, name or profile URL |
 | `-V, --version` | | print the version and exit |
 

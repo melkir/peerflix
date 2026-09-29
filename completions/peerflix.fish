@@ -10,7 +10,7 @@ complete -c peerflix -s n -l no-play -d "Don't launch IINA, just serve the strea
 complete -c peerflix -s p -l port -x -d 'HTTP port to serve the stream on'
 complete -c peerflix -l no-upnp -d "Don't ask the router to forward the torrent port"
 complete -c peerflix -l print -d 'Print search results and exit'
-complete -c peerflix -l json -d 'Print search results as JSON and exit'
+complete -c peerflix -l json -d 'Print JSON for programs instead of text'
 complete -c peerflix -s c -l category -x -a 'anime movies series' -d 'Category to start searching in'
 complete -c peerflix -s t -l trusted -d 'Only search trusted nyaa uploaders'
 complete -c peerflix -s u -l user -x -d 'Only search this nyaa uploader'
