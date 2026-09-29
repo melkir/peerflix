@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>peerflix</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --muted: color-mix(in srgb, CanvasText 55%, transparent);
+      --line: color-mix(in srgb, CanvasText 12%, transparent);
+      --hover: color-mix(in srgb, CanvasText 7%, transparent);
+      --good: #2f9e44;
+      --even: #c28a00;
+      --bad: #e8590c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 13px -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+      user-select: none;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    header { padding: 12px; border-bottom: 1px solid var(--line); }
+    .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+    .tabs button {
+      flex: 1;
+      padding: 4px 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: none;
+      color: inherit;
+      font: inherit;
+    }
+    .tabs button[aria-pressed="true"] { background: AccentColor; color: AccentColorText; border-color: AccentColor; }
+    input[type="search"] { width: 100%; padding: 6px 8px; font: inherit; }
+    #status { margin-top: 8px; color: var(--muted); min-height: 1.3em; }
+    #status.error { color: var(--bad); }
+    #back { display: none; margin-bottom: 8px; }
+    main { flex: 1; overflow-y: auto; }
+    ul { list-style: none; margin: 0; padding: 0; }
+    li { padding: 8px 12px; border-bottom: 1px solid var(--line); cursor: default; }
+    li:hover { background: var(--hover); }
+    .title { overflow-wrap: anywhere; }
+    .meta { margin-top: 2px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .good { color: var(--good); }
+    .even { color: var(--even); }
+    .bad { color: var(--bad); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="tabs" role="group" aria-label="Category">
+      <button data-category="anime">Anime</button>
+      <button data-category="movies">Movies</button>
+      <button data-category="series">Series</button>
+    </div>
+    <button id="back">‹ Results</button>
+    <input type="search" id="query" placeholder="Title, IMDb ID (tt1254207), or a magnet link" autofocus />
+    <div id="status" role="status"></div>
+  </header>
+  <main><ul id="list"></ul></main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let category = "anime";
+    let timer = null;
+    let lastResults = null;
+    // Set while a picked result is starting, so a second click doesn't
+    // start it twice; the plugin's next message clears it.
+    let busy = false;
+
+    // Sends a pick to the plugin, unless one is already starting.
+    function pick(name, data) {
+      if (busy) return;
+      busy = true;
+      iina.postMessage(name, data);
+    }
+
+    function search() {
+      clearTimeout(timer);
+      setStatus("Searching…");
+      iina.postMessage("search", { category, query: $("query").value });
+    }
+
+    function setStatus(text, error = false) {
+      $("status").textContent = text;
+      $("status").classList.toggle("error", error);
+    }
+
+    function setCategory(name) {
+      category = name;
+      for (const b of document.querySelectorAll(".tabs button")) {
+        b.setAttribute("aria-pressed", String(b.dataset.category === name));
+      }
+    }
+
+    function row(title, meta, onClick) {
+      const li = document.createElement("li");
+      const t = document.createElement("div");
+      t.className = "title";
+      t.textContent = title;
+      const m = document.createElement("div");
+      m.className = "meta";
+      m.append(...meta);
+      li.append(t, m);
+      li.addEventListener("click", onClick);
+      return li;
+    }
+
+    function health(r) {
+      const span = document.createElement("span");
+      span.className = r.seeders > r.leechers ? "good" : r.seeders === r.leechers ? "even" : "bad";
+      span.textContent = `${r.seeders} seeders`;
+      return span;
+    }
+
+    function showResults({ results, note }) {
+      lastResults = { results, note };
+      $("back").style.display = "none";
+      $("list").replaceChildren(
+        ...results.map((r) =>
+          row(r.title, [`${r.date} · ${r.size} · `, health(r), ` · ${r.site}`], () =>
+            pick("choose", { source: r.url, title: r.title })
+          )
+        )
+      );
+      $("list").parentElement.scrollTop = 0;
+      const q = $("query").value.trim();
+      const none = results.length ? "" : q ? `No ${category} results for “${q}”.` : `No ${category} to show.`;
+      setStatus([note, none].filter(Boolean).join(" "));
+    }
+
+    iina.onMessage("results", (data) => {
+      // Only the current category and query's results.
+      if (data.category !== category || data.query !== $("query").value) return;
+      showResults(data);
+    });
+
+    iina.onMessage("episodes", ({ source, title, episodes }) => {
+      busy = false;
+      $("back").style.display = "block";
+      $("list").replaceChildren(
+        ...episodes.map((e) =>
+          row(e.path, [e.size], () => pick("play", { source, index: e.index, title: e.path }))
+        )
+      );
+      $("list").parentElement.scrollTop = 0;
+      setStatus(`${title}: pick an episode.`);
+    });
+
+    iina.onMessage("status", ({ text, error }) => {
+      // An empty status means the stream started; an error, that it didn't.
+      if (!text || error) busy = false;
+      setStatus(text, error);
+    });
+
+    $("back").addEventListener("click", () => lastResults && showResults(lastResults));
+
+    $("query").addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(search, 400);
+    });
+    $("query").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") search();
+    });
+
+    for (const b of document.querySelectorAll(".tabs button")) {
+      b.addEventListener("click", () => {
+        setCategory(b.dataset.category);
+        search();
+      });
+    }
+
+    setCategory(category);
+    search();
+  </script>
+</body>
+</html>

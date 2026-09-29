@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    body {
+      color-scheme: light dark;
+      padding: 16px;
+      margin: 0;
+      font: 13px -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    }
+    input { width: 100%; margin-top: 4px; }
+    small { display: block; margin-top: 4px; opacity: 0.6; }
+  </style>
+</head>
+<body>
+  <label>
+    Path to peerflix
+    <input type="text" data-pref-key="peerflix_path" placeholder="Found automatically" />
+  </label>
+  <small>
+    Leave empty to look in the PATH, ~/.cargo/bin, /opt/homebrew/bin, /usr/local/bin, then
+    mise's shims. It needs peerflix 0.5.0 or later.
+  </small>
+</body>
+</html>

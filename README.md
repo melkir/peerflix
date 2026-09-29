@@ -131,6 +131,25 @@ being downloaded are created there, named `NAME.part` until they're complete; a 
 that shares a piece with them can also be left as a small `.part`. macOS clears `$TMPDIR` of files
 unused for a few days; use `--dir` to keep data somewhere else.
 
+## IINA plugin
+
+[`iina-plugin/`](iina-plugin) searches and streams from inside IINA: **Plugin › Search Torrents…**
+opens a window with the three categories, where typing searches as in fzf (titles, IMDb IDs, or a
+pasted magnet link). Picking a torrent opens it in a new player with its subtitles, after asking
+which episode when it holds several, and the stream stops shortly after the player closes. It runs
+peerflix with `--json` underneath.
+
+To install it, enter `melkir/peerflix` under **Settings › Plugins › Install from GitHub…** in IINA,
+which installs the plugin attached to the latest release; doing it again updates it. It needs
+peerflix 0.5.0 or later, which it looks for in the `PATH`, `~/.cargo/bin`, `/opt/homebrew/bin`,
+`/usr/local/bin`, then mise's shims, or where the plugin's preferences say.
+
+To work on it, link the folder into IINA's plugins instead, and restart IINA after changes:
+
+```sh
+ln -s (pwd)/iina-plugin ~/Library/Application\ Support/com.colliderli.iina/plugins/peerflix.iinaplugin-dev
+```
+
 ## Development
 
 [mise](https://mise.jdx.dev) installs the pinned Rust toolchain and cargo-release and runs the

@@ -1,0 +1,17 @@
+{
+  "name": "peerflix",
+  "identifier": "io.github.melkir.peerflix",
+  "version": "0.1.0",
+  "description": "Search for anime, movies and series, and stream torrents through peerflix.",
+  "author": {
+    "name": "melkir",
+    "url": "https://github.com/melkir/peerflix"
+  },
+  "entry": "main.js",
+  "globalEntry": "global.js",
+  "permissions": ["file-system"],
+  "preferencesPage": "pref.html",
+  "preferenceDefaults": {
+    "peerflix_path": ""
+  }
+}
