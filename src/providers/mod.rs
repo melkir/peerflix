@@ -1,5 +1,10 @@
-//! What every torrent site implements to be searched: the query it gets, the
-//! results it returns, and the Provider trait itself.
+//! The torrent sites, and what each implements to be searched: the query it
+//! gets, the results it returns, and the Provider trait itself.
+
+pub mod eztv;
+pub mod nyaa;
+pub mod tpb;
+pub mod yts;
 
 use anyhow::{Context, bail};
 use futures_util::future::BoxFuture;

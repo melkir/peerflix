@@ -2,10 +2,10 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use tokio::task::JoinSet;
 
-use crate::{
+use crate::providers::{
+    Provider, Query, Torrent,
     eztv::{self, Eztv},
     nyaa::{self, Nyaa},
-    provider::{Provider, Query, Torrent},
     tpb::{self, Tpb},
     yts::{self, Yts},
 };
@@ -199,7 +199,7 @@ mod tests {
     use futures_util::future::BoxFuture;
 
     use super::*;
-    use crate::{nyaa::tests::SAMPLE_FEED, testutil::FakeServer};
+    use crate::{providers::nyaa::tests::SAMPLE_FEED, testutil::FakeServer};
 
     fn endpoints(url: &str) -> Endpoints {
         Endpoints {

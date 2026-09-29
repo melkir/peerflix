@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::Context;
 use peerflix::{
-    provider::{Provider, Query, Torrent},
+    providers::{Provider, Query, Torrent},
     search::{self, Category, Failed},
 };
 use tokio::io::AsyncWriteExt;

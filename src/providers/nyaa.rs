@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
 
-use crate::provider::{Provider, Query, Torrent};
+use crate::providers::{Provider, Query, Torrent};
 
 pub const NYAA_URL: &str = "https://nyaa.si";
 

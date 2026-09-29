@@ -1,5 +1,8 @@
 //! Adding torrents to a librqbit session and serving their files.
 
+pub mod files;
+pub mod storage;
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -14,11 +17,9 @@ use librqbit::{
 use tokio::net::TcpListener;
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
-use crate::{
-    files::TorrentFile,
-    storage::PartStorage,
-    stream::{self, Reader, path_escape},
-};
+use crate::stream::{self, Reader, path_escape};
+use files::TorrentFile;
+use storage::PartStorage;
 
 /// Starts a torrent session that keeps its data in dir until cancel is
 /// cancelled, asking the router to forward its port if upnp.
@@ -184,7 +185,7 @@ fn served_name(path: &str, served: &[stream::File]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::files::{pick_file, torrent_files};
+    use crate::torrent::files::{pick_file, torrent_files};
 
     /// Seeds a torrent from local files with networking disabled and streams
     /// one of them through the HTTP server.

@@ -1,8 +1,7 @@
 //! peerflix streams a torrent (magnet link, .torrent file or URL) to IINA,
 //! or searches for one in fzf.
 
-mod fzf;
-mod player;
+mod cli;
 
 use std::{
     io::IsTerminal,
@@ -19,14 +18,20 @@ use tokio::{net::TcpListener, signal::unix::SignalKind};
 use tokio_util::sync::CancellationToken;
 
 use peerflix::{
-    files::{TorrentFile, episodes, pick_file, subtitles, torrent_files},
     search::{Category, Endpoints},
-    storage::PartStorage,
-    torrent::{self, add_torrent, complete_files, fetch_metadata, serve_files},
+    torrent::{
+        self, add_torrent, complete_files, fetch_metadata,
+        files::{TorrentFile, episodes, pick_file, subtitles, torrent_files},
+        serve_files,
+        storage::PartStorage,
+    },
     util::human_bytes,
 };
 
-use crate::fzf::NoSelection;
+use crate::cli::{
+    fzf::{self, NoSelection},
+    player,
+};
 
 /// The port the stream is served on unless --port says otherwise.
 const DEFAULT_PORT: u16 = 8888;

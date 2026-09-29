@@ -3,7 +3,7 @@ use futures_util::future::BoxFuture;
 use serde::Deserialize;
 
 use crate::{
-    provider::{Provider, Query, Torrent, get_json},
+    providers::{Provider, Query, Torrent, get_json},
     util::{human_bytes, magnet},
 };
 

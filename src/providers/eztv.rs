@@ -4,7 +4,7 @@ use serde::Deserialize;
 use tokio::task::JoinSet;
 
 use crate::{
-    provider::{Episode, Provider, Query, Torrent, get_json},
+    providers::{Episode, Provider, Query, Torrent, get_json},
     util::{human_bytes, unix_date},
 };
 
