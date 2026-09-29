@@ -1,10 +1,14 @@
-use std::{collections::HashSet, io::Write, time::Duration};
+use std::{collections::HashSet, io::Write, sync::Arc, time::Duration};
 
-use anyhow::{Context, bail};
-use serde::de::DeserializeOwned;
 use tokio::task::JoinSet;
 
-use crate::{eztv, nyaa, tpb, yts};
+use crate::{
+    eztv::{self, Eztv},
+    nyaa::{self, Nyaa},
+    provider::{Provider, Query, Torrent},
+    tpb::{self, Tpb},
+    yts::{self, Yts},
+};
 
 /// What to search for, each from the sites that have it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -35,52 +39,43 @@ impl Category {
         }
     }
 
-    fn sites(self) -> &'static [Site] {
+    /// The sites to search, at endpoints, with nyaa restricted to user's
+    /// uploads when user isn't empty and to trusted uploads if trusted.
+    pub fn providers(
+        self,
+        endpoints: &Endpoints,
+        user: &str,
+        trusted: bool,
+    ) -> Vec<Arc<dyn Provider>> {
+        let ep = endpoints.clone();
         match self {
-            Category::Anime => &[Site::Nyaa],
-            Category::Movies => &[Site::Yts, Site::Tpb(tpb::Kind::Movies)],
-            Category::Series => &[Site::Eztv, Site::Tpb(tpb::Kind::Tv)],
+            Category::Anime => vec![Arc::new(Nyaa {
+                base: ep.nyaa,
+                user: user.to_owned(),
+                trusted,
+            })],
+            Category::Movies => vec![
+                Arc::new(Yts { base: ep.yts }),
+                Arc::new(Tpb {
+                    base: ep.tpb,
+                    kind: tpb::Kind::Movies,
+                }),
+            ],
+            Category::Series => vec![
+                Arc::new(Eztv {
+                    base: ep.eztv,
+                    imdb: ep.imdb,
+                }),
+                Arc::new(Tpb {
+                    base: ep.tpb,
+                    kind: tpb::Kind::Tv,
+                }),
+            ],
         }
     }
 }
 
-/// A site peerflix searches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Site {
-    Nyaa,
-    Yts,
-    Eztv,
-    Tpb(tpb::Kind),
-}
-
-impl Site {
-    fn name(self) -> &'static str {
-        match self {
-            Site::Nyaa => "nyaa",
-            Site::Yts => "yts",
-            Site::Eztv => "eztv",
-            Site::Tpb(_) => "tpb",
-        }
-    }
-}
-
-/// A search result from any source.
-#[derive(Debug, Default)]
-pub struct Torrent {
-    /// A .torrent URL or magnet link.
-    pub url: String,
-    pub title: String,
-    /// YYYY-MM-DD
-    pub date: String,
-    pub size: String,
-    pub seeders: u32,
-    pub leechers: u32,
-    /// The info hash in lowercase hex, or empty if the source doesn't give
-    /// one.
-    pub info_hash: String,
-}
-
-/// The base URL each source is queried at.
+/// The base URL each site is queried at.
 #[derive(Clone, Debug)]
 pub struct Endpoints {
     pub nyaa: String,
@@ -111,28 +106,45 @@ impl Endpoints {
 /// results are dropped.
 const TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Queries category's sites for query in parallel and writes their results
-/// as fzf input as each site answers, one tab separated line per result: the
-/// torrent URL, the date, size, seeders (colored by health) and, when the
-/// category has several sites, site, and the title. A failed search, such as
-/// a site being unavailable or rate limiting, prints nothing. Dead torrents,
-/// with no seeders, are left out, and so is a torrent another site already
-/// listed, going by info hash. user and trusted only apply to nyaa.
+/// Searches providers, category's sites, for query in parallel and writes their
+/// results as fzf input as each site answers, one tab separated line per
+/// result: the torrent URL, the date, size, seeders (colored by health) and,
+/// when the category has several sites, site, and the title.
 ///
 /// Returns a status line for the search's header: which sites didn't answer,
 /// or where else to look when nothing was found, or nothing when all went
 /// well.
 pub async fn print_results(
     w: &mut impl Write,
-    endpoints: &Endpoints,
     category: Category,
+    providers: &[Arc<dyn Provider>],
     query: &str,
-    user: &str,
-    trusted: bool,
 ) -> String {
-    let sites = category.sites();
-    let (printed, failed) = print_sites(w, endpoints, sites, query, user, trusted).await;
-    status(category, query, printed, &failed, sites.len())
+    let mut printed = 0;
+    let failed = search(providers, &Query::new(query), |site, items| {
+        let site_column = if providers.len() > 1 {
+            format!("  {site:<4}")
+        } else {
+            String::new()
+        };
+        for it in items {
+            // A closed pipe just means fzf moved on to the next query.
+            let _ = writeln!(
+                w,
+                "{}\t\x1b[90m{}  {:>10}\x1b[0m  {}{:>5}\x1b[90m{site_column}\x1b[0m \t{}",
+                it.url,
+                it.date,
+                it.size,
+                health(&it),
+                it.seeders,
+                it.title
+            );
+            printed += 1;
+        }
+        let _ = w.flush();
+    })
+    .await;
+    status(category, query, printed, &failed, providers.len())
 }
 
 /// The sites whose search failed.
@@ -151,45 +163,41 @@ impl Failed {
     }
 }
 
-/// Returns the number of results printed and the sites that failed.
-async fn print_sites(
-    w: &mut impl Write,
-    endpoints: &Endpoints,
-    sites: &[Site],
-    query: &str,
-    user: &str,
-    trusted: bool,
-) -> (usize, Failed) {
+/// Searches providers for query in parallel, and as each one answers, passes
+/// its name and results to found. Dead torrents, with no seeders, are left
+/// out, and so is a torrent another site already listed, going by info hash.
+///
+/// Returns the sites whose search failed, such as by being unavailable or
+/// rate limiting; they pass nothing to found.
+async fn search(
+    providers: &[Arc<dyn Provider>],
+    query: &Query,
+    mut found: impl FnMut(&'static str, Vec<Torrent>),
+) -> Failed {
     let mut failed = Failed::default();
     let Ok(client) = reqwest::Client::builder().timeout(TIMEOUT).build() else {
-        failed.unanswered = sites.iter().map(|s| s.name()).collect();
-        return (0, failed);
+        failed.unanswered = providers.iter().map(|p| p.name()).collect();
+        return failed;
     };
     let mut tasks = JoinSet::new();
-    for &site in sites {
-        let (client, ep) = (client.clone(), endpoints.clone());
-        let (query, user) = (query.to_owned(), user.to_owned());
+    for (i, provider) in providers.iter().enumerate() {
+        let (provider, client, query) = (provider.clone(), client.clone(), query.clone());
         tasks.spawn(async move {
-            let search = async {
-                match site {
-                    Site::Nyaa => nyaa::search(&client, &ep.nyaa, &query, &user, trusted).await,
-                    Site::Yts => yts::search(&client, &ep.yts, &query).await,
-                    Site::Eztv => eztv::search(&client, &ep.imdb, &ep.eztv, &query).await,
-                    Site::Tpb(kind) => tpb::search(&client, &ep.tpb, &query, kind).await,
-                }
-            };
-            // The client's timeout bounds each request, and EZTV makes up to
-            // three rounds of them.
+            // The client's timeout bounds each request, and a site can make
+            // several rounds of them, as EZTV does.
             // None if it timed out.
-            let items = tokio::time::timeout(TIMEOUT, search).await.ok();
-            (site, items)
+            let items = tokio::time::timeout(TIMEOUT, provider.search(&client, &query))
+                .await
+                .ok();
+            (i, items)
         });
     }
     let mut seen = HashSet::new();
-    let (mut printed, mut answered) = (0, Vec::new());
+    let mut answered = Vec::new();
     while let Some(res) = tasks.join_next().await {
-        let Ok((site, items)) = res else { continue };
-        answered.push(site);
+        let Ok((i, items)) = res else { continue };
+        answered.push(i);
+        let name = providers[i].name();
         let items = match items {
             Some(Ok(items)) => items,
             Some(Err(e)) if !unreachable(&e) => {
@@ -197,43 +205,24 @@ async fn print_sites(
                 continue;
             }
             _ => {
-                failed.unanswered.push(site.name());
+                failed.unanswered.push(name);
                 continue;
             }
         };
-        let site_column = if sites.len() > 1 {
-            format!("  {:<4}", site.name())
-        } else {
-            String::new()
-        };
-        for mut it in items {
-            if it.seeders == 0 {
-                continue;
-            }
-            let hash = std::mem::take(&mut it.info_hash);
-            if !hash.is_empty() && !seen.insert(hash) {
-                continue;
-            }
-            // A closed pipe just means fzf moved on to the next query.
-            let _ = writeln!(
-                w,
-                "{}\t\x1b[90m{}  {:>10}\x1b[0m  {}{:>5}\x1b[90m{site_column}\x1b[0m \t{}",
-                it.url,
-                it.date,
-                it.size,
-                health(&it),
-                it.seeders,
-                it.title
-            );
-            printed += 1;
-        }
-        let _ = w.flush();
+        let live = items
+            .into_iter()
+            .filter(|it| it.seeders > 0)
+            .filter(|it| it.info_hash.is_empty() || seen.insert(it.info_hash.clone()))
+            .collect();
+        found(name, live);
     }
     // A task that panicked never reported its site.
-    for s in sites.iter().filter(|s| !answered.contains(s)) {
-        failed.unanswered.push(s.name());
+    for (i, p) in providers.iter().enumerate() {
+        if !answered.contains(&i) {
+            failed.unanswered.push(p.name());
+        }
     }
-    (printed, failed)
+    failed
 }
 
 /// Whether e means the site couldn't be reached or took too long, rather
@@ -282,25 +271,6 @@ fn status(
     format!("{missing}{none} Tab searches {a} and {b}.")
 }
 
-/// Sends req to site and parses its JSON answer, failing unless the site
-/// answered 200 OK.
-pub async fn get_json<T: DeserializeOwned>(
-    req: reqwest::RequestBuilder,
-    site: &str,
-) -> anyhow::Result<T> {
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("searching {site}"))?;
-    let status = resp.status();
-    if status != reqwest::StatusCode::OK {
-        bail!("searching {site}: {status}");
-    }
-    resp.json()
-        .await
-        .with_context(|| format!("parsing {site} results"))
-}
-
 /// Rates a live torrent by its seeders relative to its leechers, as the
 /// color to print its seeder count in.
 fn health(it: &Torrent) -> &'static str {
@@ -314,8 +284,10 @@ fn health(it: &Torrent) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::future::BoxFuture;
+
     use super::*;
-    use crate::{nyaa::tests::SAMPLE_FEED, testutil::FakeServer, yts::tests::SAMPLE_JSON};
+    use crate::{nyaa::tests::SAMPLE_FEED, testutil::FakeServer};
 
     fn endpoints(url: &str) -> Endpoints {
         Endpoints {
@@ -327,19 +299,81 @@ mod tests {
         }
     }
 
+    /// A site that answers every search with the same results, as (info
+    /// hash, seeders) pairs, or with error when it's set.
+    struct FakeSite {
+        name: &'static str,
+        results: &'static [(&'static str, u32)],
+        error: Option<&'static str>,
+    }
+
+    impl FakeSite {
+        fn answering(
+            name: &'static str,
+            results: &'static [(&'static str, u32)],
+        ) -> Arc<dyn Provider> {
+            Arc::new(FakeSite {
+                name,
+                results,
+                error: None,
+            })
+        }
+
+        fn failing(name: &'static str, error: &'static str) -> Arc<dyn Provider> {
+            Arc::new(FakeSite {
+                name,
+                results: &[],
+                error: Some(error),
+            })
+        }
+    }
+
+    impl Provider for FakeSite {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn search<'a>(
+            &'a self,
+            _: &'a reqwest::Client,
+            _: &'a Query,
+        ) -> BoxFuture<'a, anyhow::Result<Vec<Torrent>>> {
+            Box::pin(async move {
+                if let Some(e) = self.error {
+                    anyhow::bail!(e);
+                }
+                Ok(self
+                    .results
+                    .iter()
+                    .map(|&(hash, seeders)| Torrent {
+                        url: format!("magnet:?xt=urn:btih:{hash}"),
+                        title: format!("{} {hash}", self.name),
+                        info_hash: hash.into(),
+                        seeders,
+                        ..Torrent::default()
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    /// Searches providers, returning each site's name and titles in the
+    /// order they answered, and the sites that failed.
+    async fn titles(providers: &[Arc<dyn Provider>]) -> (Vec<(&'static str, Vec<String>)>, Failed) {
+        let mut found = Vec::new();
+        let failed = search(providers, &Query::new("x"), |site, items| {
+            found.push((site, items.into_iter().map(|it| it.title).collect()));
+        })
+        .await;
+        (found, failed)
+    }
+
     #[tokio::test]
     async fn prints_results() {
         let srv = FakeServer::start(200, SAMPLE_FEED).await;
         let mut buf = Vec::new();
-        print_results(
-            &mut buf,
-            &endpoints(&srv.url),
-            Category::Anime,
-            "bunny",
-            "",
-            false,
-        )
-        .await;
+        let providers = Category::Anime.providers(&endpoints(&srv.url), "", false);
+        print_results(&mut buf, Category::Anime, &providers, "bunny").await;
         let out = String::from_utf8(buf).unwrap();
         let lines: Vec<_> = out.lines().collect();
         // The sample's other torrent is dead.
@@ -361,15 +395,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_site_leaves_the_others() {
-        // nyaa can't parse YTS's JSON, so only YTS's results are printed.
-        let srv = FakeServer::start(200, SAMPLE_JSON).await;
+    async fn prints_site_column() {
+        let providers = [
+            FakeSite::answering("yts", &[("aa", 5)]),
+            FakeSite::failing("tpb", "searching tpb: 429 Too Many Requests"),
+        ];
         let mut buf = Vec::new();
-        let sites = [Site::Nyaa, Site::Yts];
-        print_sites(&mut buf, &endpoints(&srv.url), &sites, "bunny", "", false).await;
+        let status = print_results(&mut buf, Category::Movies, &providers, "x").await;
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out.lines().count(), 1, "{out}");
-        assert!(out.lines().all(|l| l.contains("yts")), "{out}");
+        assert!(out.contains("  yts "), "{out}");
+        assert_eq!(status, "searching tpb: 429 Too Many Requests.");
+    }
+
+    #[tokio::test]
+    async fn failed_site_leaves_the_others() {
+        let providers = [
+            FakeSite::failing("nyaa", "parsing nyaa results"),
+            FakeSite::answering("yts", &[("aa", 5)]),
+        ];
+        let (found, failed) = titles(&providers).await;
+        assert_eq!(found, [("yts", vec!["yts aa".to_owned()])]);
+        assert_eq!(failed.errors, ["parsing nyaa results"]);
+        assert!(failed.unanswered.is_empty());
     }
 
     #[tokio::test]
@@ -377,23 +425,17 @@ mod tests {
         let srv = FakeServer::start(503, "").await;
         for category in [Category::Anime, Category::Movies, Category::Series] {
             let mut buf = Vec::new();
-            print_results(&mut buf, &endpoints(&srv.url), category, "bunny", "", false).await;
+            let providers = category.providers(&endpoints(&srv.url), "", false);
+            print_results(&mut buf, category, &providers, "bunny").await;
             assert!(buf.is_empty(), "{category:?}");
         }
     }
 
     #[tokio::test]
     async fn tells_errors_from_unreachable_sites() {
+        let yts = |base: &str| -> [Arc<dyn Provider>; 1] { [Arc::new(Yts { base: base.into() })] };
         let srv = FakeServer::start(429, "").await;
-        let (_, failed) = print_sites(
-            &mut Vec::new(),
-            &endpoints(&srv.url),
-            &[Site::Yts],
-            "bunny",
-            "",
-            false,
-        )
-        .await;
+        let (_, failed) = titles(&yts(&srv.url)).await;
         assert_eq!(failed.errors, ["searching yts: 429 Too Many Requests"]);
         assert!(failed.unanswered.is_empty());
 
@@ -403,28 +445,30 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        let (_, failed) = print_sites(
-            &mut Vec::new(),
-            &endpoints(&format!("http://127.0.0.1:{port}")),
-            &[Site::Yts],
-            "bunny",
-            "",
-            false,
-        )
-        .await;
+        let (_, failed) = titles(&yts(&format!("http://127.0.0.1:{port}"))).await;
         assert_eq!(failed.unanswered, ["yts"]);
         assert!(failed.errors.is_empty());
     }
 
     #[tokio::test]
-    async fn skips_repeated_magnets() {
-        // YTS twice: the second copy's magnets are all repeats.
-        let srv = FakeServer::start(200, SAMPLE_JSON).await;
-        let mut buf = Vec::new();
-        let sites = [Site::Yts, Site::Yts];
-        print_sites(&mut buf, &endpoints(&srv.url), &sites, "bunny", "", false).await;
-        // One of YTS's two torrents in the sample is dead.
-        assert_eq!(String::from_utf8(buf).unwrap().lines().count(), 1);
+    async fn skips_dead_and_repeated_torrents() {
+        let (found, _) = titles(&[FakeSite::answering(
+            "yts",
+            &[("aa", 5), ("bb", 0), ("", 3), ("", 2)],
+        )])
+        .await;
+        // Torrents without a hash are never repeats.
+        assert_eq!(found[0].1, ["yts aa", "yts ", "yts "]);
+
+        // The second site's torrent was already listed.
+        let providers = [
+            FakeSite::answering("yts", &[("aa", 5)]),
+            FakeSite::answering("tpb", &[("aa", 9), ("cc", 1)]),
+        ];
+        let (found, _) = titles(&providers).await;
+        let all: Vec<_> = found.into_iter().flat_map(|(_, t)| t).collect();
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!(all.contains(&"tpb cc".to_owned()), "{all:?}");
     }
 
     #[test]

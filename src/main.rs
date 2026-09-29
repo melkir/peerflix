@@ -9,6 +9,7 @@ mod files;
 mod fzf;
 mod nyaa;
 mod player;
+mod provider;
 mod search;
 mod storage;
 mod stream;
@@ -163,13 +164,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let user = nyaa_user(cli.user.as_deref().unwrap_or(""));
     let mut source = cli.source.join(" ");
     if cli.print {
+        let providers = cli
+            .category
+            .providers(&Endpoints::from_env(), user, cli.trusted);
         let status = search::print_results(
             &mut std::io::stdout().lock(),
-            &Endpoints::from_env(),
             cli.category,
+            &providers,
             &source,
-            user,
-            cli.trusted,
         )
         .await;
         // The interactive search shows it as its header.

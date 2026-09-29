@@ -1,7 +1,8 @@
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Deserializer};
 
 use crate::{
-    search::{Torrent, get_json},
+    provider::{Provider, Query, Torrent, get_json},
     util::{human_bytes, magnet, unix_date},
 };
 
@@ -50,41 +51,55 @@ struct Item {
     added: i64,
 }
 
-/// Searches The Pirate Bay's movies or TV shows, most seeded first. An empty
-/// query lists the top 100 in HD, what's popular right now. Cams and other
-/// pre-release copies are left out of movies.
-pub async fn search(
-    client: &reqwest::Client,
-    base: &str,
-    query: &str,
-    kind: Kind,
-) -> anyhow::Result<Vec<Torrent>> {
-    let req = if query.trim().is_empty() {
-        client.get(format!(
-            "{base}/precompiled/data_top100_{}.json",
-            kind.top()
-        ))
-    } else {
-        client
-            .get(format!("{base}/q.php"))
-            .query(&[("q", query), ("cat", kind.categories())])
-    };
-    let items: Vec<Item> = get_json(req, "tpb").await?;
-    Ok(items
-        .into_iter()
-        // No results come back as one placeholder with an all-zero hash.
-        .filter(|it| it.info_hash.bytes().any(|b| b != b'0'))
-        .filter(|it| kind != Kind::Movies || !is_cam(&it.name))
-        .map(|it| Torrent {
-            url: magnet(&it.info_hash, &it.name),
-            date: unix_date(it.added),
-            size: human_bytes(it.size),
-            seeders: it.seeders.try_into().unwrap_or(u32::MAX),
-            leechers: it.leechers.try_into().unwrap_or(u32::MAX),
-            info_hash: it.info_hash.to_ascii_lowercase(),
-            title: it.name,
+/// The Pirate Bay's movies or TV shows.
+pub struct Tpb {
+    pub base: String,
+    pub kind: Kind,
+}
+
+impl Provider for Tpb {
+    fn name(&self) -> &'static str {
+        "tpb"
+    }
+
+    /// Searches The Pirate Bay's movies or TV shows, most seeded first. An
+    /// empty query lists the top 100 in HD, what's popular right now. Cams
+    /// and other pre-release copies are left out of movies.
+    fn search<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        query: &'a Query,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<Torrent>>> {
+        Box::pin(async move {
+            let (base, kind) = (&self.base, self.kind);
+            let req = if query.text.trim().is_empty() {
+                client.get(format!(
+                    "{base}/precompiled/data_top100_{}.json",
+                    kind.top()
+                ))
+            } else {
+                client
+                    .get(format!("{base}/q.php"))
+                    .query(&[("q", query.text.as_str()), ("cat", kind.categories())])
+            };
+            let items: Vec<Item> = get_json(req, "tpb").await?;
+            Ok(items
+                .into_iter()
+                // No results come back as one placeholder with an all-zero hash.
+                .filter(|it| it.info_hash.bytes().any(|b| b != b'0'))
+                .filter(|it| kind != Kind::Movies || !is_cam(&it.name))
+                .map(|it| Torrent {
+                    url: magnet(&it.info_hash, &it.name),
+                    date: unix_date(it.added),
+                    size: human_bytes(it.size),
+                    seeders: it.seeders.try_into().unwrap_or(u32::MAX),
+                    leechers: it.leechers.try_into().unwrap_or(u32::MAX),
+                    info_hash: it.info_hash.to_ascii_lowercase(),
+                    title: it.name,
+                })
+                .collect())
         })
-        .collect())
+    }
 }
 
 /// Whether a movie's name marks it as a cam, telesync or screener: a
@@ -138,6 +153,15 @@ mod tests {
     use super::*;
     use crate::testutil::FakeServer;
 
+    async fn search(base: &str, query: &str, kind: Kind) -> anyhow::Result<Vec<Torrent>> {
+        let tpb = Tpb {
+            base: base.into(),
+            kind,
+        };
+        tpb.search(&reqwest::Client::new(), &Query::new(query))
+            .await
+    }
+
     const SAMPLE_JSON: &str = r#"[
         {"id":"7349754","name":"Big Buck Bunny (2008) 1080p BrRip x264","info_hash":"224BF45881252643DFC2E71ABC7B2660A21C68C4","leechers":"94","seeders":"892","size":"1991613584","num_files":"6","username":"someone","added":"1339547627","status":"vip","category":"207","imdb":"tt1254207"},
         {"id":"2","name":"Big Buck Bunny 720p","info_hash":"89ABCDEF0123456789ABCDEF0123456789ABCDEF","leechers":"","seeders":"0","size":"x","added":"0"}
@@ -148,14 +172,9 @@ mod tests {
     #[tokio::test]
     async fn search_parses_results() {
         let srv = FakeServer::start(200, SAMPLE_JSON).await;
-        let items = search(
-            &reqwest::Client::new(),
-            &srv.url,
-            "big buck bunny",
-            Kind::Movies,
-        )
-        .await
-        .unwrap();
+        let items = search(&srv.url, "big buck bunny", Kind::Movies)
+            .await
+            .unwrap();
         assert_eq!(items.len(), 2);
         let it = &items[0];
         assert_eq!(it.title, "Big Buck Bunny (2008) 1080p BrRip x264");
@@ -184,9 +203,7 @@ mod tests {
     #[tokio::test]
     async fn no_results() {
         let srv = FakeServer::start(200, NO_RESULTS).await;
-        let items = search(&reqwest::Client::new(), &srv.url, "nothing", Kind::Tv)
-            .await
-            .unwrap();
+        let items = search(&srv.url, "nothing", Kind::Tv).await.unwrap();
         assert!(items.is_empty());
         assert_eq!(
             srv.queries()[0].get("cat").map(String::as_str),
@@ -202,14 +219,13 @@ mod tests {
     #[tokio::test]
     async fn empty_query_lists_top_100() {
         let srv = FakeServer::start(200, TOP_JSON).await;
-        let client = reqwest::Client::new();
-        let items = search(&client, &srv.url, " ", Kind::Movies).await.unwrap();
+        let items = search(&srv.url, " ", Kind::Movies).await.unwrap();
         assert_eq!(items.len(), 1);
         let it = &items[0];
         assert_eq!((it.seeders, it.leechers), (6824, 7648));
         assert_eq!(it.size, "3.5 GiB");
         assert_eq!(it.date, "2026-07-31");
-        search(&client, &srv.url, "", Kind::Tv).await.unwrap();
+        search(&srv.url, "", Kind::Tv).await.unwrap();
         assert_eq!(
             srv.paths(),
             [
@@ -243,13 +259,10 @@ mod tests {
     #[tokio::test]
     async fn leaves_out_cams_from_movies() {
         let srv = FakeServer::start(200, CAM_JSON).await;
-        let client = reqwest::Client::new();
-        let movies = search(&client, &srv.url, "movie", Kind::Movies)
-            .await
-            .unwrap();
+        let movies = search(&srv.url, "movie", Kind::Movies).await.unwrap();
         let titles: Vec<_> = movies.iter().map(|it| it.title.as_str()).collect();
         assert_eq!(titles, ["Movie 2026 1080p WEB-DL"]);
-        let tv = search(&client, &srv.url, "movie", Kind::Tv).await.unwrap();
+        let tv = search(&srv.url, "movie", Kind::Tv).await.unwrap();
         assert_eq!(tv.len(), 2);
     }
 
@@ -261,9 +274,7 @@ mod tests {
     #[tokio::test]
     async fn search_errors() {
         let srv = FakeServer::start(502, "").await;
-        let err = search(&reqwest::Client::new(), &srv.url, "x", Kind::Tv)
-            .await
-            .unwrap_err();
+        let err = search(&srv.url, "x", Kind::Tv).await.unwrap_err();
         assert!(err.to_string().contains("502"), "{err}");
     }
 }

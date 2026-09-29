@@ -1,8 +1,9 @@
 use anyhow::bail;
+use futures_util::future::BoxFuture;
 use serde::Deserialize;
 
 use crate::{
-    search::{Torrent, get_json},
+    provider::{Provider, Query, Torrent, get_json},
     util::{human_bytes, magnet},
 };
 
@@ -45,56 +46,79 @@ struct Item {
     date_uploaded: String,
 }
 
-/// Searches YTS's movies by title, most seeded first, and returns one result
-/// per movie and quality. An empty query returns nothing rather than the
-/// whole catalog.
-pub async fn search(
-    client: &reqwest::Client,
-    base: &str,
-    query: &str,
-) -> anyhow::Result<Vec<Torrent>> {
-    if query.trim().is_empty() {
-        return Ok(Vec::new());
+/// YTS's movies.
+pub struct Yts {
+    pub base: String,
+}
+
+impl Provider for Yts {
+    fn name(&self) -> &'static str {
+        "yts"
     }
-    let req = client
-        .get(format!("{base}/api/v2/list_movies.json"))
-        .query(&[("query_term", query), ("limit", "50"), ("sort_by", "seeds")]);
-    let body: Response = get_json(req, "yts").await?;
-    if body.status != "ok" {
-        bail!("searching yts: {}", body.status_message);
+
+    /// Searches YTS's movies by title, most seeded first, and returns one
+    /// result per movie and quality. An empty query returns nothing rather
+    /// than the whole catalog.
+    fn search<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        query: &'a Query,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<Torrent>>> {
+        Box::pin(async move {
+            if query.text.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            let req = client
+                .get(format!("{}/api/v2/list_movies.json", self.base))
+                .query(&[
+                    ("query_term", query.text.as_str()),
+                    ("limit", "50"),
+                    ("sort_by", "seeds"),
+                ]);
+            let body: Response = get_json(req, "yts").await?;
+            if body.status != "ok" {
+                bail!("searching yts: {}", body.status_message);
+            }
+            let mut results = Vec::new();
+            for movie in body.data.movies {
+                for it in movie.torrents {
+                    let tags = [&it.quality, &it.kind, &it.video_codec]
+                        .into_iter()
+                        .filter(|t| !t.is_empty())
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let title = format!("{} [{tags}]", movie.title_long);
+                    results.push(Torrent {
+                        url: magnet(&it.hash, &title),
+                        title,
+                        date: it
+                            .date_uploaded
+                            .get(..10)
+                            .unwrap_or("0001-01-01")
+                            .to_owned(),
+                        size: human_bytes(it.size_bytes),
+                        info_hash: it.hash.to_ascii_lowercase(),
+                        seeders: it.seeds,
+                        leechers: it.peers,
+                    });
+                }
+            }
+            Ok(results)
+        })
     }
-    let mut results = Vec::new();
-    for movie in body.data.movies {
-        for it in movie.torrents {
-            let tags = [&it.quality, &it.kind, &it.video_codec]
-                .into_iter()
-                .filter(|t| !t.is_empty())
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(" ");
-            let title = format!("{} [{tags}]", movie.title_long);
-            results.push(Torrent {
-                url: magnet(&it.hash, &title),
-                title,
-                date: it
-                    .date_uploaded
-                    .get(..10)
-                    .unwrap_or("0001-01-01")
-                    .to_owned(),
-                size: human_bytes(it.size_bytes),
-                info_hash: it.hash.to_ascii_lowercase(),
-                seeders: it.seeds,
-                leechers: it.peers,
-            });
-        }
-    }
-    Ok(results)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::{testutil::FakeServer, util::TRACKERS};
+
+    async fn search(base: &str, query: &str) -> anyhow::Result<Vec<Torrent>> {
+        let yts = Yts { base: base.into() };
+        yts.search(&reqwest::Client::new(), &Query::new(query))
+            .await
+    }
 
     pub const SAMPLE_JSON: &str = r#"{"status":"ok","status_message":"Query was successful","data":{"movie_count":1,"movies":[
         {"title_long":"Big Buck Bunny (2008)","torrents":[
@@ -105,9 +129,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn search_parses_movies() {
         let srv = FakeServer::start(200, SAMPLE_JSON).await;
-        let items = search(&reqwest::Client::new(), &srv.url, "big buck bunny")
-            .await
-            .unwrap();
+        let items = search(&srv.url, "big buck bunny").await.unwrap();
         assert_eq!(items.len(), 2);
         let it = &items[0];
         assert_eq!(it.title, "Big Buck Bunny (2008) [1080p bluray x264]");
@@ -141,9 +163,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn empty_query_skips_request() {
         let srv = FakeServer::start(200, SAMPLE_JSON).await;
-        let items = search(&reqwest::Client::new(), &srv.url, " ")
-            .await
-            .unwrap();
+        let items = search(&srv.url, " ").await.unwrap();
         assert!(items.is_empty());
         assert!(srv.queries().is_empty());
     }
@@ -151,15 +171,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn search_errors() {
         let srv = FakeServer::start(200, r#"{"status":"error","status_message":"nope"}"#).await;
-        let err = search(&reqwest::Client::new(), &srv.url, "x")
-            .await
-            .unwrap_err();
+        let err = search(&srv.url, "x").await.unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
 
         let srv = FakeServer::start(429, "").await;
-        let err = search(&reqwest::Client::new(), &srv.url, "x")
-            .await
-            .unwrap_err();
+        let err = search(&srv.url, "x").await.unwrap_err();
         assert!(err.to_string().contains("429"), "{err}");
     }
 }

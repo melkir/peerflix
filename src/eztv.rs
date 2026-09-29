@@ -1,9 +1,10 @@
 use anyhow::{Context, anyhow};
+use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use tokio::task::JoinSet;
 
 use crate::{
-    search::{Torrent, get_json},
+    provider::{Episode, Provider, Query, Torrent, get_json},
     util::{human_bytes, unix_date},
 };
 
@@ -16,12 +17,6 @@ pub const IMDB_URL: &str = "https://v3.sg.media-imdb.com";
 const PAGE_SIZE: usize = 100;
 /// The most pages fetched when looking for one season.
 const MAX_PAGES: usize = 5;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Episode {
-    season: u32,
-    episode: Option<u32>,
-}
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
@@ -44,28 +39,43 @@ struct Item {
     date_released_unix: i64,
 }
 
-/// Searches EZTV for the show IMDb suggests for query, newest first. A
-/// trailing S01E02, S01 or 1x02 keeps only that season or episode.
-pub async fn search(
-    client: &reqwest::Client,
-    imdb: &str,
-    base: &str,
-    query: &str,
-) -> anyhow::Result<Vec<Torrent>> {
-    let (show, wanted) = split_episode(query);
-    if show.is_empty() {
-        return Ok(Vec::new());
+/// EZTV's TV shows.
+pub struct Eztv {
+    pub base: String,
+    /// IMDb's title suggestions, which map queries to show IDs.
+    pub imdb: String,
+}
+
+impl Provider for Eztv {
+    fn name(&self) -> &'static str {
+        "eztv"
     }
-    let Some(id) = show_id(client, imdb, show).await? else {
-        return Ok(Vec::new());
-    };
-    let pages = if wanted.is_some() { MAX_PAGES } else { 1 };
-    let items = torrents(client, base, &id, pages).await?;
-    Ok(items
-        .into_iter()
-        .filter(|it| wanted.is_none_or(|w| w.matches(it)))
-        .map(Torrent::from)
-        .collect())
+
+    /// Searches EZTV for the show IMDb suggests for the query's title,
+    /// newest first, keeping only the query's season or episode if it has
+    /// one.
+    fn search<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        query: &'a Query,
+    ) -> BoxFuture<'a, anyhow::Result<Vec<Torrent>>> {
+        Box::pin(async move {
+            if query.title.is_empty() {
+                return Ok(Vec::new());
+            }
+            let Some(id) = show_id(client, &self.imdb, &query.title).await? else {
+                return Ok(Vec::new());
+            };
+            let wanted = query.episode;
+            let pages = if wanted.is_some() { MAX_PAGES } else { 1 };
+            let items = torrents(client, &self.base, &id, pages).await?;
+            Ok(items
+                .into_iter()
+                .filter(|it| wanted.is_none_or(|w| is_episode(it, w)))
+                .map(Torrent::from)
+                .collect())
+        })
+    }
 }
 
 /// Returns the IMDb ID, such as tt1234567, of the first TV show IMDb
@@ -134,11 +144,10 @@ async fn page(client: &reqwest::Client, base: &str, id: &str, n: usize) -> anyho
     get_json(req, "eztv").await
 }
 
-impl Episode {
-    fn matches(self, it: &Item) -> bool {
-        it.season.parse() == Ok(self.season)
-            && self.episode.is_none_or(|e| it.episode.parse() == Ok(e))
-    }
+/// Whether it is from wanted's season, or is wanted's episode.
+fn is_episode(it: &Item, wanted: Episode) -> bool {
+    it.season.parse() == Ok(wanted.season)
+        && wanted.episode.is_none_or(|e| it.episode.parse() == Ok(e))
 }
 
 impl From<Item> for Torrent {
@@ -154,43 +163,6 @@ impl From<Item> for Torrent {
             info_hash: it.hash.to_ascii_lowercase(),
         }
     }
-}
-
-/// Splits a trailing episode token off query, returning the show's title and
-/// the episode.
-fn split_episode(query: &str) -> (&str, Option<Episode>) {
-    let query = query.trim();
-    let (show, last) = query.rsplit_once(' ').unwrap_or(("", query));
-    match parse_episode(last) {
-        Some(e) => (show.trim_end(), Some(e)),
-        None => (query, None),
-    }
-}
-
-/// Parses S01E02, S01 or 1x02, in any case.
-fn parse_episode(s: &str) -> Option<Episode> {
-    let s = s.to_ascii_lowercase();
-    let num = |t: &str| {
-        if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        t.parse().ok()
-    };
-    if let Some(rest) = s.strip_prefix('s') {
-        let (season, episode) = match rest.split_once('e') {
-            Some((s, e)) => (s, Some(num(e)?)),
-            None => (rest, None),
-        };
-        return Some(Episode {
-            season: num(season)?,
-            episode,
-        });
-    }
-    let (season, episode) = s.split_once('x')?;
-    Some(Episode {
-        season: num(season)?,
-        episode: Some(num(episode)?),
-    })
 }
 
 #[cfg(test)]
@@ -230,7 +202,12 @@ mod tests {
     #[tokio::test]
     async fn empty_query_skips_request() {
         let srv = FakeServer::start(200, SAMPLE_JSON).await;
-        let items = search(&reqwest::Client::new(), &srv.url, &srv.url, " ")
+        let eztv = Eztv {
+            base: srv.url.clone(),
+            imdb: srv.url.clone(),
+        };
+        let items = eztv
+            .search(&reqwest::Client::new(), &Query::new(" "))
             .await
             .unwrap();
         assert!(items.is_empty());
@@ -244,12 +221,13 @@ mod tests {
         let items = torrents(&client, &srv.url, "tt1234567", MAX_PAGES)
             .await
             .unwrap();
-        let wanted = parse_episode("s02").unwrap();
-        let kept: Vec<_> = items.iter().filter(|it| wanted.matches(it)).collect();
+        let episode = |q| Query::new(q).episode.unwrap();
+        let wanted = episode("s02");
+        let kept: Vec<_> = items.iter().filter(|it| is_episode(it, wanted)).collect();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].title, "Pioneer One S02E01 720p");
-        let wanted = parse_episode("1x10").unwrap();
-        assert!(wanted.matches(&items[0]) && !wanted.matches(&items[1]));
+        let wanted = episode("1x10");
+        assert!(is_episode(&items[0], wanted) && !is_episode(&items[1], wanted));
     }
 
     #[tokio::test]
@@ -269,22 +247,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id, None);
-    }
-
-    #[test]
-    fn splits_episodes() {
-        let ep = |season, episode| Some(Episode { season, episode });
-        for (q, show, want) in [
-            ("big buck bunny", "big buck bunny", None),
-            ("big buck bunny S01E02", "big buck bunny", ep(1, Some(2))),
-            ("big buck bunny s3", "big buck bunny", ep(3, None)),
-            ("big buck bunny 2x10 ", "big buck bunny", ep(2, Some(10))),
-            ("sintel", "sintel", None),
-            ("se10", "se10", None),
-            ("s01", "", ep(1, None)),
-            ("the show s01e", "the show s01e", None),
-        ] {
-            assert_eq!(split_episode(q), (show, want), "{q:?}");
-        }
     }
 }
