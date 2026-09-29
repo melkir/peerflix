@@ -35,7 +35,7 @@ pub struct File {
 
 type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 
-/// Serves each of files at /<escaped name>, and the first on every other path,
+/// Serves each of files at `/<escaped name>`, and the first on every other path,
 /// until the task is dropped.
 pub async fn serve(listener: TcpListener, files: Arc<[File]>) {
     let paths: Arc<[String]> = files.iter().map(|f| path_escape(&f.name)).collect();

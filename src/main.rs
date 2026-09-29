@@ -1,23 +1,8 @@
-//! peerflix streams a torrent (magnet link, .torrent file or URL) to IINA.
-//!
-//! The selected file is served over a local HTTP server with range support;
-//! reads prioritize the pieces around the player's read position, so playback
-//! starts as soon as the first pieces arrive and seeking works.
+//! peerflix streams a torrent (magnet link, .torrent file or URL) to IINA,
+//! or searches for one in fzf.
 
-mod eztv;
-mod files;
 mod fzf;
-mod nyaa;
 mod player;
-mod provider;
-mod search;
-mod storage;
-mod stream;
-#[cfg(test)]
-mod testutil;
-mod tpb;
-mod util;
-mod yts;
 
 use std::{
     io::IsTerminal,
@@ -27,24 +12,21 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use clap::Parser;
-use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
-    ListenerOptions, ManagedTorrent, PeerConnectionOptions, Session, SessionOptions, TorrentStats,
-    storage::StorageFactoryExt,
-};
+use librqbit::{AddTorrent, ManagedTorrent, Session, TorrentStats};
 use tokio::{net::TcpListener, signal::unix::SignalKind};
-use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+use tokio_util::sync::CancellationToken;
 
-use crate::{
+use peerflix::{
     files::{TorrentFile, episodes, pick_file, subtitles, torrent_files},
-    fzf::NoSelection,
     search::{Category, Endpoints},
     storage::PartStorage,
-    stream::{Reader, path_escape},
+    torrent::{self, add_torrent, complete_files, fetch_metadata, serve_files},
     util::human_bytes,
 };
+
+use crate::fzf::NoSelection;
 
 /// The port the stream is served on unless --port says otherwise.
 const DEFAULT_PORT: u16 = 8888;
@@ -167,7 +149,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let providers = cli
             .category
             .providers(&Endpoints::from_env(), user, cli.trusted);
-        let status = search::print_results(
+        let status = fzf::print_results(
             &mut std::io::stdout().lock(),
             cli.category,
             &providers,
@@ -228,24 +210,7 @@ async fn run(cancel: &CancellationToken, source: &str, cli: &Cli) -> anyhow::Res
         None => std::env::temp_dir().join("peerflix"),
     };
 
-    let session = Session::new_with_opts(
-        data_dir,
-        SessionOptions {
-            cancellation_token: Some(cancel.child_token()),
-            // Don't leave DHT state behind in the user's cache dir.
-            dht: Some(DhtSessionConfig {
-                persistence: None,
-                ..Default::default()
-            }),
-            listen: Some(ListenerOptions {
-                enable_upnp_port_forwarding: !cli.no_upnp,
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    )
-    .await
-    .context("creating torrent session")?;
+    let session = torrent::session(data_dir, cancel.child_token(), !cli.no_upnp).await?;
     let result = stream_torrent(cancel, &session, source, cli).await;
     session.stop().await;
     result
@@ -313,80 +278,6 @@ async fn stream_torrent(
     watch(cancel, player, &torrent, &storage, &files, id, wanted).await
 }
 
-/// Adds the torrent to download just the wanted files, as .part files until
-/// they're complete; streams still take priority. With --dir, existing data
-/// is checked and reused.
-async fn add_torrent(
-    session: &Arc<Session>,
-    meta: ListOnlyResponse,
-    storage: &PartStorage,
-    wanted: &[usize],
-) -> anyhow::Result<Arc<ManagedTorrent>> {
-    let opts = AddTorrentOptions {
-        only_files: Some(wanted.to_vec()),
-        // Where librqbit would put it anyway, spelled out as storage uses it.
-        output_folder: Some(meta.output_folder.to_string_lossy().into_owned()),
-        storage_factory: Some(storage.clone().boxed()),
-        overwrite: true,
-        initial_peers: Some(meta.seen_peers),
-        peer_opts: Some(PeerConnectionOptions {
-            // The piece at the player's position after a seek is requested
-            // behind everything already queued to a peer. librqbit queues 128
-            // chunks (2 MiB); 32 cut long jumps in IINA from 2.6-8 s to
-            // 0.5-2.4 s without slowing the download.
-            max_request_window: Some(32),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    session
-        .add_torrent(AddTorrent::from_bytes(meta.torrent_bytes), Some(opts))
-        .await?
-        .into_handle()
-        .context("torrent was not added")
-}
-
-/// The stream being served, until dropped.
-struct Stream {
-    /// The name file id is served under.
-    name: String,
-    url: String,
-    /// The names and URLs of the subtitles served alongside.
-    sub_names: Vec<String>,
-    sub_urls: Vec<String>,
-    _server: AbortOnDropHandle<()>,
-}
-
-/// Starts serving file id of torrent and its subtitles subs on listener.
-fn serve_files(
-    listener: TcpListener,
-    torrent: &Arc<ManagedTorrent>,
-    files: &[TorrentFile],
-    id: usize,
-    subs: &[usize],
-) -> anyhow::Result<Stream> {
-    let base = format!("http://{}", listener.local_addr()?);
-    let name = served_name(&files[id].path, &[]);
-    let mut served = vec![torrent_file(
-        torrent.clone(),
-        id,
-        name.clone(),
-        files[id].len,
-    )];
-    for &i in subs {
-        let sub_name = served_name(&files[i].path, &served);
-        served.push(torrent_file(torrent.clone(), i, sub_name, files[i].len));
-    }
-    let url_of = |name: &str| format!("{base}/{}", path_escape(name));
-    Ok(Stream {
-        url: url_of(&name),
-        sub_urls: served[1..].iter().map(|f| url_of(&f.name)).collect(),
-        sub_names: served[1..].iter().map(|f| f.name.clone()).collect(),
-        name,
-        _server: AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, served.into()))),
-    })
-}
-
 /// Shows progress and renames finished files until cancelled or the player
 /// quits, and returns the player's result. downloading is the ids of the
 /// files being downloaded, of which id is the one streamed.
@@ -448,21 +339,6 @@ async fn watch(
     }
 }
 
-/// Drops their .part suffix from the downloading files that have finished,
-/// and removes them from downloading.
-fn complete_files(
-    storage: &PartStorage,
-    stats: &TorrentStats,
-    files: &[TorrentFile],
-    downloading: &mut Vec<usize>,
-) {
-    downloading.retain(|&i| {
-        let done = stats.file_progress.get(i) == Some(&files[i].len);
-        // A failed rename is retried on the next tick.
-        !(done && storage.complete(i).is_ok())
-    });
-}
-
 /// Binds the stream's port on localhost. Without an explicit port, that's
 /// DEFAULT_PORT, or a random one when it's taken.
 async fn bind_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
@@ -473,35 +349,6 @@ async fn bind_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
             Ok(TcpListener::bind(("127.0.0.1", 0)).await?)
         }
         Err(e) => Err(e).with_context(|| format!("listening on port {want}")),
-    }
-}
-
-/// Resolves the torrent's metadata without adding it, so nothing is
-/// downloaded until a file is picked.
-async fn fetch_metadata(
-    session: &Arc<Session>,
-    add: AddTorrent<'_>,
-) -> anyhow::Result<ListOnlyResponse> {
-    let opts = AddTorrentOptions {
-        list_only: true,
-        ..Default::default()
-    };
-    match session.add_torrent(add, Some(opts)).await? {
-        AddTorrentResponse::ListOnly(meta) => Ok(meta),
-        _ => bail!("torrent was added instead of listed"),
-    }
-}
-
-/// Serves file id of torrent. With --dir, existing data is checked first; IINA
-/// starts meanwhile and librqbit holds its first request until the check ends.
-fn torrent_file(torrent: Arc<ManagedTorrent>, id: usize, name: String, len: u64) -> stream::File {
-    stream::File {
-        name,
-        len,
-        open: Box::new(move || {
-            let t = torrent.clone();
-            Box::pin(async move { Ok(Box::pin(t.stream(id).await?) as Reader) })
-        }),
     }
 }
 
@@ -552,22 +399,6 @@ async fn select_file(
         return Ok(None);
     };
     Ok(Some(choice?.parse().context("reading fzf's choice")?))
-}
-
-/// Returns the file name to serve path under, prefixed with a number if one
-/// of served already has it.
-fn served_name(path: &str, served: &[stream::File]) -> String {
-    let name = Path::new(path)
-        .file_name()
-        .map_or_else(|| path.to_owned(), |n| n.to_string_lossy().into_owned());
-    let taken = |n: &str| served.iter().any(|f| f.name == n);
-    if !taken(&name) {
-        return name;
-    }
-    (2..)
-        .map(|k| format!("{k}-{name}"))
-        .find(|n| !taken(n))
-        .expect("an unused name")
 }
 
 #[cfg(test)]
@@ -631,80 +462,5 @@ mod tests {
         ] {
             assert_eq!(is_torrent_source(s), want, "{s:?}");
         }
-    }
-
-    /// Seeds a torrent from local files with networking disabled and streams
-    /// one of them through the HTTP server.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn streams_local_torrent() {
-        let dir = tempfile::tempdir().unwrap();
-        let content = dir.path().join("content");
-        std::fs::create_dir(&content).unwrap();
-        let data = "0123456789".repeat(5000); // spans several pieces
-        std::fs::write(content.join("video.mkv"), &data).unwrap();
-        std::fs::write(content.join("other.txt"), "x").unwrap();
-
-        let spawner = librqbit::spawn_utils::BlockingSpawner::new(1);
-        let opts = librqbit::CreateTorrentOptions {
-            piece_length: Some(16 << 10),
-            ..Default::default()
-        };
-        let created = librqbit::create_torrent(&content, opts, &spawner)
-            .await
-            .unwrap();
-
-        let session = Session::new_with_opts(
-            dir.path().to_owned(),
-            SessionOptions {
-                dht: None,
-                listen: None,
-                disable_trackers: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let add = AddTorrent::from_bytes(created.as_bytes().unwrap());
-        let meta = fetch_metadata(&session, add).await.unwrap();
-        let files = torrent_files(&meta);
-        let id = pick_file(&files, None).unwrap();
-        assert_eq!(files[id].path, "video.mkv");
-
-        let storage = PartStorage::new(meta.output_folder.clone());
-        let opts = AddTorrentOptions {
-            only_files: Some(vec![id]),
-            overwrite: true,
-            output_folder: Some(meta.output_folder.to_string_lossy().into_owned()),
-            storage_factory: Some(storage.boxed()),
-            ..Default::default()
-        };
-        let torrent = session
-            .add_torrent(AddTorrent::from_bytes(meta.torrent_bytes), Some(opts))
-            .await
-            .unwrap()
-            .into_handle()
-            .unwrap();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/video.mkv", listener.local_addr().unwrap());
-        // librqbit's stream() waits for the initial check, which is too quick
-        // here to overlap with the requests.
-        let file = torrent_file(torrent.clone(), id, "video.mkv".into(), files[id].len);
-        let _server =
-            AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, Arc::new([file]))));
-
-        let client = reqwest::Client::new();
-        let resp = client.get(&url).send().await.unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(resp.text().await.unwrap(), data);
-        let resp = client
-            .get(&url)
-            .header("Range", "bytes=20000-20009")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 206);
-        assert_eq!(resp.text().await.unwrap(), data[20000..20010]);
-        session.stop().await;
     }
 }

@@ -1,11 +1,17 @@
 //! Picking from lists in fzf: the live search and the episode picker.
 
-use std::process::{Command, Stdio};
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+    sync::Arc,
+};
 
 use anyhow::Context;
+use peerflix::{
+    provider::{Provider, Query, Torrent},
+    search::{self, Category, Failed},
+};
 use tokio::io::AsyncWriteExt;
-
-use crate::search::Category;
 
 /// Options both lists share. Lines are tab separated: the value to return,
 /// which is hidden, then columns shown with ANSI colors, of which the second
@@ -113,6 +119,97 @@ pub fn search_interactive(
     fzf_choice(out?)
 }
 
+/// Searches providers, category's sites, for query in parallel and writes
+/// their results as the live search's input as each site answers, one line
+/// per result.
+///
+/// Returns a status line for the search's header: which sites didn't answer,
+/// or where else to look when nothing was found, or nothing when all went
+/// well.
+pub async fn print_results(
+    w: &mut impl Write,
+    category: Category,
+    providers: &[Arc<dyn Provider>],
+    query: &str,
+) -> String {
+    let mut printed = 0;
+    let failed = search::search(providers, &Query::new(query), |site, items| {
+        // The site column is only worth its space when there are several.
+        let site = (providers.len() > 1).then_some(site);
+        for it in items {
+            // A closed pipe just means fzf moved on to the next query.
+            let _ = writeln!(w, "{}", line(&it, site));
+            printed += 1;
+        }
+        let _ = w.flush();
+    })
+    .await;
+    status(category, query, printed, &failed, providers.len())
+}
+
+/// The live search's line for it: the torrent URL, a tab, the date, size,
+/// seeders (colored by health) and site if given, a tab, and the title.
+fn line(it: &Torrent, site: Option<&str>) -> String {
+    let site = site.map_or_else(String::new, |s| format!("  {s:<4}"));
+    format!(
+        "{}\t\x1b[90m{}  {:>10}\x1b[0m  {}{:>5}\x1b[90m{site}\x1b[0m \t{}",
+        it.url,
+        it.date,
+        it.size,
+        health(it),
+        it.seeders,
+        it.title
+    )
+}
+
+/// The header line for a search that printed printed results, with failed
+/// holding the sites, out of sites, whose search failed.
+fn status(
+    category: Category,
+    query: &str,
+    printed: usize,
+    failed: &Failed,
+    sites: usize,
+) -> String {
+    let unanswered = failed.unanswered.join(" and ");
+    if failed.unanswered.len() == sites {
+        return format!("{unanswered} didn't answer. Check your connection and try again.");
+    }
+    let mut notes: Vec<String> = failed.errors.iter().map(|e| format!("{e}.")).collect();
+    if !unanswered.is_empty() {
+        notes.insert(0, format!("{unanswered} didn't answer."));
+    }
+    let missing = notes.join(" ");
+    // No results says nothing when no site could search.
+    if printed > 0 || failed.count() == sites {
+        return missing;
+    }
+    let missing = if missing.is_empty() {
+        missing
+    } else {
+        missing + " "
+    };
+    let [a, b] = category.others().map(Category::name);
+    let query = query.trim();
+    let none = if query.is_empty() {
+        format!("No {} to show.", category.name())
+    } else {
+        format!("No {} results for \"{query}\".", category.name())
+    };
+    format!("{missing}{none} Tab searches {a} and {b}.")
+}
+
+/// Rates a live torrent by its seeders relative to its leechers, as the
+/// color to print its seeder count in.
+fn health(it: &Torrent) -> &'static str {
+    use std::cmp::Ordering::*;
+    match it.seeders.cmp(&it.leechers) {
+        Greater => "\x1b[32m",
+        Equal => "\x1b[33m",
+        Less => "\x1b[38;5;208m",
+    }
+}
+
 /// Runs fzf over lines, each the value to return, a tab, a detail column, a
 /// tab and the text to match, and returns the chosen value, or NoSelection if
 /// the user quits.
@@ -168,6 +265,116 @@ mod tests {
             ("it's", r"'it'\''s'"),
         ] {
             assert_eq!(shell_quote(s), want);
+        }
+    }
+
+    #[test]
+    fn lines() {
+        let it = Torrent {
+            url: "https://nyaa.si/download/1.torrent".into(),
+            title: "[Group] Big Buck Bunny - 01 [1080p].mkv".into(),
+            date: "2026-09-26".into(),
+            size: "1.2 GiB".into(),
+            seeders: 42,
+            leechers: 3,
+            ..Torrent::default()
+        };
+        let l = line(&it, None);
+        let fields: Vec<_> = l.split('\t').collect();
+        assert_eq!(fields.len(), 3, "{l:?}");
+        assert_eq!(fields[0], "https://nyaa.si/download/1.torrent");
+        assert!(
+            fields[1].contains("2026-09-26")
+                && fields[1].contains("1.2 GiB")
+                // 42 seeders and 3 leechers: green.
+                && fields[1].contains("\x1b[32m   42"),
+            "{:?}",
+            fields[1]
+        );
+        assert_eq!(fields[2], "[Group] Big Buck Bunny - 01 [1080p].mkv");
+
+        let l = line(&it, Some("yts"));
+        assert!(l.contains("   42\x1b[90m  yts \x1b[0m \t"), "{l:?}");
+    }
+
+    #[test]
+    fn statuses() {
+        use Category::*;
+        let failed = |unanswered: &[&'static str], errors: &[&str]| Failed {
+            unanswered: unanswered.to_vec(),
+            errors: errors.iter().map(|e| e.to_string()).collect(),
+        };
+        let none = failed(&[], &[]);
+        assert_eq!(status(Movies, "x", 5, &none, 2), "");
+        assert_eq!(
+            status(Movies, "x", 5, &failed(&["tpb"], &[]), 2),
+            "tpb didn't answer."
+        );
+        assert_eq!(
+            status(Movies, "x", 0, &failed(&["yts", "tpb"], &[]), 2),
+            "yts and tpb didn't answer. Check your connection and try again."
+        );
+        assert_eq!(
+            status(Anime, "sintel ", 0, &none, 1),
+            "No anime results for \"sintel\". Tab searches movies and series."
+        );
+        assert_eq!(
+            status(Series, "x", 0, &failed(&["tpb"], &[]), 2),
+            "tpb didn't answer. No series results for \"x\". Tab searches anime and movies."
+        );
+        assert_eq!(
+            status(Movies, "", 0, &none, 2),
+            "No movies to show. Tab searches series and anime."
+        );
+        // A site's own error is shown as is, without blaming the connection.
+        assert_eq!(
+            status(
+                Anime,
+                "x",
+                0,
+                &failed(&[], &["nyaa user \"typo\" not found"]),
+                1
+            ),
+            "nyaa user \"typo\" not found."
+        );
+        assert_eq!(
+            status(
+                Movies,
+                "x",
+                3,
+                &failed(&["yts"], &["searching tpb: 429 Too Many Requests"]),
+                2
+            ),
+            "yts didn't answer. searching tpb: 429 Too Many Requests."
+        );
+        assert_eq!(
+            status(
+                Movies,
+                "x",
+                0,
+                &failed(&["yts"], &["parsing tpb results"]),
+                2
+            ),
+            "yts didn't answer. parsing tpb results."
+        );
+    }
+
+    #[test]
+    fn health_colors() {
+        for (seeders, leechers, color) in [
+            (10, 2, "\x1b[32m"),
+            (3, 3, "\x1b[33m"),
+            (1, 9, "\x1b[38;5;208m"),
+        ] {
+            let it = Torrent {
+                seeders,
+                leechers,
+                ..Torrent::default()
+            };
+            assert!(
+                health(&it) == color,
+                "{seeders} seeders, {leechers} leechers"
+            );
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, io::Write, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use tokio::task::JoinSet;
 
@@ -31,7 +31,7 @@ impl Category {
     }
 
     /// The other two categories, in Tab order.
-    fn others(self) -> [Category; 2] {
+    pub fn others(self) -> [Category; 2] {
         match self {
             Category::Anime => [Category::Movies, Category::Series],
             Category::Movies => [Category::Series, Category::Anime],
@@ -106,59 +106,19 @@ impl Endpoints {
 /// results are dropped.
 const TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Searches providers, category's sites, for query in parallel and writes their
-/// results as fzf input as each site answers, one tab separated line per
-/// result: the torrent URL, the date, size, seeders (colored by health) and,
-/// when the category has several sites, site, and the title.
-///
-/// Returns a status line for the search's header: which sites didn't answer,
-/// or where else to look when nothing was found, or nothing when all went
-/// well.
-pub async fn print_results(
-    w: &mut impl Write,
-    category: Category,
-    providers: &[Arc<dyn Provider>],
-    query: &str,
-) -> String {
-    let mut printed = 0;
-    let failed = search(providers, &Query::new(query), |site, items| {
-        let site_column = if providers.len() > 1 {
-            format!("  {site:<4}")
-        } else {
-            String::new()
-        };
-        for it in items {
-            // A closed pipe just means fzf moved on to the next query.
-            let _ = writeln!(
-                w,
-                "{}\t\x1b[90m{}  {:>10}\x1b[0m  {}{:>5}\x1b[90m{site_column}\x1b[0m \t{}",
-                it.url,
-                it.date,
-                it.size,
-                health(&it),
-                it.seeders,
-                it.title
-            );
-            printed += 1;
-        }
-        let _ = w.flush();
-    })
-    .await;
-    status(category, query, printed, &failed, providers.len())
-}
-
 /// The sites whose search failed.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Failed {
+pub struct Failed {
     /// The names of the sites that couldn't be reached or timed out.
-    unanswered: Vec<&'static str>,
+    pub unanswered: Vec<&'static str>,
     /// What went wrong at the sites that answered with an error, such as a
     /// rate limit or an unknown nyaa user.
-    errors: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 impl Failed {
-    fn len(&self) -> usize {
+    /// How many sites failed.
+    pub fn count(&self) -> usize {
         self.unanswered.len() + self.errors.len()
     }
 }
@@ -169,7 +129,7 @@ impl Failed {
 ///
 /// Returns the sites whose search failed, such as by being unavailable or
 /// rate limiting; they pass nothing to found.
-async fn search(
+pub async fn search(
     providers: &[Arc<dyn Provider>],
     query: &Query,
     mut found: impl FnMut(&'static str, Vec<Torrent>),
@@ -232,54 +192,6 @@ fn unreachable(e: &anyhow::Error) -> bool {
         c.downcast_ref::<reqwest::Error>()
             .is_some_and(|e| e.is_connect() || e.is_timeout())
     })
-}
-
-/// The header line for a search that printed printed results, with failed
-/// holding the sites, out of sites, whose search failed.
-fn status(
-    category: Category,
-    query: &str,
-    printed: usize,
-    failed: &Failed,
-    sites: usize,
-) -> String {
-    let unanswered = failed.unanswered.join(" and ");
-    if failed.unanswered.len() == sites {
-        return format!("{unanswered} didn't answer. Check your connection and try again.");
-    }
-    let mut notes: Vec<String> = failed.errors.iter().map(|e| format!("{e}.")).collect();
-    if !unanswered.is_empty() {
-        notes.insert(0, format!("{unanswered} didn't answer."));
-    }
-    let missing = notes.join(" ");
-    // No results says nothing when no site could search.
-    if printed > 0 || failed.len() == sites {
-        return missing;
-    }
-    let missing = if missing.is_empty() {
-        missing
-    } else {
-        missing + " "
-    };
-    let [a, b] = category.others().map(Category::name);
-    let query = query.trim();
-    let none = if query.is_empty() {
-        format!("No {} to show.", category.name())
-    } else {
-        format!("No {} results for \"{query}\".", category.name())
-    };
-    format!("{missing}{none} Tab searches {a} and {b}.")
-}
-
-/// Rates a live torrent by its seeders relative to its leechers, as the
-/// color to print its seeder count in.
-fn health(it: &Torrent) -> &'static str {
-    use std::cmp::Ordering::*;
-    match it.seeders.cmp(&it.leechers) {
-        Greater => "\x1b[32m",
-        Equal => "\x1b[33m",
-        Less => "\x1b[38;5;208m",
-    }
 }
 
 #[cfg(test)]
@@ -369,43 +281,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prints_results() {
+    async fn searches_category_sites() {
         let srv = FakeServer::start(200, SAMPLE_FEED).await;
-        let mut buf = Vec::new();
         let providers = Category::Anime.providers(&endpoints(&srv.url), "", false);
-        print_results(&mut buf, Category::Anime, &providers, "bunny").await;
-        let out = String::from_utf8(buf).unwrap();
-        let lines: Vec<_> = out.lines().collect();
+        let (found, failed) = titles(&providers).await;
         // The sample's other torrent is dead.
-        assert_eq!(lines.len(), 1, "{out}");
-        let fields: Vec<_> = lines[0].split('\t').collect();
-        assert_eq!(fields.len(), 3, "{:?}", lines[0]);
-        assert_eq!(fields[0], "https://nyaa.si/download/1.torrent");
-        assert!(
-            fields[1].contains("2026-09-26")
-                && fields[1].contains("1.2 GiB")
-                // 42 seeders and 3 leechers: green.
-                && fields[1].contains("\x1b[32m   42"),
-            "{:?}",
-            fields[1]
-        );
-        // Anime has one site, so no site column.
-        assert!(!fields[1].contains("nyaa"), "{:?}", fields[1]);
-        assert_eq!(fields[2], "[Group] Big Buck Bunny - 01 [1080p].mkv");
-    }
-
-    #[tokio::test]
-    async fn prints_site_column() {
-        let providers = [
-            FakeSite::answering("yts", &[("aa", 5)]),
-            FakeSite::failing("tpb", "searching tpb: 429 Too Many Requests"),
-        ];
-        let mut buf = Vec::new();
-        let status = print_results(&mut buf, Category::Movies, &providers, "x").await;
-        let out = String::from_utf8(buf).unwrap();
-        assert_eq!(out.lines().count(), 1, "{out}");
-        assert!(out.contains("  yts "), "{out}");
-        assert_eq!(status, "searching tpb: 429 Too Many Requests.");
+        let want = vec!["[Group] Big Buck Bunny - 01 [1080p].mkv".to_owned()];
+        assert_eq!(found, [("nyaa", want)]);
+        assert_eq!(failed, Failed::default());
     }
 
     #[tokio::test]
@@ -421,13 +304,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_search_prints_nothing() {
+    async fn failed_search_finds_nothing() {
         let srv = FakeServer::start(503, "").await;
         for category in [Category::Anime, Category::Movies, Category::Series] {
-            let mut buf = Vec::new();
             let providers = category.providers(&endpoints(&srv.url), "", false);
-            print_results(&mut buf, category, &providers, "bunny").await;
-            assert!(buf.is_empty(), "{category:?}");
+            let (found, failed) = titles(&providers).await;
+            assert!(found.is_empty(), "{category:?}");
+            assert_eq!(failed.count(), providers.len(), "{category:?}");
         }
     }
 
@@ -469,86 +352,5 @@ mod tests {
         let all: Vec<_> = found.into_iter().flat_map(|(_, t)| t).collect();
         assert_eq!(all.len(), 2, "{all:?}");
         assert!(all.contains(&"tpb cc".to_owned()), "{all:?}");
-    }
-
-    #[test]
-    fn statuses() {
-        use Category::*;
-        let failed = |unanswered: &[&'static str], errors: &[&str]| Failed {
-            unanswered: unanswered.to_vec(),
-            errors: errors.iter().map(|e| e.to_string()).collect(),
-        };
-        let none = failed(&[], &[]);
-        assert_eq!(status(Movies, "x", 5, &none, 2), "");
-        assert_eq!(
-            status(Movies, "x", 5, &failed(&["tpb"], &[]), 2),
-            "tpb didn't answer."
-        );
-        assert_eq!(
-            status(Movies, "x", 0, &failed(&["yts", "tpb"], &[]), 2),
-            "yts and tpb didn't answer. Check your connection and try again."
-        );
-        assert_eq!(
-            status(Anime, "sintel ", 0, &none, 1),
-            "No anime results for \"sintel\". Tab searches movies and series."
-        );
-        assert_eq!(
-            status(Series, "x", 0, &failed(&["tpb"], &[]), 2),
-            "tpb didn't answer. No series results for \"x\". Tab searches anime and movies."
-        );
-        assert_eq!(
-            status(Movies, "", 0, &none, 2),
-            "No movies to show. Tab searches series and anime."
-        );
-        // A site's own error is shown as is, without blaming the connection.
-        assert_eq!(
-            status(
-                Anime,
-                "x",
-                0,
-                &failed(&[], &["nyaa user \"typo\" not found"]),
-                1
-            ),
-            "nyaa user \"typo\" not found."
-        );
-        assert_eq!(
-            status(
-                Movies,
-                "x",
-                3,
-                &failed(&["yts"], &["searching tpb: 429 Too Many Requests"]),
-                2
-            ),
-            "yts didn't answer. searching tpb: 429 Too Many Requests."
-        );
-        assert_eq!(
-            status(
-                Movies,
-                "x",
-                0,
-                &failed(&["yts"], &["parsing tpb results"]),
-                2
-            ),
-            "yts didn't answer. parsing tpb results."
-        );
-    }
-
-    #[test]
-    fn health_colors() {
-        for (seeders, leechers, color) in [
-            (10, 2, "\x1b[32m"),
-            (3, 3, "\x1b[33m"),
-            (1, 9, "\x1b[38;5;208m"),
-        ] {
-            let it = Torrent {
-                seeders,
-                leechers,
-                ..Torrent::default()
-            };
-            assert!(
-                health(&it) == color,
-                "{seeders} seeders, {leechers} leechers"
-            );
-        }
     }
 }
