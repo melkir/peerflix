@@ -30,7 +30,7 @@ use peerflix::{
 
 use crate::cli::{
     fzf::{self, NoSelection},
-    player,
+    json, player,
 };
 
 /// The port the stream is served on unless --port says otherwise.
@@ -94,6 +94,10 @@ struct Cli {
     /// Print results for the search terms as fzf input and exit
     #[arg(long)]
     print: bool,
+
+    /// Print results for the search terms as JSON and exit
+    #[arg(long, conflicts_with = "print")]
+    json: bool,
 }
 
 fn main() -> ExitCode {
@@ -150,6 +154,12 @@ fn raise_open_file_limit() {
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let user = nyaa_user(cli.user.as_deref().unwrap_or(""));
     let mut source = cli.source.join(" ");
+    if cli.json {
+        let providers = cli
+            .category
+            .providers(&Endpoints::from_env(), user, cli.trusted);
+        return json::print_results(&mut std::io::stdout().lock(), &providers, &source).await;
+    }
     if cli.print {
         let providers = cli
             .category

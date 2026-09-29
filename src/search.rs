@@ -1,5 +1,6 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
+use serde::Serialize;
 use tokio::task::JoinSet;
 
 use crate::providers::{
@@ -107,7 +108,7 @@ impl Endpoints {
 const TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The sites whose search failed.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Failed {
     /// The names of the sites that couldn't be reached or timed out.
     pub unanswered: Vec<&'static str>,

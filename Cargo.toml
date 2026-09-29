@@ -23,6 +23,7 @@ quick-xml = { version = "0.41", features = ["serialize"] }
 # The same major version and TLS backend as librqbit, so it's linked once.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "query", "json"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "process", "time"] }
 tokio-util = { version = "0.7.11", features = ["io", "rt"] }
 

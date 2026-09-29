@@ -8,7 +8,7 @@ pub mod yts;
 
 use anyhow::{Context, bail};
 use futures_util::future::BoxFuture;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 
 /// A site that can be searched for torrents.
 pub trait Provider: Send + Sync {
@@ -123,7 +123,7 @@ fn parse_episode(s: &str) -> Option<Episode> {
 }
 
 /// A search result from any site.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct Torrent {
     /// A .torrent URL or magnet link.
     pub url: String,

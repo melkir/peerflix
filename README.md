@@ -88,6 +88,15 @@ Search runs in [fzf](https://github.com/junegunn/fzf) 0.60 or later, which must 
 peerflix --print big buck bunny | fzf --ansi -d '\t' --with-nth 2.. --nth 2 --accept-nth 1 | xargs peerflix
 ```
 
+`--json` writes them as one JSON object once every site has answered, for programs that search
+through peerflix: `results`, each with its `site`, `url` (magnet or .torrent), `title`, `date`,
+`size`, `seeders`, `leechers` and `info_hash`, then the sites that failed, as `unanswered` (names)
+and `errors` (messages).
+
+```sh
+peerflix --json -c movies tt1254207 | jq -r '.results[0].url' | xargs peerflix
+```
+
 Flags:
 
 | flag | default | |
@@ -101,6 +110,7 @@ Flags:
 | `-c, --category NAME` | anime | category to start searching in: `anime`, `movies` or `series` |
 | `-t, --trusted` | | only search trusted nyaa uploads (anime) |
 | `--print` | | print search results and exit |
+| `--json` | | print search results as JSON and exit |
 | `-u, --user NAME` | | restrict anime search to a nyaa uploader, name or profile URL |
 | `-V, --version` | | print the version and exit |
 
