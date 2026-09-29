@@ -1,7 +1,7 @@
 {
   "name": "peerflix",
   "identifier": "io.github.melkir.peerflix",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "Search for anime, movies and series, and stream torrents through peerflix.",
   "author": {
     "name": "melkir",

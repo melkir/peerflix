@@ -1,7 +1,12 @@
 # `cargo release patch|minor|major --execute` bumps the version, commits,
 # tags vX.Y.Z and pushes; the tag triggers .github/workflows/release.yml,
-# which builds the binaries and creates the GitHub release.
+# which builds the binaries and the IINA plugin and creates the GitHub
+# release.
 allow-branch = ["main"]
 publish = false
 tag-name = "v{{version}}"
 pre-release-commit-message = "Release v{{version}}"
+# The IINA plugin ships in the same release, so it takes the same version.
+pre-release-replacements = [
+  { file = "iina-plugin/Info.json", search = '"version": "[^"]*"', replace = '"version": "{{version}}"', exactly = 1 },
+]

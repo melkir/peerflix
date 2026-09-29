@@ -23,7 +23,11 @@ jobs:
           cp target/release/peerflix README.md LICENSE "$name/"
           cp -r completions "$name/"
           tar czf "$name.tar.gz" "$name"
-          shasum -a 256 "$name.tar.gz" > checksums.txt
-      - run: gh release create "$GITHUB_REF_NAME" --generate-notes *.tar.gz checksums.txt
+          # IINA installs the .iinaplgz of the latest release, a zip with the
+          # plugin's files at its root.
+          plugin="peerflix-$GITHUB_REF_NAME.iinaplgz"
+          (cd iina-plugin && zip -qrX "../$plugin" . -x '.*')
+          shasum -a 256 "$name.tar.gz" "$plugin" > checksums.txt
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes *.tar.gz *.iinaplgz checksums.txt
         env:
           GH_TOKEN: ${{ github.token }}

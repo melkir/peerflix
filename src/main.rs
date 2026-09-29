@@ -459,6 +459,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plugin_version_matches() {
+        // cargo release bumps both; see release.toml.
+        let info: serde_json::Value =
+            serde_json::from_str(include_str!("../iina-plugin/Info.json")).unwrap();
+        assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
     fn cli_is_valid() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
