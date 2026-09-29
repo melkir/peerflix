@@ -67,6 +67,13 @@ pub async fn serve(listener: TcpListener, files: Arc<[File]>) {
 }
 
 async fn handle<B>(file: &File, req: &Request<B>) -> Response<Body> {
+    if !local_host(req.headers().get(header::HOST)) {
+        // A web page reaching the server through a rebound DNS name.
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(empty())
+            .unwrap();
+    }
     if req.method() != Method::GET && req.method() != Method::HEAD {
         return Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -123,6 +130,21 @@ async fn handle<B>(file: &File, req: &Request<B>) -> Response<Body> {
         ReaderStream::with_capacity(reader.take(end - start), 64 << 10).map_ok(Frame::data),
     );
     resp.body(BodyExt::boxed_unsync(body)).unwrap()
+}
+
+/// Whether a Host header names the loopback address the server listens on,
+/// or is absent, as with HTTP/1.0 clients.
+fn local_host(host: Option<&HeaderValue>) -> bool {
+    let Some(host) = host.and_then(|h| h.to_str().ok().or(Some("?"))) else {
+        return true;
+    };
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map_or(v6, |(a, _)| a),
+        None => host.rsplit_once(':').map_or(host, |(a, _)| a),
+    };
+    ["127.0.0.1", "::1", "localhost"]
+        .iter()
+        .any(|l| name.eq_ignore_ascii_case(l))
 }
 
 fn empty() -> Body {
@@ -256,6 +278,24 @@ mod tests {
     }
 
     #[test]
+    fn local_hosts() {
+        for (host, want) in [
+            (None, true),
+            (Some("127.0.0.1:8888"), true),
+            (Some("localhost:8888"), true),
+            (Some("LocalHost"), true),
+            (Some("[::1]:8888"), true),
+            (Some("evil.example:8888"), false),
+            (Some("evil.example"), false),
+            (Some("127.0.0.1.evil.example:80"), false),
+            (Some(""), false),
+        ] {
+            let value = host.map(|h| HeaderValue::from_str(h).unwrap());
+            assert_eq!(local_host(value.as_ref()), want, "{host:?}");
+        }
+    }
+
+    #[test]
     fn escapes_paths() {
         assert_eq!(
             path_escape("[Grp] Show - 01 (1080p).mkv"),
@@ -342,5 +382,13 @@ mod tests {
 
         let resp = client.post(&url).send().await.unwrap();
         assert_eq!(resp.status(), 405);
+
+        let resp = client
+            .get(&url)
+            .header("Host", "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
     }
 }
