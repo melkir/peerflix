@@ -93,6 +93,7 @@ Flags:
 | `-l, --list` | | list files and exit |
 | `-p, --port N` | 8888 | local HTTP port (0 = random); a random one if 8888 is taken |
 | `-d, --dir PATH` | `$TMPDIR/peerflix` | where to store data |
+| `--no-upnp` | | don't ask the router to forward the torrent port |
 | `-n, --no-play` | | only serve `http://127.0.0.1:PORT/<name>` |
 | `-c, --category NAME` | anime | category to start searching in: `anime`, `movies` or `series` |
 | `-t, --trusted` | | only search trusted nyaa uploads (anime) |

@@ -87,6 +87,10 @@ struct Cli {
     #[arg(short, long)]
     no_play: bool,
 
+    /// Don't ask the router to forward the torrent port (UPnP)
+    #[arg(long)]
+    no_upnp: bool,
+
     /// What to search for; Tab switches between them in the search
     #[arg(short, long, value_enum, default_value_t = Category::Anime)]
     category: Category,
@@ -232,7 +236,7 @@ async fn run(cancel: &CancellationToken, source: &str, cli: &Cli) -> anyhow::Res
                 ..Default::default()
             }),
             listen: Some(ListenerOptions {
-                enable_upnp_port_forwarding: true,
+                enable_upnp_port_forwarding: !cli.no_upnp,
                 ..Default::default()
             }),
             ..Default::default()
