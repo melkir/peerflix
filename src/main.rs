@@ -42,6 +42,9 @@ use crate::{
     stream::{Reader, path_escape},
 };
 
+/// The port the stream is served on unless --port says otherwise.
+const DEFAULT_PORT: u16 = 8888;
+
 /// The release version, or the crate version for `cargo install` builds.
 const VERSION: &str = match option_env!("PEERFLIX_VERSION") {
     Some(v) => v,
@@ -59,9 +62,10 @@ struct Cli {
     #[arg(value_name = "SOURCE | QUERY")]
     source: Vec<String>,
 
-    /// HTTP port to serve the stream on (0 = random)
-    #[arg(short, long, default_value_t = 8888)]
-    port: u16,
+    /// HTTP port to serve the stream on (0 = random) [default: 8888, or a
+    /// random one if that's taken]
+    #[arg(short, long)]
+    port: Option<u16>,
 
     /// Download directory, reused across runs [default: $TMPDIR/peerflix]
     #[arg(short, long)]
@@ -169,6 +173,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     }
     if !is_torrent_source(&source) {
         source = fzf::search_interactive(&source, cli.category, user, cli.trusted)?;
+    } else if !user.is_empty() || cli.trusted {
+        eprintln!("warning: --user and --trusted only apply to searching anime; ignoring them");
     }
 
     // Installed after fzf, which handles Ctrl-C itself.
@@ -300,9 +306,7 @@ async fn stream_torrent(
     };
     let torrent = resp?.into_handle().context("torrent was not added")?;
 
-    let listener = TcpListener::bind(("127.0.0.1", cli.port))
-        .await
-        .with_context(|| format!("listening on port {}", cli.port))?;
+    let listener = bind_listener(cli.port).await?;
     let base = format!("http://{}", listener.local_addr()?);
     let url = format!("{base}/{}", path_escape(&name));
     let mut served = vec![torrent_file(torrent.clone(), id, name.clone(), file.len)];
@@ -335,6 +339,8 @@ async fn stream_torrent(
         tokio::time::Instant::now() + Duration::from_secs(1),
         Duration::from_secs(1),
     );
+    // Progress rewrites one line, which only suits a terminal.
+    let tty = std::io::stderr().is_terminal();
     let mut last_fetched = 0;
     let mut init = torrent.wait_until_initialized();
     let mut initialized = false;
@@ -343,12 +349,16 @@ async fn stream_torrent(
         tokio::select! {
             _ = cancel.cancelled() => {
                 complete_files(&storage, &torrent.stats(), &files, &mut downloading);
-                eprintln!();
+                if tty {
+                    eprintln!();
+                }
                 return Ok(());
             }
             result = &mut player => {
                 complete_files(&storage, &torrent.stats(), &files, &mut downloading);
-                eprintln!();
+                if tty {
+                    eprintln!();
+                }
                 return result;
             }
             result = &mut init, if !initialized => {
@@ -357,13 +367,17 @@ async fn stream_torrent(
             }
             _ = ticker.tick() => {
                 if !initialized {
-                    eprint!("\r\x1b[KChecking existing data...");
+                    if tty {
+                        eprint!("\r\x1b[KChecking existing data...");
+                    }
                     continue;
                 }
                 let stats = torrent.stats();
                 complete_files(&storage, &stats, &files, &mut downloading);
                 let (line, fetched) = progress_line(&stats, id, file.len, last_fetched);
-                eprint!("\r\x1b[K{line}");
+                if tty {
+                    eprint!("\r\x1b[K{line}");
+                }
                 last_fetched = fetched;
             }
         }
@@ -383,6 +397,19 @@ fn complete_files(
         // A failed rename is retried on the next tick.
         !(done && storage.complete(i).is_ok())
     });
+}
+
+/// Binds the stream's port on localhost. Without an explicit port, that's
+/// DEFAULT_PORT, or a random one when it's taken.
+async fn bind_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
+    let want = port.unwrap_or(DEFAULT_PORT);
+    match TcpListener::bind(("127.0.0.1", want)).await {
+        Ok(l) => Ok(l),
+        Err(e) if port.is_none() && e.kind() == std::io::ErrorKind::AddrInUse => {
+            Ok(TcpListener::bind(("127.0.0.1", 0)).await?)
+        }
+        Err(e) => Err(e).with_context(|| format!("listening on port {want}")),
+    }
 }
 
 /// Resolves the torrent's metadata without adding it, so nothing is
