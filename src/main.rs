@@ -4,13 +4,20 @@
 //! reads prioritize the pieces around the player's read position, so playback
 //! starts as soon as the first pieces arrive and seeking works.
 
+mod eztv;
+mod files;
+mod fzf;
 mod nyaa;
 mod search;
+mod storage;
 mod stream;
 #[cfg(test)]
 mod testutil;
+mod tpb;
+mod yts;
 
 use std::{
+    io::IsTerminal,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -22,13 +29,17 @@ use clap::Parser;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
     ListenerOptions, ManagedTorrent, PeerConnectionOptions, Session, SessionOptions, TorrentStats,
+    storage::StorageFactoryExt,
 };
 use tokio::{net::TcpListener, signal::unix::SignalKind};
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 use crate::{
-    search::NoSelection,
-    stream::{Reader, content_type, path_escape},
+    files::{TorrentFile, episodes, pick_file, subtitles, torrent_files},
+    fzf::NoSelection,
+    search::{Category, Endpoints, human_bytes},
+    storage::PartStorage,
+    stream::{Reader, path_escape},
 };
 
 /// The release version, or the crate version for `cargo install` builds.
@@ -40,11 +51,11 @@ const VERSION: &str = match option_env!("PEERFLIX_VERSION") {
 /// Stream a torrent straight into IINA.
 ///
 /// With a magnet link, .torrent file or http(s) URL, streams it. Anything else
-/// searches nyaa.si interactively in fzf.
+/// searches for anime, movies or series interactively in fzf.
 #[derive(Parser, Debug)]
 #[command(version = VERSION)]
 struct Cli {
-    /// Magnet link, .torrent file or URL, or nyaa search terms
+    /// Magnet link, .torrent file or URL, or search terms
     #[arg(value_name = "SOURCE | QUERY")]
     source: Vec<String>,
 
@@ -56,7 +67,8 @@ struct Cli {
     #[arg(short, long)]
     dir: Option<PathBuf>,
 
-    /// File index to stream [default: largest video file]
+    /// File index to stream [default: ask when there are several episodes,
+    /// otherwise the largest video]
     #[arg(short, long)]
     index: Option<usize>,
 
@@ -68,21 +80,26 @@ struct Cli {
     #[arg(short, long)]
     no_play: bool,
 
-    /// Only search torrents from this nyaa uploader (name or profile URL)
+    /// What to search for; Tab switches between them in the search
+    #[arg(short, long, value_enum, default_value_t = Category::Anime)]
+    category: Category,
+
+    /// Only search anime from this nyaa uploader (name or profile URL)
     #[arg(short, long)]
     user: Option<String>,
 
-    /// Only search torrents from trusted nyaa uploaders
+    /// Only search anime from trusted nyaa uploaders
     #[arg(short, long)]
     trusted: bool,
 
-    /// Print nyaa results for the search terms as fzf input and exit
+    /// Print results for the search terms as fzf input and exit
     #[arg(long)]
     print: bool,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    raise_open_file_limit();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -101,25 +118,57 @@ fn main() -> ExitCode {
     }
 }
 
+/// Raises the soft limit on open files as far as the system allows. Peer
+/// connections alone can come close to macOS's default of 256: streaming one
+/// episode of a big season pack held 151 open.
+fn raise_open_file_limit() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit only read and write lim.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        // macOS refuses more than kern.maxfilesperproc even when the hard
+        // limit is unlimited, so fall back to OPEN_MAX, which it always takes.
+        for want in [lim.rlim_max, 10240] {
+            if want <= lim.rlim_cur {
+                return;
+            }
+            let new = libc::rlimit {
+                rlim_cur: want,
+                rlim_max: lim.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &new) == 0 {
+                return;
+            }
+        }
+    }
+}
+
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let user = nyaa_user(cli.user.as_deref().unwrap_or(""));
     let mut source = cli.source.join(" ");
     if cli.print {
-        // PEERFLIX_NYAA_URL points search at another nyaa-compatible feed,
-        // such as a local mock for demos.
-        let base = std::env::var("PEERFLIX_NYAA_URL");
-        search::print_results(
+        let status = search::print_results(
             &mut std::io::stdout().lock(),
-            base.as_deref().unwrap_or(nyaa::NYAA_URL),
+            &Endpoints::from_env(),
+            cli.category,
             &source,
             user,
             cli.trusted,
         )
         .await;
+        // The interactive search shows it as its header.
+        if let Some(path) = std::env::var_os("PEERFLIX_STATUS") {
+            let _ = std::fs::write(path, status);
+        }
         return Ok(());
     }
     if !is_torrent_source(&source) {
-        source = search::search_interactive(&source, user, cli.trusted)?;
+        source = fzf::search_interactive(&source, cli.category, user, cli.trusted)?;
     }
 
     // Installed after fzf, which handles Ctrl-C itself.
@@ -187,13 +236,6 @@ async fn run(cancel: &CancellationToken, source: &str, cli: &Cli) -> anyhow::Res
     result
 }
 
-struct TorrentFile {
-    path: String,
-    len: u64,
-    /// BEP 47 padding files only exist to align the next file to a piece.
-    padding: bool,
-}
-
 async fn stream_torrent(
     cancel: &CancellationToken,
     session: &Arc<Session>,
@@ -218,16 +260,24 @@ async fn stream_torrent(
         return Ok(());
     }
 
-    let id = pick_file(&files, cli.index)?;
+    let eps = episodes(&files);
+    let Some(id) = select_file(cancel, &files, &eps, cli.index).await? else {
+        return Ok(());
+    };
     let file = &files[id];
-    let name = Path::new(&file.path)
-        .file_name()
-        .map_or_else(|| file.path.clone(), |n| n.to_string_lossy().into_owned());
+    let name = served_name(&file.path, &[]);
 
-    // Download just that file; streams still take priority. With --dir,
-    // existing data is checked and reused.
+    // Download just that file and its subtitles, as .part files until
+    // they're complete; streams still take priority. With --dir, existing
+    // data is checked and reused.
+    let subs = subtitles(&files, id, eps.len() <= 1);
+    let wanted: Vec<usize> = [id].into_iter().chain(subs.iter().copied()).collect();
+    let storage = PartStorage::new(meta.output_folder.clone());
     let opts = AddTorrentOptions {
-        only_files: Some(vec![id]),
+        only_files: Some(wanted.clone()),
+        // Where librqbit would put it anyway, spelled out as storage uses it.
+        output_folder: Some(meta.output_folder.to_string_lossy().into_owned()),
+        storage_factory: Some(storage.clone().boxed()),
         overwrite: true,
         initial_peers: Some(meta.seen_peers),
         peer_opts: Some(PeerConnectionOptions {
@@ -253,18 +303,31 @@ async fn stream_torrent(
     let listener = TcpListener::bind(("127.0.0.1", cli.port))
         .await
         .with_context(|| format!("listening on port {}", cli.port))?;
-    let url = format!("http://{}/{}", listener.local_addr()?, path_escape(&name));
-    let stream_file = torrent_file(torrent.clone(), id, name.clone(), file.len);
-    let _server =
-        AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, Arc::new(stream_file))));
+    let base = format!("http://{}", listener.local_addr()?);
+    let url = format!("{base}/{}", path_escape(&name));
+    let mut served = vec![torrent_file(torrent.clone(), id, name.clone(), file.len)];
+    for &i in &subs {
+        let sub_name = served_name(&files[i].path, &served);
+        served.push(torrent_file(torrent.clone(), i, sub_name, files[i].len));
+    }
+    let sub_urls: Vec<_> = served[1..]
+        .iter()
+        .map(|f| format!("{base}/{}", path_escape(&f.name)))
+        .collect();
+    let sub_names: Vec<_> = served[1..].iter().map(|f| f.name.as_str()).collect();
+    let sub_names = sub_names.join(", ");
+    let _server = AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, served.into())));
 
     eprintln!("Streaming {name} ({})\n{url}", human_bytes(file.len));
+    if !sub_urls.is_empty() {
+        eprintln!("Subtitles: {sub_names}");
+    }
 
     let player = async {
         if cli.no_play {
             std::future::pending().await
         } else {
-            launch_iina(url).await
+            launch_iina(url, &sub_urls).await
         }
     };
     tokio::pin!(player);
@@ -275,13 +338,16 @@ async fn stream_torrent(
     let mut last_fetched = 0;
     let mut init = torrent.wait_until_initialized();
     let mut initialized = false;
+    let mut downloading = wanted;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
+                complete_files(&storage, &torrent.stats(), &files, &mut downloading);
                 eprintln!();
                 return Ok(());
             }
             result = &mut player => {
+                complete_files(&storage, &torrent.stats(), &files, &mut downloading);
                 eprintln!();
                 return result;
             }
@@ -294,12 +360,29 @@ async fn stream_torrent(
                     eprint!("\r\x1b[KChecking existing data...");
                     continue;
                 }
-                let (line, fetched) = progress_line(&torrent.stats(), id, file.len, last_fetched);
+                let stats = torrent.stats();
+                complete_files(&storage, &stats, &files, &mut downloading);
+                let (line, fetched) = progress_line(&stats, id, file.len, last_fetched);
                 eprint!("\r\x1b[K{line}");
                 last_fetched = fetched;
             }
         }
     }
+}
+
+/// Drops their .part suffix from the downloading files that have finished,
+/// and removes them from downloading.
+fn complete_files(
+    storage: &PartStorage,
+    stats: &TorrentStats,
+    files: &[TorrentFile],
+    downloading: &mut Vec<usize>,
+) {
+    downloading.retain(|&i| {
+        let done = stats.file_progress.get(i) == Some(&files[i].len);
+        // A failed rename is retried on the next tick.
+        !(done && storage.complete(i).is_ok())
+    });
 }
 
 /// Resolves the torrent's metadata without adding it, so nothing is
@@ -316,17 +399,6 @@ async fn fetch_metadata(
         AddTorrentResponse::ListOnly(meta) => Ok(meta),
         _ => bail!("torrent was added instead of listed"),
     }
-}
-
-fn torrent_files(meta: &ListOnlyResponse) -> Vec<TorrentFile> {
-    meta.info
-        .iter_file_details()
-        .map(|d| TorrentFile {
-            path: d.filename.to_pathbuf().to_string_lossy().into_owned(),
-            len: d.len,
-            padding: d.attrs().padding,
-        })
-        .collect()
 }
 
 /// Serves file id of torrent. With --dir, existing data is checked first; IINA
@@ -351,37 +423,75 @@ fn progress_line(stats: &TorrentStats, id: usize, len: u64, last_fetched: u64) -
         (s.fetched_bytes, s.peer_stats.live, s.peer_stats.seen)
     });
     let line = format!(
-        "{:5.1}%  {}/s  peers {live}/{seen}",
+        "{:5.1}%  {:>10}/s  {live} peers, {seen} seen",
         100.0 * done as f64 / len.max(1) as f64,
         human_bytes(fetched.saturating_sub(last_fetched)),
     );
     (line, fetched)
 }
 
-/// Returns the index of the file at index, or of the largest video file
-/// (falling back to the largest file) when index is None.
-fn pick_file(files: &[TorrentFile], index: Option<usize>) -> anyhow::Result<usize> {
-    if let Some(i) = index {
-        if i >= files.len() {
-            bail!(
-                "file index {i} out of range (torrent has {} files)",
-                files.len()
-            );
-        }
-        return Ok(i);
+/// Returns the file to stream: the one at index if given, else one the user
+/// picks in fzf among eps, the torrent's episodes, when there are several
+/// and stdin is a terminal, else the one pick_file chooses. None means
+/// peerflix was cancelled meanwhile.
+async fn select_file(
+    cancel: &CancellationToken,
+    files: &[TorrentFile],
+    eps: &[usize],
+    index: Option<usize>,
+) -> anyhow::Result<Option<usize>> {
+    if index.is_some() || eps.len() < 2 || !std::io::stdin().is_terminal() {
+        return pick_file(files, index).map(Some);
     }
-    let is_video = |f: &TorrentFile| content_type(&f.path).starts_with("video/");
-    files
+    let lines: String = eps
         .iter()
-        .enumerate()
-        .filter(|(_, f)| !f.padding)
-        .max_by_key(|(_, f)| (is_video(f), f.len))
-        .map(|(i, _)| i)
-        .context("torrent has no files")
+        .map(|&i| {
+            let f = &files[i];
+            format!(
+                "{i}\t\x1b[90m{:>9}\x1b[0m  \t{}\n",
+                human_bytes(f.len),
+                f.path
+            )
+        })
+        .collect();
+    let Some(choice) = cancel
+        .run_until_cancelled(fzf::choose("episode> ", lines))
+        .await
+    else {
+        return Ok(None);
+    };
+    Ok(Some(choice?.parse().context("reading fzf's choice")?))
 }
 
-/// Opens the stream in IINA and returns once the player quits.
-async fn launch_iina(url: String) -> anyhow::Result<()> {
+/// Returns the file name to serve path under, prefixed with a number if one
+/// of served already has it.
+fn served_name(path: &str, served: &[stream::File]) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_owned(), |n| n.to_string_lossy().into_owned());
+    let taken = |n: &str| served.iter().any(|f| f.name == n);
+    if !taken(&name) {
+        return name;
+    }
+    (2..)
+        .map(|k| format!("{k}-{name}"))
+        .find(|n| !taken(n))
+        .expect("an unused name")
+}
+
+/// Joins paths into an mpv path list: colon separated, with a backslash
+/// escaping a colon or backslash within a path.
+fn mpv_path_list(paths: &[String]) -> String {
+    let escaped: Vec<_> = paths
+        .iter()
+        .map(|p| p.replace('\\', "\\\\").replace(':', "\\:"))
+        .collect();
+    escaped.join(":")
+}
+
+/// Opens the stream in IINA with the subtitle URLs and returns once the player
+/// quits.
+async fn launch_iina(url: String, subs: &[String]) -> anyhow::Result<()> {
     let bin = std::env::var_os("PATH")
         .and_then(|path| {
             std::env::split_paths(&path)
@@ -393,8 +503,13 @@ async fn launch_iina(url: String) -> anyhow::Result<()> {
             app.is_file().then_some(app)
         })
         .context("IINA not found; install it with `brew install --cask iina`")?;
-    let status = tokio::process::Command::new(bin)
-        .args(["--no-stdin", "--keep-running", &url])
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(["--no-stdin", "--keep-running"]);
+    if !subs.is_empty() {
+        cmd.arg(format!("--mpv-sub-files={}", mpv_path_list(subs)));
+    }
+    let status = cmd
+        .arg(&url)
         .kill_on_drop(true)
         .status()
         .await
@@ -403,25 +518,6 @@ async fn launch_iina(url: String) -> anyhow::Result<()> {
         bail!("IINA {status}");
     }
     Ok(())
-}
-
-fn human_bytes(n: u64) -> String {
-    const UNIT: u64 = 1024;
-    if n < UNIT {
-        return format!("{n} B");
-    }
-    let (mut div, mut exp) = (UNIT, 0);
-    let mut m = n / UNIT;
-    while m >= UNIT {
-        div *= UNIT;
-        exp += 1;
-        m /= UNIT;
-    }
-    format!(
-        "{:.1} {}iB",
-        n as f64 / div as f64,
-        "KMGTPE".as_bytes()[exp] as char
-    )
 }
 
 #[cfg(test)]
@@ -443,12 +539,15 @@ mod tests {
             "--user",
             "bob",
             "--trusted",
+            "--category",
+            "series",
             "--",
             "-dash query",
         ])
         .unwrap();
         assert!(cli.print && cli.trusted);
         assert_eq!(cli.user.as_deref(), Some("bob"));
+        assert_eq!(cli.category, Category::Series);
         assert_eq!(cli.source, ["-dash query"]);
     }
 
@@ -482,46 +581,6 @@ mod tests {
         ] {
             assert_eq!(is_torrent_source(s), want, "{s:?}");
         }
-    }
-
-    #[test]
-    fn human_sizes() {
-        for (n, want) in [
-            (0, "0 B"),
-            (1023, "1023 B"),
-            (1024, "1.0 KiB"),
-            (1536, "1.5 KiB"),
-            (1 << 20, "1.0 MiB"),
-            (5 << 30, "5.0 GiB"),
-            (3 << 40, "3.0 TiB"),
-        ] {
-            assert_eq!(human_bytes(n), want);
-        }
-    }
-
-    fn files(spec: &[(&str, u64, bool)]) -> Vec<TorrentFile> {
-        spec.iter()
-            .map(|&(path, len, padding)| TorrentFile {
-                path: path.into(),
-                len,
-                padding,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn picks_largest_video() {
-        let fs = files(&[
-            ("sample.mkv", 10, false),
-            ("movie.MP4", 100, false),
-            ("extras.zip", 1000, false),
-            (".pad/5000", 5000, true),
-            ("subs/en.srt", 4, false),
-        ]);
-        assert_eq!(pick_file(&fs, None).unwrap(), 1);
-        assert_eq!(pick_file(&fs, Some(4)).unwrap(), 4);
-        assert!(pick_file(&fs, Some(5)).is_err());
-        assert!(pick_file(&[], None).is_err());
     }
 
     /// Seeds a torrent from local files with networking disabled and streams
@@ -561,9 +620,12 @@ mod tests {
         let id = pick_file(&files, None).unwrap();
         assert_eq!(files[id].path, "video.mkv");
 
+        let storage = PartStorage::new(meta.output_folder.clone());
         let opts = AddTorrentOptions {
             only_files: Some(vec![id]),
             overwrite: true,
+            output_folder: Some(meta.output_folder.to_string_lossy().into_owned()),
+            storage_factory: Some(storage.boxed()),
             ..Default::default()
         };
         let torrent = session
@@ -578,7 +640,8 @@ mod tests {
         // librqbit's stream() waits for the initial check, which is too quick
         // here to overlap with the requests.
         let file = torrent_file(torrent.clone(), id, "video.mkv".into(), files[id].len);
-        let _server = AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, Arc::new(file))));
+        let _server =
+            AbortOnDropHandle::new(tokio::spawn(stream::serve(listener, Arc::new([file]))));
 
         let client = reqwest::Client::new();
         let resp = client.get(&url).send().await.unwrap();
@@ -596,8 +659,8 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_largest_file() {
-        let fs = files(&[("small.txt", 1, false), ("big.bin", 50, false)]);
-        assert_eq!(pick_file(&fs, None).unwrap(), 1);
+    fn mpv_path_lists() {
+        let urls = ["http://127.0.0.1:8888/a.srt".to_owned(), r"b\c".to_owned()];
+        assert_eq!(mpv_path_list(&urls), r"http\://127.0.0.1\:8888/a.srt:b\\c");
     }
 }

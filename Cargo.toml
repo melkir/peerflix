@@ -15,11 +15,13 @@ futures-util = { version = "0.3", default-features = false }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# For setrlimit, to raise the open file limit.
+libc = "0.2"
 # rust-tls instead of the default native-tls, so Linux builds don't need OpenSSL.
 librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls"] }
 quick-xml = { version = "0.41", features = ["serialize"] }
 # The same major version and TLS backend as librqbit, so it's linked once.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "query"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "query", "json"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "process", "time"] }
 tokio-util = { version = "0.7.11", features = ["io", "rt"] }
