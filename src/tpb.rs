@@ -1,6 +1,9 @@
 use serde::{Deserialize, Deserializer};
 
-use crate::search::{Torrent, get_json, human_bytes, magnet, unix_date};
+use crate::{
+    search::{Torrent, get_json},
+    util::{human_bytes, magnet, unix_date},
+};
 
 /// The Pirate Bay's JSON API.
 pub const TPB_URL: &str = "https://apibay.org";

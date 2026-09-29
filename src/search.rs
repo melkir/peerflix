@@ -312,62 +312,6 @@ fn health(it: &Torrent) -> &'static str {
     }
 }
 
-pub fn human_bytes(n: u64) -> String {
-    const UNIT: u64 = 1024;
-    if n < UNIT {
-        return format!("{n} B");
-    }
-    let (mut div, mut exp) = (UNIT, 0);
-    let mut m = n / UNIT;
-    while m >= UNIT {
-        div *= UNIT;
-        exp += 1;
-        m /= UNIT;
-    }
-    format!(
-        "{:.1} {}iB",
-        n as f64 / div as f64,
-        "KMGTPE".as_bytes()[exp] as char
-    )
-}
-
-/// The trackers put in magnets built from a bare info hash.
-pub const TRACKERS: [&str; 5] = [
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.stealth.si:80/announce",
-    "udp://tracker.torrent.eu.org:451/announce",
-    "udp://tracker.dler.org:6969/announce",
-    "udp://open.dstud.io:6969/announce",
-];
-
-/// Builds a magnet link for an info hash, naming it name.
-pub fn magnet(hash: &str, name: &str) -> String {
-    let mut url =
-        reqwest::Url::parse(&format!("magnet:?xt=urn:btih:{hash}")).expect("magnet URLs parse");
-    let mut query = url.query_pairs_mut();
-    query.append_pair("dn", name);
-    for tr in TRACKERS {
-        query.append_pair("tr", tr);
-    }
-    drop(query);
-    url.into()
-}
-
-/// Formats a Unix time as a UTC YYYY-MM-DD date.
-pub fn unix_date(secs: i64) -> String {
-    // Howard Hinnant's civil_from_days.
-    let z = secs.div_euclid(86_400) + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,33 +505,6 @@ mod tests {
                 health(&it) == color,
                 "{seeders} seeders, {leechers} leechers"
             );
-        }
-    }
-
-    #[test]
-    fn human_sizes() {
-        for (n, want) in [
-            (0, "0 B"),
-            (1023, "1023 B"),
-            (1024, "1.0 KiB"),
-            (1536, "1.5 KiB"),
-            (1 << 20, "1.0 MiB"),
-            (5 << 30, "5.0 GiB"),
-            (3 << 40, "3.0 TiB"),
-        ] {
-            assert_eq!(human_bytes(n), want);
-        }
-    }
-
-    #[test]
-    fn unix_dates() {
-        for (secs, want) in [
-            (0, "1970-01-01"),
-            (951_782_400, "2000-02-29"),
-            (1_790_612_897, "2026-09-28"),
-            (-86_400, "1969-12-31"),
-        ] {
-            assert_eq!(unix_date(secs), want, "{secs}");
         }
     }
 }

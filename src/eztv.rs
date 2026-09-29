@@ -2,7 +2,10 @@ use anyhow::{Context, anyhow};
 use serde::Deserialize;
 use tokio::task::JoinSet;
 
-use crate::search::{Torrent, get_json, human_bytes, unix_date};
+use crate::{
+    search::{Torrent, get_json},
+    util::{human_bytes, unix_date},
+};
 
 pub const EZTV_URL: &str = "https://eztvx.to";
 /// EZTV's API only looks shows up by IMDb ID, so titles go through IMDb's

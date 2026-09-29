@@ -1,7 +1,10 @@
 use anyhow::bail;
 use serde::Deserialize;
 
-use crate::search::{Torrent, get_json, human_bytes, magnet};
+use crate::{
+    search::{Torrent, get_json},
+    util::{human_bytes, magnet},
+};
 
 /// YTS's API; the yts.* sites point clients here.
 pub const YTS_URL: &str = "https://movies-api.accel.li";
@@ -91,7 +94,7 @@ pub async fn search(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::{search::TRACKERS, testutil::FakeServer};
+    use crate::{testutil::FakeServer, util::TRACKERS};
 
     pub const SAMPLE_JSON: &str = r#"{"status":"ok","status_message":"Query was successful","data":{"movie_count":1,"movies":[
         {"title_long":"Big Buck Bunny (2008)","torrents":[

@@ -15,6 +15,7 @@ mod stream;
 #[cfg(test)]
 mod testutil;
 mod tpb;
+mod util;
 mod yts;
 
 use std::{
@@ -38,9 +39,10 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use crate::{
     files::{TorrentFile, episodes, pick_file, subtitles, torrent_files},
     fzf::NoSelection,
-    search::{Category, Endpoints, human_bytes},
+    search::{Category, Endpoints},
     storage::PartStorage,
     stream::{Reader, path_escape},
+    util::human_bytes,
 };
 
 /// The port the stream is served on unless --port says otherwise.
