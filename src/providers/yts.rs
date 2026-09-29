@@ -56,9 +56,9 @@ impl Provider for Yts {
         "yts"
     }
 
-    /// Searches YTS's movies by title, most seeded first, and returns one
-    /// result per movie and quality. An empty query returns nothing rather
-    /// than the whole catalog.
+    /// Searches YTS's movies by title or IMDb ID, most seeded first, and
+    /// returns one result per movie and quality. An empty query returns
+    /// nothing rather than the whole catalog.
     fn search<'a>(
         &'a self,
         client: &'a reqwest::Client,
@@ -71,7 +71,7 @@ impl Provider for Yts {
             let req = client
                 .get(format!("{}/api/v2/list_movies.json", self.base))
                 .query(&[
-                    ("query_term", query.text.as_str()),
+                    ("query_term", query.imdb.as_deref().unwrap_or(&query.text)),
                     ("limit", "50"),
                     ("sort_by", "seeds"),
                 ]);

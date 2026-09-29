@@ -31,6 +31,8 @@ pub struct Query {
     pub text: String,
     /// The terms without a trailing episode, trimmed.
     pub title: String,
+    /// The IMDb ID, such as tt1748166, when that's what the title is.
+    pub imdb: Option<String>,
     /// The season or episode that trailed the terms, as in S01E03, S01 or
     /// 1x03.
     pub episode: Option<Episode>,
@@ -47,9 +49,17 @@ impl Query {
         Query {
             text: text.to_owned(),
             title: title.to_owned(),
+            imdb: is_imdb_id(title).then(|| title.to_ascii_lowercase()),
             episode,
         }
     }
+}
+
+/// Whether s is an IMDb ID: tt and at least 7 digits, in any case.
+fn is_imdb_id(s: &str) -> bool {
+    s.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("tt"))
+        && s.len() >= 9
+        && s[2..].bytes().all(|b| b.is_ascii_digit())
 }
 
 /// A whole season, or one episode of it.
@@ -57,6 +67,33 @@ impl Query {
 pub struct Episode {
     pub season: u32,
     pub episode: Option<u32>,
+}
+
+impl Episode {
+    /// The first season or episode tag in a release's name, such as the
+    /// S01E02 in Show.S01E02.720p, or the Season 2 in Show Season 2 Complete.
+    pub fn in_name(name: &str) -> Option<Episode> {
+        let words: Vec<_> = name
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        words.iter().enumerate().find_map(|(i, w)| {
+            if w.eq_ignore_ascii_case("season") {
+                let season = words.get(i + 1)?.parse().ok()?;
+                return Some(Episode {
+                    season,
+                    episode: None,
+                });
+            }
+            parse_episode(w)
+        })
+    }
+
+    /// Whether found is this episode, or in this season if this is a whole
+    /// season.
+    pub fn includes(self, found: Episode) -> bool {
+        self.season == found.season && self.episode.is_none_or(|e| found.episode == Some(e))
+    }
 }
 
 /// Parses S01E02, S01 or 1x02, in any case.
@@ -144,6 +181,50 @@ mod tests {
                 (title, want),
                 "{q:?}"
             );
+            assert_eq!(query.imdb, None, "{q:?}");
         }
+    }
+
+    #[test]
+    fn spots_imdb_ids() {
+        for (q, want) in [
+            ("tt1748166", Some("tt1748166")),
+            ("TT1748166 s01e02", Some("tt1748166")),
+            ("tt12345678", Some("tt12345678")),
+            ("tt174816", None),
+            ("tt1748166x", None),
+            ("pioneer one tt1748166", None),
+            ("", None),
+        ] {
+            assert_eq!(Query::new(q).imdb.as_deref(), want, "{q:?}");
+        }
+    }
+
+    #[test]
+    fn finds_episodes_in_names() {
+        let ep = |season, episode| Some(Episode { season, episode });
+        for (name, want) in [
+            ("Pioneer.One.S01E02.720p.x264", ep(1, Some(2))),
+            ("Pioneer One S02 Complete 1080p", ep(2, None)),
+            ("Show 3x04 HDTV", ep(3, Some(4))),
+            ("Pioneer One Season 1 Complete 720p", ep(1, None)),
+            ("Pioneer.One.Season.3.720p.S03E01", ep(3, None)),
+            ("The Season Finale", None),
+            ("Sintel.2010.1080p", None),
+        ] {
+            assert_eq!(Episode::in_name(name), want, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn includes_episodes() {
+        let ep = |season, episode| Episode { season, episode };
+        assert!(ep(1, None).includes(ep(1, Some(3))));
+        assert!(ep(1, None).includes(ep(1, None)));
+        assert!(ep(1, Some(3)).includes(ep(1, Some(3))));
+        assert!(!ep(1, Some(3)).includes(ep(1, Some(4))));
+        // A season pack isn't the episode asked for.
+        assert!(!ep(1, Some(3)).includes(ep(1, None)));
+        assert!(!ep(1, None).includes(ep(2, Some(3))));
     }
 }

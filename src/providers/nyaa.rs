@@ -77,6 +77,10 @@ impl Provider for Nyaa {
         query: &'a Query,
     ) -> BoxFuture<'a, anyhow::Result<Vec<Torrent>>> {
         Box::pin(async move {
+            // nyaa doesn't know IMDb IDs.
+            if query.imdb.is_some() {
+                return Ok(Vec::new());
+            }
             let user = self.user.as_str();
             let filter = if self.trusted { "2" } else { "0" };
             let mut params = vec![
@@ -216,6 +220,14 @@ pub(crate) mod tests {
         let q = srv.queries().remove(0);
         assert_eq!(q.get("f").map(String::as_str), Some("0"));
         assert!(!q.contains_key("u"), "user set without --user");
+    }
+
+    #[tokio::test]
+    async fn skips_imdb_ids() {
+        let srv = FakeServer::start(200, SAMPLE_FEED).await;
+        let items = search(&srv.url, "tt1727587", "", false).await.unwrap();
+        assert!(items.is_empty());
+        assert!(srv.queries().is_empty());
     }
 
     #[tokio::test]

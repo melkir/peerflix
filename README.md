@@ -65,6 +65,9 @@ what you typed. The prompt shows the current one:
   listed, newest first. A trailing `S02`, `S02E03` or `2x03` narrows EZTV's
   results to that season or episode.
 
+An IMDb ID instead of a title, such as `tt1254207` or `tt1748166 S02`, looks the movie or show up
+by ID on YTS, EZTV and The Pirate Bay. nyaa has no IMDb IDs.
+
 Before you type anything, anime lists nyaa's newest uploads, movies The Pirate Bay's top 100 HD
 movies, and series its top 100 HD TV shows.
 

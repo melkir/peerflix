@@ -51,9 +51,9 @@ impl Provider for Eztv {
         "eztv"
     }
 
-    /// Searches EZTV for the show IMDb suggests for the query's title,
-    /// newest first, keeping only the query's season or episode if it has
-    /// one.
+    /// Searches EZTV for the query's IMDb ID, or else the show IMDb suggests
+    /// for its title, newest first, keeping only the query's season or
+    /// episode if it has one.
     fn search<'a>(
         &'a self,
         client: &'a reqwest::Client,
@@ -63,8 +63,12 @@ impl Provider for Eztv {
             if query.title.is_empty() {
                 return Ok(Vec::new());
             }
-            let Some(id) = show_id(client, &self.imdb, &query.title).await? else {
-                return Ok(Vec::new());
+            let id = match &query.imdb {
+                Some(id) => id.clone(),
+                None => match show_id(client, &self.imdb, &query.title).await? {
+                    Some(id) => id,
+                    None => return Ok(Vec::new()),
+                },
             };
             let wanted = query.episode;
             let pages = if wanted.is_some() { MAX_PAGES } else { 1 };
@@ -146,8 +150,12 @@ async fn page(client: &reqwest::Client, base: &str, id: &str, n: usize) -> anyho
 
 /// Whether it is from wanted's season, or is wanted's episode.
 fn is_episode(it: &Item, wanted: Episode) -> bool {
-    it.season.parse() == Ok(wanted.season)
-        && wanted.episode.is_none_or(|e| it.episode.parse() == Ok(e))
+    it.season.parse().is_ok_and(|season| {
+        wanted.includes(Episode {
+            season,
+            episode: it.episode.parse().ok(),
+        })
+    })
 }
 
 impl From<Item> for Torrent {
@@ -212,6 +220,27 @@ mod tests {
             .unwrap();
         assert!(items.is_empty());
         assert!(srv.queries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn searches_imdb_ids_directly() {
+        let srv = FakeServer::start(200, SAMPLE_JSON).await;
+        let eztv = Eztv {
+            base: srv.url.clone(),
+            imdb: srv.url.clone(),
+        };
+        let items = eztv
+            .search(&reqwest::Client::new(), &Query::new("tt1234567 s02"))
+            .await
+            .unwrap();
+        let titles: Vec<_> = items.iter().map(|it| it.title.as_str()).collect();
+        assert_eq!(titles, ["Pioneer One S02E01 720p"]);
+        // No IMDb lookup, straight to the show's torrents.
+        assert_eq!(srv.paths(), ["/api/get-torrents"]);
+        assert_eq!(
+            srv.queries()[0].get("imdb_id").map(String::as_str),
+            Some("1234567")
+        );
     }
 
     #[tokio::test]

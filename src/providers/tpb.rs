@@ -2,7 +2,7 @@ use futures_util::future::BoxFuture;
 use serde::{Deserialize, Deserializer};
 
 use crate::{
-    providers::{Provider, Query, Torrent, get_json},
+    providers::{Episode, Provider, Query, Torrent, get_json},
     util::{human_bytes, magnet, unix_date},
 };
 
@@ -65,6 +65,10 @@ impl Provider for Tpb {
     /// Searches The Pirate Bay's movies or TV shows, most seeded first. An
     /// empty query lists the top 100 in HD, what's popular right now. Cams
     /// and other pre-release copies are left out of movies.
+    ///
+    /// An IMDb ID is searched on its own, since apibay finds nothing for it
+    /// with other terms, and the results are narrowed to the query's season or
+    /// episode by their names.
     fn search<'a>(
         &'a self,
         client: &'a reqwest::Client,
@@ -72,7 +76,11 @@ impl Provider for Tpb {
     ) -> BoxFuture<'a, anyhow::Result<Vec<Torrent>>> {
         Box::pin(async move {
             let (base, kind) = (&self.base, self.kind);
-            let req = if query.text.trim().is_empty() {
+            let terms = query.imdb.as_deref().unwrap_or(&query.text);
+            // Only an IMDb ID's results need narrowing; the terms already
+            // hold the episode otherwise.
+            let wanted = query.imdb.as_ref().and(query.episode);
+            let req = if terms.trim().is_empty() {
                 client.get(format!(
                     "{base}/precompiled/data_top100_{}.json",
                     kind.top()
@@ -80,7 +88,7 @@ impl Provider for Tpb {
             } else {
                 client
                     .get(format!("{base}/q.php"))
-                    .query(&[("q", query.text.as_str()), ("cat", kind.categories())])
+                    .query(&[("q", terms), ("cat", kind.categories())])
             };
             let items: Vec<Item> = get_json(req, "tpb").await?;
             Ok(items
@@ -88,6 +96,9 @@ impl Provider for Tpb {
                 // No results come back as one placeholder with an all-zero hash.
                 .filter(|it| it.info_hash.bytes().any(|b| b != b'0'))
                 .filter(|it| kind != Kind::Movies || !is_cam(&it.name))
+                .filter(|it| {
+                    wanted.is_none_or(|w| Episode::in_name(&it.name).is_some_and(|f| w.includes(f)))
+                })
                 .map(|it| Torrent {
                     url: magnet(&it.info_hash, &it.name),
                     date: unix_date(it.added),
@@ -270,6 +281,47 @@ mod tests {
         {"name":"Movie 2026 HDCAM","info_hash":"1111111111111111111111111111111111111111","seeders":"900"},
         {"name":"Movie 2026 1080p WEB-DL","info_hash":"2222222222222222222222222222222222222222","seeders":"50"}
     ]"#;
+
+    const TV_JSON: &str = r#"[
+        {"name":"Pioneer One S01E01 720p","info_hash":"1111111111111111111111111111111111111111","seeders":"9"},
+        {"name":"Pioneer.One.S01E02.720p","info_hash":"2222222222222222222222222222222222222222","seeders":"8"},
+        {"name":"Pioneer One S01 Complete","info_hash":"3333333333333333333333333333333333333333","seeders":"7"},
+        {"name":"Pioneer One S02E01","info_hash":"4444444444444444444444444444444444444444","seeders":"6"}
+    ]"#;
+
+    #[tokio::test]
+    async fn searches_imdb_ids_alone() {
+        let srv = FakeServer::start(200, TV_JSON).await;
+        let titles =
+            |items: Vec<Torrent>| -> Vec<String> { items.into_iter().map(|it| it.title).collect() };
+        let items = search(&srv.url, "tt1234567 S01E02", Kind::Tv)
+            .await
+            .unwrap();
+        assert_eq!(titles(items), ["Pioneer.One.S01E02.720p"]);
+        let items = search(&srv.url, "TT1234567 s01", Kind::Tv).await.unwrap();
+        assert_eq!(
+            titles(items),
+            [
+                "Pioneer One S01E01 720p",
+                "Pioneer.One.S01E02.720p",
+                "Pioneer One S01 Complete"
+            ]
+        );
+        let items = search(&srv.url, "tt1234567", Kind::Tv).await.unwrap();
+        assert_eq!(items.len(), 4);
+        for q in srv.queries() {
+            assert_eq!(q.get("q").map(String::as_str), Some("tt1234567"));
+        }
+
+        // Without an ID, apibay matches the episode as a search term.
+        search(&srv.url, "pioneer one s01e02", Kind::Tv)
+            .await
+            .unwrap();
+        assert_eq!(
+            srv.queries()[3].get("q").map(String::as_str),
+            Some("pioneer one s01e02")
+        );
+    }
 
     #[tokio::test]
     async fn search_errors() {
