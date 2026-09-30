@@ -104,31 +104,91 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
-    let category = "anime";
+
+    // What the window shows. render() draws the page from it, and actions
+    // change it, then render.
+    const state = {
+      category: "anime",
+      // Whether a search is waiting for its results.
+      searching: false,
+      // The latest results, with the category and query they're for and a
+      // note on the sites that failed. They're kept while episodes are shown.
+      results: null,
+      // Why the latest search failed, if it did.
+      error: "",
+      // The torrent whose episodes are shown, with its source and title, or
+      // null while the results are.
+      torrent: null,
+      // The row being started, by its source and index, with the id of the
+      // pick the plugin's answers carry, and how it goes: text, and kind,
+      // "pending" or "failed".
+      picking: null,
+      // The streams being played, each a name and how its download is going.
+      streams: [],
+    };
     let timer = null;
-    let lastResults = null;
-    // The row picked and starting, which shows how it goes; while it's set,
-    // other picks wait.
-    let picked = null;
+    let picks = 0;
 
     function isSource(query) {
       return /^(magnet:|https?:\/\/)/.test(query.trim());
     }
 
-    // Sends a pick to the plugin, unless another one is starting.
-    function pick(li, name, data) {
-      if (picked) return;
-      for (const other of document.querySelectorAll("li.failed")) setState(other, "");
-      picked = li;
-      setState(li, name === "choose" ? "Fetching files…" : "Starting…", "pending");
-      iina.postMessage(name, data);
+    // The rows the list shows, each a torrent's source, the index of the
+    // episode to play (null on a result's row), a title and details.
+    function rows() {
+      if (state.torrent) {
+        const { source, episodes } = state.torrent;
+        return episodes.map((e) => ({ source, index: e.index, title: e.path, meta: [e.size] }));
+      }
+      return (state.results?.results ?? []).map((r) => ({
+        source: r.url,
+        index: null,
+        title: r.title,
+        // A pasted magnet link or URL has no details.
+        meta: r.site ? [`${r.date} · ${r.size} · `, health(r), ` · ${r.site}`] : [],
+      }));
     }
 
-    // Shows text under the row's details, as kind ("pending" or "failed").
-    function setState(li, text, kind) {
-      li.classList.remove("pending", "failed");
-      if (kind) li.classList.add(kind);
-      li.querySelector(".state").textContent = text;
+    function isPicked(row) {
+      const p = state.picking;
+      return p != null && p.source === row.source && p.index === row.index;
+    }
+
+    // Changes what the list shows, from its top. The episodes it stops
+    // showing, and a pick whose row it stops showing, are given up.
+    function setList(changes) {
+      const hadEpisodes = state.torrent != null;
+      Object.assign(state, changes);
+      const lost = state.picking != null && !rows().some(isPicked);
+      if (lost) state.picking = null;
+      if (lost || (hadEpisodes && !state.torrent)) iina.postMessage("cancel", null);
+      render();
+      $("main").scrollTop = 0;
+    }
+
+    // Asks the plugin to start row, unless it's starting already: a result
+    // lists its episodes when it has several, and an episode plays.
+    function pick(row) {
+      if (isPicked(row) && state.picking.kind === "pending") return;
+      const episode = row.index != null;
+      const id = ++picks;
+      state.picking = {
+        pick: id,
+        source: row.source,
+        index: row.index,
+        text: episode ? "Starting…" : "Fetching files…",
+        kind: "pending",
+      };
+      const title = state.torrent?.title ?? row.title;
+      iina.postMessage(episode ? "play" : "choose", { pick: id, source: row.source, title, index: row.index });
+      render();
+    }
+
+    // Applies changes to the row being started, if it's still pick's.
+    function updatePick(pick, changes) {
+      if (pick !== state.picking?.pick) return;
+      state.picking = changes && { ...state.picking, ...changes };
+      render();
     }
 
     function search() {
@@ -136,41 +196,68 @@
       const query = $("query").value;
       // A pasted magnet link or URL plays straight away.
       if (isSource(query)) {
-        const li = row(query.trim(), [], (li) => pick(li, "choose", { source: query.trim(), title: query.trim() }));
-        show([li]);
-        li.click();
+        const source = query.trim();
+        const results = { results: [{ title: source, url: source }], note: "" };
+        setList({ results, error: "", torrent: null, searching: false });
+        pick(rows()[0]);
         return;
       }
-      $("main").classList.add("searching");
-      if (!$("list").children.length) setEmpty("Searching…");
-      iina.postMessage("search", { category, query });
+      state.searching = true;
+      render();
+      iina.postMessage("search", { category: state.category, query });
     }
 
-    function setEmpty(text, error = false) {
+    function render() {
+      for (const b of document.querySelectorAll(".tabs button")) {
+        b.setAttribute("aria-pressed", String(b.dataset.category === state.category));
+      }
+      $("crumb").hidden = !state.torrent;
+      $("crumb-title").textContent = state.torrent?.title ?? "";
+      $("main").classList.toggle("searching", state.searching);
+      const items = rows().map(rowElement);
+      const note = state.torrent ? "" : state.results?.note;
+      if (items.length && note) items.push(noteElement(note));
+      $("list").replaceChildren(...items);
+      const [text, error] = items.length ? ["", false] : emptyText();
       $("empty").textContent = text;
       $("empty").classList.toggle("error", error);
+      renderStreams();
     }
 
-    function setCategory(name) {
-      category = name;
-      for (const b of document.querySelectorAll(".tabs button")) {
-        b.setAttribute("aria-pressed", String(b.dataset.category === name));
-      }
+    // What the list says when it has no rows, and whether that's an error.
+    function emptyText() {
+      if (state.searching) return ["Searching…", false];
+      if (state.error) return [state.error, true];
+      if (!state.results) return ["", false];
+      const { category, query, note } = state.results;
+      const q = query.trim();
+      const none = q ? `No ${category} results for “${q}”.` : `No ${category} to show.`;
+      return [[none, note].filter(Boolean).join(" "), false];
     }
 
-    // Calls onClick with the row when it's clicked.
-    function row(title, meta, onClick) {
+    function rowElement(row) {
       const li = document.createElement("li");
       const t = document.createElement("div");
       t.className = "title";
-      t.textContent = title;
+      t.textContent = row.title;
       const m = document.createElement("div");
       m.className = "meta";
-      m.append(...meta);
+      m.append(...row.meta);
       const s = document.createElement("div");
       s.className = "state";
+      if (isPicked(row)) {
+        li.classList.add(state.picking.kind);
+        s.textContent = state.picking.text;
+      }
       li.append(t, m, s);
-      li.addEventListener("click", () => onClick(li));
+      li.addEventListener("click", () => pick(row));
+      return li;
+    }
+
+    function noteElement(note) {
+      const li = document.createElement("li");
+      li.className = "note";
+      li.textContent = note;
       return li;
     }
 
@@ -181,80 +268,10 @@
       return span;
     }
 
-    // Shows rows in the list, with note, if any, after them.
-    function show(rows, note = "") {
-      $("main").classList.remove("searching");
-      const items = [...rows];
-      if (note) {
-        const li = document.createElement("li");
-        li.className = "note";
-        li.textContent = note;
-        items.push(li);
-      }
-      $("list").replaceChildren(...items);
-      $("main").scrollTop = 0;
-      setEmpty("");
-    }
-
-    function showResults({ results, note }) {
-      lastResults = { results, note };
-      if (!$("crumb").hidden) {
-        // Leaving the episodes, whose torrent peerflix waits with.
-        $("crumb").hidden = true;
-        iina.postMessage("back", null);
-      }
-      show(
-        results.map((r) =>
-          row(r.title, [`${r.date} · ${r.size} · `, health(r), ` · ${r.site}`], (li) =>
-            pick(li, "choose", { source: r.url, title: r.title })
-          )
-        ),
-        results.length ? note : ""
-      );
-      if (!results.length) {
-        const q = $("query").value.trim();
-        const none = q ? `No ${category} results for “${q}”.` : `No ${category} to show.`;
-        setEmpty([none, note].filter(Boolean).join(" "));
-      }
-    }
-
-    iina.onMessage("results", (data) => {
-      // Only the current category and query's results.
-      if (data.category !== category || data.query !== $("query").value) return;
-      showResults(data);
-    });
-
-    iina.onMessage("searchFailed", ({ category: c, query, text }) => {
-      if (c !== category || query !== $("query").value) return;
-      show([]);
-      setEmpty(text, true);
-    });
-
-    iina.onMessage("episodes", ({ source, title, episodes }) => {
-      picked = null;
-      $("crumb-title").textContent = title;
-      $("crumb").hidden = false;
-      show(episodes.map((e) => row(e.path, [e.size], (li) => pick(li, "play", { source, title, index: e.index }))));
-    });
-
-    iina.onMessage("progress", ({ text }) => {
-      if (picked) setState(picked, text, "pending");
-    });
-
-    iina.onMessage("started", () => {
-      if (picked) setState(picked, "");
-      picked = null;
-    });
-
-    iina.onMessage("failed", ({ text }) => {
-      if (picked) setState(picked, text, "failed");
-      picked = null;
-    });
-
     // Each stream being played, with how its download is going.
-    iina.onMessage("streams", (streams) => {
+    function renderStreams() {
       $("streams").replaceChildren(
-        ...streams.map(({ name, text }) => {
+        ...state.streams.map(({ name, text }) => {
           const div = document.createElement("div");
           const n = document.createElement("span");
           n.className = "name";
@@ -266,9 +283,34 @@
           return div;
         })
       );
+    }
+
+    iina.onMessage("results", (data) => {
+      // Only the current category and query's results.
+      if (data.category !== state.category || data.query !== $("query").value) return;
+      setList({ results: data, error: "", torrent: null, searching: false });
     });
 
-    $("back").addEventListener("click", () => lastResults && showResults(lastResults));
+    iina.onMessage("searchFailed", ({ category, query, text }) => {
+      if (category !== state.category || query !== $("query").value) return;
+      setList({ results: null, error: text, torrent: null, searching: false });
+    });
+
+    iina.onMessage("episodes", ({ pick, source, title, episodes }) => {
+      if (pick !== state.picking?.pick) return;
+      setList({ torrent: { source, title, episodes }, picking: null });
+    });
+
+    iina.onMessage("progress", ({ pick, text }) => updatePick(pick, { text }));
+    iina.onMessage("started", ({ pick }) => updatePick(pick, null));
+    iina.onMessage("failed", ({ pick, text }) => updatePick(pick, { text, kind: "failed" }));
+
+    iina.onMessage("streams", (streams) => {
+      state.streams = streams;
+      renderStreams();
+    });
+
+    $("back").addEventListener("click", () => setList({ torrent: null }));
 
     $("query").addEventListener("input", () => {
       clearTimeout(timer);
@@ -280,12 +322,11 @@
 
     for (const b of document.querySelectorAll(".tabs button")) {
       b.addEventListener("click", () => {
-        setCategory(b.dataset.category);
+        state.category = b.dataset.category;
         search();
       });
     }
 
-    setCategory(category);
     search();
   </script>
 </body>

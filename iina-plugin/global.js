@@ -52,6 +52,10 @@ done
 // The peerflix that listed a torrent's episodes and waits for one to be
 // picked, with the torrent's source and its control URL.
 let pending = null;
+// The id of the search window's pick being started, if any. A newer pick, or
+// the window giving it up, replaces it, and a peerflix started for a pick
+// that isn't current is stopped rather than played.
+let current = null;
 // The streams players were opened on, each a name and control URL, by
 // player ID, until the player closes.
 const streams = new Map();
@@ -72,7 +76,7 @@ function showWindow() {
   win.onMessage("search", search);
   win.onMessage("choose", choose);
   win.onMessage("play", play);
-  win.onMessage("back", cancelPending);
+  win.onMessage("cancel", cancel);
   win.open();
 }
 
@@ -119,13 +123,15 @@ async function search({ category, query }) {
   }
 }
 
-// The search window shows how a picked torrent is starting on its row.
-function progress(text) {
-  win.postMessage("progress", { text });
+// The search window shows how pick is starting on its row.
+function progress(pick, text) {
+  win.postMessage("progress", { pick, text });
 }
 
-function failed(e) {
-  win.postMessage("failed", { text: e.message });
+function failed(pick, text) {
+  if (pick !== current) return;
+  current = null;
+  win.postMessage("failed", { pick, text });
 }
 
 // Starts peerflix on source, which answers with the torrent's files and
@@ -133,31 +139,41 @@ function failed(e) {
 // index, or the torrent's largest video; or, when neither is given and it
 // holds several episodes, lists them to pick from, keeping peerflix waiting.
 // The search window shows "Fetching files…" meanwhile.
-async function choose({ source, title, index = null }) {
+async function choose({ pick, source, title, index = null }) {
   cancelPending();
+  current = pick;
   try {
     const { files, episodes, control } = JSON.parse(await run(["--json", "--", source]));
     if (!control) throw new Error("peerflix is too old for this plugin; update it.");
+    if (pick !== current) return stop(control);
     if (index != null || episodes.length < 2) {
-      progress("Starting…");
-      return start(control, index);
+      progress(pick, "Starting…");
+      return start(pick, control, index);
     }
     pending = { source, control };
+    current = null;
     const byIndex = Object.fromEntries(files.map((f) => [f.index, f]));
-    win.postMessage("episodes", { source, title, episodes: episodes.map((i) => byIndex[i]) });
+    win.postMessage("episodes", { pick, source, title, episodes: episodes.map((i) => byIndex[i]) });
   } catch (e) {
-    failed(e);
+    failed(pick, e.message);
   }
 }
 
 // Plays the episode at index of source, picked from the list the waiting
 // peerflix sent, or with a new peerflix once that one has started one. The
 // search window shows "Starting…" meanwhile.
-function play({ source, title, index }) {
-  if (pending?.source !== source) return choose({ source, title, index });
+function play({ pick, source, title, index }) {
+  if (pending?.source !== source) return choose({ pick, source, title, index });
   const { control } = pending;
   pending = null;
-  start(control, index);
+  current = pick;
+  start(pick, control, index);
+}
+
+// Gives up the pick being started, and the episodes being picked from.
+function cancel() {
+  current = null;
+  cancelPending();
 }
 
 // Stops the peerflix waiting for an episode to be picked, if any.
@@ -186,19 +202,24 @@ function stop(control) {
 }
 
 // Asks peerflix at control to stream the file at index, or its largest
-// video, and plays the stream in a new player.
-async function start(control, index) {
+// video, and plays the stream in a new player, unless pick was given up
+// meanwhile.
+async function start(pick, control, index) {
   let stream;
   try {
     const res = await onMain(http.put(index == null ? control : `${control}?index=${index}`, {}));
     stream = body(res);
   } catch (res) {
-    return failed(new Error(res.text?.trim() || "peerflix didn't answer."));
+    // peerflix waits for another pick after one of a file there isn't.
+    stop(control);
+    return failed(pick, res.text?.trim() || "peerflix didn't answer.");
   }
+  if (pick !== current) return stop(control);
+  current = null;
   const id = global.createPlayerInstance({ url: stream.url, label: "peerflix", enablePlugins: true });
   // The player's main.js has run by now, though its video may not have loaded.
   global.postMessage(id, "subtitles", stream.subtitles.map((s) => s.url));
-  win.postMessage("started", null);
+  win.postMessage("started", { pick });
   streams.set(id, { name: stream.name, control });
   watch();
 }
