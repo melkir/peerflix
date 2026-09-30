@@ -49,6 +49,9 @@ done
 /bin/rm -f "$out" "$err"
 `;
 
+// The peerflix that listed a torrent's episodes and waits for one to be
+// picked, with the torrent's source and its control URL.
+let pending = null;
 // The streams players were opened on, each a name and control URL, by
 // player ID, until the player closes.
 const streams = new Map();
@@ -69,6 +72,7 @@ function showWindow() {
   win.onMessage("search", search);
   win.onMessage("choose", choose);
   win.onMessage("play", play);
+  win.onMessage("back", cancelPending);
   win.open();
 }
 
@@ -91,7 +95,7 @@ async function run(args) {
   const res = await utils.exec("/bin/sh", ["-c", FIRST_LINE, "sh", bin, ...args]);
   if (res.status !== 0) {
     if (res.stderr.includes("unexpected argument '--json'")) {
-      throw new Error(`${bin} is too old; the plugin needs peerflix 0.5.0 or later.`);
+      throw new Error(`${bin} is too old for this plugin; update it.`);
     }
     // The first error line says what went wrong; later ones tend to be
     // advice, as with mise's shim.
@@ -124,15 +128,21 @@ function failed(e) {
   win.postMessage("failed", { text: e.message });
 }
 
-// Plays source, or lists its episodes to pick from when it has several. The
-// search window shows "Fetching files…" meanwhile.
-async function choose({ source, title }) {
+// Starts peerflix on source, which answers with the torrent's files and
+// episodes and the control URL to pick one from, then plays the file at
+// index, or the torrent's largest video; or, when neither is given and it
+// holds several episodes, lists them to pick from, keeping peerflix waiting.
+// The search window shows "Fetching files…" meanwhile.
+async function choose({ source, title, index = null }) {
+  cancelPending();
   try {
-    const { files, episodes } = JSON.parse(await run(["--json", "--list", "--", source]));
-    if (episodes.length < 2) {
+    const { files, episodes, control } = JSON.parse(await run(["--json", "--", source]));
+    if (!control) throw new Error("peerflix is too old for this plugin; update it.");
+    if (index != null || episodes.length < 2) {
       progress("Starting…");
-      return play({ source, index: null });
+      return start(control, index);
     }
+    pending = { source, control };
     const byIndex = Object.fromEntries(files.map((f) => [f.index, f]));
     win.postMessage("episodes", { source, title, episodes: episodes.map((i) => byIndex[i]) });
   } catch (e) {
@@ -140,28 +150,48 @@ async function choose({ source, title }) {
   }
 }
 
-// Streams file index of source, or the torrent's largest video, in a new
-// player. peerflix serves it until the player closes. The search window shows
-// "Starting…" meanwhile.
-async function play({ source, index }) {
-  const args = ["--json"];
-  if (index != null) args.push("-i", String(index));
-  args.push("--", source);
+// Plays the episode at index of source, picked from the list the waiting
+// peerflix sent, or with a new peerflix once that one has started one. The
+// search window shows "Starting…" meanwhile.
+function play({ source, title, index }) {
+  if (pending?.source !== source) return choose({ source, title, index });
+  const { control } = pending;
+  pending = null;
+  start(control, index);
+}
+
+// Stops the peerflix waiting for an episode to be picked, if any.
+function cancelPending() {
+  if (pending) stop(pending.control);
+  pending = null;
+}
+
+// Settles as promise does, on the main thread, where IINA must create
+// players and touch windows: its http settles off it, and timers fire on it.
+function onMain(promise) {
+  return promise.finally(() => sleep(0));
+}
+
+function stop(control) {
+  http.delete(control, {}).catch(() => {});
+}
+
+// Asks peerflix at control to stream the file at index, or its largest
+// video, and plays the stream in a new player.
+async function start(control, index) {
+  let stream;
   try {
-    const stream = JSON.parse(await run(args));
-    // exec resolves on the main thread, where IINA must create windows.
-    const id = global.createPlayerInstance({ url: stream.url, label: "peerflix", enablePlugins: true });
-    // The player's main.js has run by now, though its video may not have loaded.
-    global.postMessage(id, "subtitles", stream.subtitles.map((s) => s.url));
-    win.postMessage("started", null);
-    // peerflix 0.5.0 has no control URL to get the status from.
-    if (stream.control) {
-      streams.set(id, { name: stream.name, control: stream.control });
-      watch();
-    }
-  } catch (e) {
-    failed(e);
+    const res = await onMain(http.put(index == null ? control : `${control}?index=${index}`, {}));
+    stream = res.data || JSON.parse(res.text);
+  } catch (res) {
+    return failed(new Error(res.text?.trim() || "peerflix didn't answer."));
   }
+  const id = global.createPlayerInstance({ url: stream.url, label: "peerflix", enablePlugins: true });
+  // The player's main.js has run by now, though its video may not have loaded.
+  global.postMessage(id, "subtitles", stream.subtitles.map((s) => s.url));
+  win.postMessage("started", null);
+  streams.set(id, { name: stream.name, control });
+  watch();
 }
 
 // Sends each stream's status to its player, and all of them to the search
@@ -173,7 +203,7 @@ async function watch() {
     const shown = [];
     for (const [id, { name, control }] of streams) {
       try {
-        const res = await http.get(control, {});
+        const res = await onMain(http.get(control, {}));
         const status = res.data || JSON.parse(res.text);
         global.postMessage(id, "status", status);
         shown.push({ name, text: describe(status) });
@@ -197,5 +227,5 @@ global.onMessage("closed", (_, player) => {
   const stream = streams.get(id);
   if (!stream) return;
   streams.delete(id);
-  http.delete(stream.control, {}).catch(() => {});
+  stop(stream.control);
 });

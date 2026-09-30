@@ -24,11 +24,12 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
+use tokio::sync::{mpsc, oneshot};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
     net::TcpListener,
 };
-use tokio_util::{io::ReaderStream, sync::CancellationToken};
+use tokio_util::{io::ReaderStream, sync::CancellationToken, task::AbortOnDropHandle};
 
 pub trait ReadSeek: AsyncRead + AsyncSeek + Send {}
 impl<T: AsyncRead + AsyncSeek + Send> ReadSeek for T {}
@@ -49,26 +50,111 @@ type Body = UnsyncBoxBody<Bytes, std::io::Error>;
 /// names are served escaped, so none can take a path with a slash.
 pub const CONTROL_PATH: &str = "peerflix/stream";
 
-/// What the server does at CONTROL_PATH: GET returns status's JSON, for a
-/// player to show how the download is going, and DELETE cancels stop, for it
-/// to end the stream when it's done with it.
-pub struct Control {
-    pub status: Box<dyn Fn() -> String + Send + Sync>,
-    pub stop: CancellationToken,
+/// A request to start streaming, from a PUT to CONTROL_PATH: the index of
+/// the file it asked for, if any, and where to send the JSON to answer with,
+/// or why streaming didn't start.
+pub struct Pick {
+    pub index: Option<usize>,
+    pub reply: oneshot::Sender<Result<String, String>>,
 }
 
-impl Control {
-    fn respond<B>(&self, req: &Request<B>) -> Response<Body> {
-        match *req.method() {
+/// An HTTP server on localhost for a stream, until dropped.
+///
+/// At CONTROL_PATH, it answers for the stream itself: a PUT asks to start
+/// streaming, with `?index=N` for a given file, a GET returns the stream's
+/// status once it has started, and a DELETE cancels the server's stop token.
+/// Once streaming, it serves each file at `/<escaped name>`, and the first on
+/// every other path.
+pub struct Server {
+    base: String,
+    shared: Arc<Shared>,
+    _task: AbortOnDropHandle<()>,
+}
+
+/// What a server's connections share.
+struct Shared {
+    streaming: OnceLock<Streaming>,
+    picks: mpsc::Sender<Pick>,
+    stop: CancellationToken,
+    connections: Connections,
+}
+
+/// The files a server streams, and how to tell their download's status.
+struct Streaming {
+    files: Vec<File>,
+    /// The escaped names of files, in the same order.
+    paths: Vec<String>,
+    status: Box<dyn Fn() -> String + Send + Sync>,
+}
+
+impl Server {
+    /// Starts serving on listener, cancelling stop on a DELETE. The picks PUT
+    /// to the control come out of the returned receiver; dropping it turns
+    /// them down.
+    pub fn start(
+        listener: TcpListener,
+        stop: CancellationToken,
+    ) -> std::io::Result<(Server, mpsc::Receiver<Pick>)> {
+        let base = format!("http://{}", listener.local_addr()?);
+        let (picks, received) = mpsc::channel(1);
+        let shared = Arc::new(Shared {
+            streaming: OnceLock::new(),
+            picks,
+            stop,
+            connections: Connections::default(),
+        });
+        let task = AbortOnDropHandle::new(tokio::spawn(accept(listener, shared.clone())));
+        let server = Server {
+            base,
+            shared,
+            _task: task,
+        };
+        Ok((server, received))
+    }
+
+    /// The URL a file named name is streamed at.
+    pub fn url(&self, name: &str) -> String {
+        format!("{}/{}", self.base, path_escape(name))
+    }
+
+    pub fn control_url(&self) -> String {
+        format!("{}/{CONTROL_PATH}", self.base)
+    }
+
+    /// The connections players have open.
+    pub fn connections(&self) -> &Connections {
+        &self.shared.connections
+    }
+
+    /// Starts streaming files, with status for the control's GET. A server
+    /// streams once.
+    pub fn stream(&self, files: Vec<File>, status: impl Fn() -> String + Send + Sync + 'static) {
+        let paths = files.iter().map(|f| path_escape(&f.name)).collect();
+        let streaming = Streaming {
+            files,
+            paths,
+            status: Box::new(status),
+        };
+        let first = self.shared.streaming.set(streaming).is_ok();
+        assert!(first, "a server streams once");
+    }
+}
+
+impl Shared {
+    async fn control(&self, method: &Method, query: Option<&str>) -> Response<Body> {
+        match *method {
             // Without CORS headers, a web page can send this but can't read
             // the answer.
-            Method::GET => Response::builder()
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::CACHE_CONTROL, "no-store")
-                .body(full((self.status)()))
-                .unwrap(),
-            // A web page can't send DELETE to another site without asking
-            // first in a CORS preflight, which gets a 405 below.
+            Method::GET => match self.streaming.get() {
+                Some(streaming) => json((streaming.status)()),
+                None => text(StatusCode::CONFLICT, "not streaming yet"),
+            },
+            // A web page can't send PUT or DELETE to another site without
+            // asking first in a CORS preflight, which gets a 405 below.
+            Method::PUT => match query_index(query) {
+                Ok(index) => self.pick(index).await,
+                Err(()) => text(StatusCode::BAD_REQUEST, "index isn't a number"),
+            },
             Method::DELETE => {
                 self.stop.cancel();
                 Response::builder()
@@ -76,9 +162,34 @@ impl Control {
                     .body(empty())
                     .unwrap()
             }
-            _ => not_allowed("GET, DELETE"),
+            _ => not_allowed("GET, PUT, DELETE"),
         }
     }
+
+    /// Hands a pick of file index to the receiver of picks, and answers with
+    /// what it replies.
+    async fn pick(&self, index: Option<usize>) -> Response<Body> {
+        let taken = || text(StatusCode::CONFLICT, "already streaming");
+        let (reply, answer) = oneshot::channel();
+        if self.streaming.get().is_some() || self.picks.send(Pick { index, reply }).await.is_err() {
+            return taken();
+        }
+        match answer.await {
+            Ok(Ok(stream)) => json(stream),
+            Ok(Err(e)) => text(StatusCode::INTERNAL_SERVER_ERROR, e),
+            // Dropped for another pick, or as peerflix stops.
+            Err(_) => taken(),
+        }
+    }
+}
+
+/// Parses the index in a query such as `index=3`, if there's one.
+fn query_index(query: Option<&str>) -> Result<Option<usize>, ()> {
+    let value = query
+        .unwrap_or("")
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("index="));
+    value.map(|v| v.parse().map_err(|_| ())).transpose()
 }
 
 /// Counts the connections players have open to a server, to tell whether
@@ -108,19 +219,10 @@ impl Drop for Open {
     }
 }
 
-/// What a server serves, shared by its connections.
-struct Server {
-    files: Vec<File>,
-    /// The escaped names of files, in the same order.
-    paths: Vec<String>,
-    control: Control,
-    connections: Connections,
-}
-
 /// One connection to a server, counted in its Connections once it asks for a
 /// file.
 struct Connection {
-    server: Arc<Server>,
+    shared: Arc<Shared>,
     player: OnceLock<Open>,
 }
 
@@ -128,37 +230,24 @@ impl Connection {
     async fn respond<B>(&self, req: Request<B>) -> Response<Body> {
         if !local_host(req.headers().get(header::HOST)) {
             // A web page reaching the server through a rebound DNS name.
-            return Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(empty())
-                .unwrap();
+            return text(StatusCode::FORBIDDEN, "");
         }
-        let server = &self.server;
+        let shared = &self.shared;
         let path = req.uri().path().trim_start_matches('/');
         if path == CONTROL_PATH {
-            return server.control.respond(&req);
+            return shared.control(req.method(), req.uri().query()).await;
         }
-        self.player.get_or_init(|| server.connections.open());
-        let i = server.paths.iter().position(|p| p == path).unwrap_or(0);
-        handle(&server.files[i], &req).await
+        let Some(streaming) = shared.streaming.get() else {
+            return text(StatusCode::NOT_FOUND, "not streaming yet");
+        };
+        self.player.get_or_init(|| shared.connections.open());
+        let i = streaming.paths.iter().position(|p| p == path).unwrap_or(0);
+        handle(&streaming.files[i], &req).await
     }
 }
 
-/// Serves each of files at `/<escaped name>`, control at CONTROL_PATH, and the
-/// first file on every other path, until the task is dropped, counting the
-/// connections players have open in connections.
-pub async fn serve(
-    listener: TcpListener,
-    files: Vec<File>,
-    control: Control,
-    connections: Connections,
-) {
-    let server = Arc::new(Server {
-        paths: files.iter().map(|f| path_escape(&f.name)).collect(),
-        files,
-        control,
-        connections,
-    });
+/// Accepts connections to a server until the task is dropped.
+async fn accept(listener: TcpListener, shared: Arc<Shared>) {
     loop {
         let sock = match listener.accept().await {
             Ok((sock, _)) => sock,
@@ -169,7 +258,7 @@ pub async fn serve(
             }
         };
         let conn = Arc::new(Connection {
-            server: server.clone(),
+            shared: shared.clone(),
             player: OnceLock::new(),
         });
         tokio::spawn(async move {
@@ -259,12 +348,6 @@ fn empty() -> Body {
     Empty::new().map_err(|e| match e {}).boxed_unsync()
 }
 
-fn full(s: String) -> Body {
-    Full::new(Bytes::from(s))
-        .map_err(|e| match e {})
-        .boxed_unsync()
-}
-
 fn not_allowed(allow: &'static str) -> Response<Body> {
     Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -273,14 +356,30 @@ fn not_allowed(allow: &'static str) -> Response<Body> {
         .unwrap()
 }
 
+fn json(body: String) -> Response<Body> {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(full(body))
+        .unwrap()
+}
+
+fn text(status: StatusCode, body: impl Into<String>) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(full(body.into()))
+        .unwrap()
+}
+
 fn error(e: anyhow::Error) -> Response<Body> {
-    let mut resp = Response::new(full(format!("{e:#}\n")));
-    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    resp
+    text(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}\n"))
+}
+
+fn full(body: String) -> Body {
+    Full::new(Bytes::from(body))
+        .map_err(|e| match e {})
+        .boxed_unsync()
 }
 
 #[derive(Debug, PartialEq)]
@@ -432,58 +531,79 @@ mod tests {
         }
     }
 
-    fn control(status: &'static str) -> Control {
-        Control {
-            status: Box::new(|| status.into()),
-            stop: CancellationToken::new(),
-        }
+    async fn start(stop: CancellationToken) -> (Server, mpsc::Receiver<Pick>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Server::start(listener, stop).unwrap()
     }
 
-    async fn serve_bytes(data: &'static [u8]) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/video.mkv", listener.local_addr().unwrap());
-        let files = vec![bytes_file("video.mkv", data)];
-        tokio::spawn(serve(
-            listener,
-            files,
-            control("{}"),
-            Connections::default(),
-        ));
-        url
+    /// Starts a server streaming files, with status for its control.
+    async fn streaming(files: Vec<File>, status: &'static str) -> Server {
+        let (server, _) = start(CancellationToken::new()).await;
+        server.stream(files, || status.into());
+        server
     }
 
     #[tokio::test]
     async fn serves_files_by_name() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
         let files = vec![
             bytes_file("video.mkv", b"video"),
             bytes_file("Show E01.en.srt", b"subs"),
         ];
-        tokio::spawn(serve(
-            listener,
-            files,
-            control("{}"),
-            Connections::default(),
-        ));
-        for (path, want) in [
-            ("/video.mkv", "video"),
-            ("/Show%20E01.en.srt", "subs"),
-            ("/anything", "video"),
+        let server = streaming(files, "{}").await;
+        for (name, want) in [
+            ("video.mkv", "video"),
+            ("Show E01.en.srt", "subs"),
+            ("anything", "video"),
         ] {
-            let body = reqwest::get(format!("{base}{path}")).await.unwrap();
-            assert_eq!(body.text().await.unwrap(), want, "{path}");
+            let body = reqwest::get(server.url(name)).await.unwrap();
+            assert_eq!(body.text().await.unwrap(), want, "{name}");
         }
     }
 
     #[tokio::test]
+    async fn starts_streaming_on_a_pick() {
+        let (server, mut picks) = start(CancellationToken::new()).await;
+        let url = server.control_url();
+        let client = reqwest::Client::new();
+        let status = async |req: reqwest::RequestBuilder| req.send().await.unwrap().status();
+        assert_eq!(status(client.get(&url)).await, 409);
+        assert_eq!(status(client.get(server.url("video.mkv"))).await, 404);
+        assert_eq!(status(client.put(format!("{url}?index=x"))).await, 400);
+
+        // Answers what the receiver of picks replies.
+        let put = |query: &str| tokio::spawn(client.put(format!("{url}{query}")).send());
+        let failing = put("?index=9");
+        let pick = picks.recv().await.unwrap();
+        assert_eq!(pick.index, Some(9));
+        pick.reply.send(Err("no file 9".into())).unwrap();
+        let resp = failing.await.unwrap().unwrap();
+        assert_eq!(resp.status(), 500);
+        assert_eq!(resp.text().await.unwrap(), "no file 9");
+
+        let starting = put("");
+        let pick = picks.recv().await.unwrap();
+        assert_eq!(pick.index, None);
+        server.stream(vec![bytes_file("video.mkv", b"video")], || "{}".into());
+        pick.reply
+            .send(Ok(r#"{"name":"video.mkv"}"#.into()))
+            .unwrap();
+        let resp = starting.await.unwrap().unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), r#"{"name":"video.mkv"}"#);
+
+        assert_eq!(status(client.put(&url)).await, 409);
+        let body = client.get(server.url("video.mkv")).send().await.unwrap();
+        assert_eq!(body.text().await.unwrap(), "video");
+    }
+
+    #[tokio::test]
     async fn controls_the_stream() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/{CONTROL_PATH}", listener.local_addr().unwrap());
-        let control = control(r#"{"downloaded":5}"#);
-        let stop = control.stop.clone();
-        let files = vec![bytes_file("video.mkv", b"video")];
-        tokio::spawn(serve(listener, files, control, Connections::default()));
+        let stop = CancellationToken::new();
+        let (server, _) = start(stop.clone()).await;
+        server.stream(vec![bytes_file("video.mkv", b"video")], || {
+            r#"{"downloaded":5}"#.into()
+        });
+        let url = server.control_url();
         let client = reqwest::Client::new();
 
         let resp = client.get(&url).send().await.unwrap();
@@ -509,14 +629,26 @@ mod tests {
         assert!(stop.is_cancelled());
     }
 
+    #[test]
+    fn query_indexes() {
+        for (query, want) in [
+            (None, Ok(None)),
+            (Some(""), Ok(None)),
+            (Some("index=3"), Ok(Some(3))),
+            (Some("x=1&index=12"), Ok(Some(12))),
+            (Some("index="), Err(())),
+            (Some("index=-1"), Err(())),
+        ] {
+            assert_eq!(query_index(query), want, "{query:?}");
+        }
+    }
+
     #[tokio::test]
     async fn counts_connections() {
         use tokio::io::AsyncWriteExt;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let connections = Connections::default();
-        let files = vec![bytes_file("video.mkv", b"video")];
-        tokio::spawn(serve(listener, files, control("{}"), connections.clone()));
+        let server = streaming(vec![bytes_file("video.mkv", b"video")], "{}").await;
+        let connections = server.connections();
+        let addr = server.base.trim_start_matches("http://").to_owned();
         // Waits up to a second for the count to reach want.
         let settles_at = async |want| {
             for _ in 0..100 {
@@ -529,7 +661,7 @@ mod tests {
         };
         // Opens a connection that asks for path once and stays open.
         let ask = async |path: &str| {
-            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
             let req = format!("HEAD /{path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
             sock.write_all(req.as_bytes()).await.unwrap();
             // Answered, so the request was seen.
@@ -539,7 +671,7 @@ mod tests {
         let a = ask("video.mkv").await;
         let b = ask("video.mkv").await;
         let _control = ask(CONTROL_PATH).await;
-        let _idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _idle = tokio::net::TcpStream::connect(&addr).await.unwrap();
         assert!(settles_at(2).await, "{}", connections.count());
         drop(a);
         assert!(settles_at(1).await, "{}", connections.count());
@@ -550,7 +682,8 @@ mod tests {
     #[tokio::test]
     async fn serves_ranges() {
         let data: &'static [u8] = b"0123456789".repeat(5000).leak();
-        let url = serve_bytes(data).await;
+        let server = streaming(vec![bytes_file("video.mkv", data)], "{}").await;
+        let url = server.url("video.mkv");
         let client = reqwest::Client::new();
 
         let resp = client.get(&url).send().await.unwrap();

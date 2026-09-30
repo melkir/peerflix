@@ -3,7 +3,7 @@ name = "peerflix"
 version = "0.5.0"
 edition = "2024"
 rust-version = "1.98.1"
-description = "Stream a torrent straight into IINA"
+description = "Search for anime, movies and series, and stream the torrent into IINA"
 repository = "https://github.com/melkir/peerflix"
 license = "MIT"
 
@@ -24,7 +24,7 @@ quick-xml = { version = "0.41", features = ["serialize"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "query", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "process", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "process", "sync", "time"] }
 tokio-util = { version = "0.7.11", features = ["io", "rt"] }
 
 [dev-dependencies]

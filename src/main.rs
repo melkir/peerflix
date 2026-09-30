@@ -13,15 +13,19 @@ use std::{
 
 use anyhow::Context;
 use clap::Parser;
-use librqbit::{AddTorrent, ManagedTorrent, Session, TorrentStats};
-use tokio::{net::TcpListener, signal::unix::SignalKind};
+use librqbit::{AddTorrent, ManagedTorrent, Session};
+use tokio::{
+    net::TcpListener,
+    signal::unix::SignalKind,
+    sync::{mpsc, oneshot},
+};
 use tokio_util::sync::CancellationToken;
 
 use peerflix::{
     search::{Category, Endpoints},
-    stream::Connections,
+    stream::{Connections, Pick, Server},
     torrent::{
-        self, add_torrent, complete_files, fetch_metadata,
+        self, Status, add_torrent, complete_files, fetch_metadata,
         files::{TorrentFile, episodes, pick_file, subtitles, torrent_files},
         serve_files,
         storage::PartStorage,
@@ -41,73 +45,68 @@ const DEFAULT_PORT: u16 = 8888;
 /// before peerflix exits.
 const IDLE: Duration = Duration::from_secs(30);
 
+/// How long peerflix waits with --json for a program to pick a file to
+/// stream, in case the program went away.
+const PICK_WAIT: Duration = Duration::from_secs(10 * 60);
+
 /// The release version, or the crate version for `cargo install` builds.
 const VERSION: &str = match option_env!("PEERFLIX_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
 
-/// Stream a torrent straight into IINA.
+/// Search for anime, movies and series, and stream the torrent into IINA.
 ///
-/// With a magnet link, .torrent file or http(s) URL, streams it. Anything else
-/// searches for anime, movies or series interactively in fzf.
-///
-/// With --json, prints JSON for another program instead: search results, the
-/// torrent's files with --list, or the stream's URLs, for the program to play.
+/// Search terms (or none) open the search in fzf, where Tab switches
+/// category. A magnet link, .torrent file or http(s) URL streams right away.
 #[derive(Parser, Debug)]
 #[command(version = VERSION)]
 struct Cli {
-    /// Magnet link, .torrent file or URL, or search terms
-    #[arg(value_name = "SOURCE | QUERY")]
+    /// Search terms, or a magnet link, .torrent file or URL to stream
+    #[arg(value_name = "QUERY | SOURCE")]
     source: Vec<String>,
 
-    /// HTTP port to serve the stream on (0 = random) [default: 8888, or a
-    /// random one if that's taken]
-    #[arg(short, long)]
-    port: Option<u16>,
+    /// Category to start searching in
+    #[arg(short, long, value_enum, default_value_t = Category::Anime, help_heading = "Search")]
+    category: Category,
 
-    /// Download directory, reused across runs [default: $TMPDIR/peerflix]
-    #[arg(short, long)]
-    dir: Option<PathBuf>,
+    /// Only search this nyaa uploader's anime (name or profile URL)
+    #[arg(short, long, help_heading = "Search")]
+    user: Option<String>,
 
-    /// File index to stream [default: ask when there are several episodes,
-    /// otherwise the largest video]
-    #[arg(short, long)]
+    /// Only search trusted nyaa uploads
+    #[arg(short, long, help_heading = "Search")]
+    trusted: bool,
+
+    /// File to stream, instead of picking the episode in fzf
+    #[arg(short, long, help_heading = "Stream")]
     index: Option<usize>,
 
-    /// List files in the torrent and exit
-    #[arg(short, long)]
-    list: bool,
+    /// Where to keep downloads, reused across runs [default: $TMPDIR/peerflix]
+    #[arg(short, long, help_heading = "Stream")]
+    dir: Option<PathBuf>,
 
-    /// Don't launch IINA, just serve the stream
-    #[arg(short, long)]
+    /// Local HTTP port to serve the stream on [default: 8888, or a free one if
+    /// that's taken; 0 = random]
+    #[arg(short, long, help_heading = "Stream")]
+    port: Option<u16>,
+
+    /// Only serve the stream, without launching IINA
+    #[arg(short, long, help_heading = "Stream")]
     no_play: bool,
 
     /// Don't ask the router to forward the torrent port (UPnP)
-    #[arg(long)]
+    #[arg(long, help_heading = "Stream")]
     no_upnp: bool,
 
-    /// What to search for; Tab switches between them in the search
-    #[arg(short, long, value_enum, default_value_t = Category::Anime)]
-    category: Category,
-
-    /// Only search anime from this nyaa uploader (name or profile URL)
-    #[arg(short, long)]
-    user: Option<String>,
-
-    /// Only search anime from trusted nyaa uploaders
-    #[arg(short, long)]
-    trusted: bool,
-
-    /// Print results for the search terms as fzf input and exit
-    #[arg(long)]
-    print: bool,
-
-    /// Print JSON for programs: search results, --list's files, or the stream's
-    /// URLs once it's served, then serve it without launching IINA until its
-    /// control URL gets a DELETE or no player has been connected for 30 seconds
+    /// Print JSON for programs, such as the IINA plugin (see the README)
     #[arg(long, conflicts_with = "print")]
     json: bool,
+
+    /// Print results for the search terms as fzf input and exit; the live
+    /// search reloads with it
+    #[arg(long, hide = true)]
+    print: bool,
 }
 
 fn main() -> ExitCode {
@@ -259,19 +258,18 @@ async fn stream_torrent(
     let files = torrent_files(&meta);
 
     let eps = episodes(&files);
-    if cli.list {
-        if cli.json {
-            return json::print_files(&mut std::io::stdout().lock(), &files, &eps);
-        }
-        for (i, f) in files.iter().enumerate().filter(|(_, f)| !f.padding) {
-            println!("{i:3}  {:>9}  {}", human_bytes(f.len), f.path);
-        }
-        return Ok(());
-    }
-
-    // A program reading JSON picks with --index, having listed the files.
-    let ask = !cli.json;
-    let Some(id) = select_file(cancel, &files, &eps, cli.index, ask).await? else {
+    let (server, picks) = Server::start(bind_listener(cli.port).await?, cancel.clone())?;
+    let picked = if cli.json {
+        let control = server.control_url();
+        json::print_files(&mut std::io::stdout().lock(), &files, &eps, &control)?;
+        wait_for_pick(cancel, picks, &files, cli.index).await
+    } else {
+        drop(picks);
+        select_file(cancel, &files, &eps, cli.index)
+            .await?
+            .map(|id| (id, None))
+    };
+    let Some((id, reply)) = picked else {
         return Ok(());
     };
     let subs = subtitles(&files, id, eps.len() <= 1);
@@ -284,10 +282,17 @@ async fn stream_torrent(
     else {
         return Ok(());
     };
-    let torrent = torrent?;
+    let torrent = match torrent {
+        Ok(torrent) => torrent,
+        Err(e) => {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(format!("{e:#}")));
+            }
+            return Err(e);
+        }
+    };
 
-    let listener = bind_listener(cli.port).await?;
-    let stream = serve_files(listener, &torrent, &files, id, &subs, cancel.clone())?;
+    let stream = serve_files(&server, &torrent, &files, id, &subs);
     eprintln!(
         "Streaming {} ({})\n{}",
         stream.name,
@@ -297,14 +302,14 @@ async fn stream_torrent(
     if !stream.sub_names.is_empty() {
         eprintln!("Subtitles: {}", stream.sub_names.join(", "));
     }
-    if cli.json {
-        json::print_stream(&mut std::io::stdout().lock(), &stream)?;
+    if let Some(reply) = reply {
+        let _ = reply.send(Ok(json::stream(&stream)));
     }
 
     let player = async {
         if cli.json {
-            // The program that asked plays it; when it's done, no one is.
-            idle(&stream.connections).await;
+            // The program that picked plays it; when it's done, no one is.
+            idle(server.connections()).await;
             Ok(())
         } else if cli.no_play {
             std::future::pending().await
@@ -313,6 +318,37 @@ async fn stream_torrent(
         }
     };
     watch(cancel, player, &torrent, &storage, &files, id, wanted).await
+}
+
+/// Waits for a program to pick a file with a PUT to the control, the file at
+/// default or pick_file's choice when it names none, turning down picks of
+/// files there aren't. Returns the file picked and where to send the stream's
+/// JSON once it's served, or None when cancelled or once PICK_WAIT passes
+/// without a pick.
+async fn wait_for_pick(
+    cancel: &CancellationToken,
+    mut picks: mpsc::Receiver<Pick>,
+    files: &[TorrentFile],
+    default: Option<usize>,
+) -> Option<(usize, Option<oneshot::Sender<Result<String, String>>>)> {
+    let deadline = tokio::time::sleep(PICK_WAIT);
+    tokio::pin!(deadline);
+    loop {
+        let pick = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            _ = &mut deadline => {
+                eprintln!("No file was picked in {} minutes", PICK_WAIT.as_secs() / 60);
+                return None;
+            }
+            pick = picks.recv() => pick?,
+        };
+        match pick_file(files, pick.index.or(default)) {
+            Ok(id) => return Some((id, Some(pick.reply))),
+            Err(e) => {
+                let _ = pick.reply.send(Err(format!("{e:#}")));
+            }
+        }
+    }
 }
 
 /// Shows progress and renames finished files until cancelled or the player
@@ -334,7 +370,6 @@ async fn watch(
     );
     // Progress rewrites one line, which only suits a terminal.
     let tty = std::io::stderr().is_terminal();
-    let mut last_fetched = 0;
     let mut init = torrent.wait_until_initialized();
     let mut initialized = false;
     loop {
@@ -358,19 +393,12 @@ async fn watch(
                 initialized = true;
             }
             _ = ticker.tick() => {
-                if !initialized {
-                    if tty {
-                        eprint!("\r\x1b[KChecking existing data...");
-                    }
-                    continue;
-                }
                 let stats = torrent.stats();
                 complete_files(storage, &stats, files, &mut downloading);
-                let (line, fetched) = progress_line(&stats, id, files[id].len, last_fetched);
                 if tty {
-                    eprint!("\r\x1b[K{line}");
+                    let status = Status::new(&stats, id, files[id].len);
+                    eprint!("\r\x1b[K{}", progress_line(&status));
                 }
-                last_fetched = fetched;
             }
         }
     }
@@ -404,34 +432,32 @@ async fn bind_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
     }
 }
 
-/// Returns the status line for file id of len bytes, and the torrent's
-/// fetched byte count to pass back as last_fetched on the next tick.
-fn progress_line(stats: &TorrentStats, id: usize, len: u64, last_fetched: u64) -> (String, u64) {
-    let done = stats.file_progress.get(id).copied().unwrap_or(0);
-    let (fetched, live, seen) = stats.live.as_ref().map_or((last_fetched, 0, 0), |l| {
-        let s = &l.snapshot;
-        (s.fetched_bytes, s.peer_stats.live, s.peer_stats.seen)
-    });
-    let line = format!(
-        "{:5.1}%  {:>10}/s  {live} peers, {seen} seen",
-        100.0 * done as f64 / len.max(1) as f64,
-        human_bytes(fetched.saturating_sub(last_fetched)),
-    );
-    (line, fetched)
+/// Returns the line the terminal shows the stream's status on, with the same
+/// numbers as the control's JSON.
+fn progress_line(s: &Status) -> String {
+    if s.checking {
+        return "Checking existing data...".into();
+    }
+    format!(
+        "{:5.1}%  {:>10}/s  {} peers, {} seen",
+        100.0 * s.downloaded as f64 / s.size.max(1) as f64,
+        human_bytes(s.download_speed),
+        s.peers,
+        s.seen,
+    )
 }
 
 /// Returns the file to stream: the one at index if given, else one the user
-/// picks in fzf among eps, the torrent's episodes, when there are several,
-/// ask is set and stdin is a terminal, else the one pick_file chooses. None
-/// means peerflix was cancelled meanwhile.
+/// picks in fzf among eps, the torrent's episodes, when there are several and
+/// stdin is a terminal, else the one pick_file chooses. None means peerflix
+/// was cancelled meanwhile.
 async fn select_file(
     cancel: &CancellationToken,
     files: &[TorrentFile],
     eps: &[usize],
     index: Option<usize>,
-    ask: bool,
 ) -> anyhow::Result<Option<usize>> {
-    if index.is_some() || eps.len() < 2 || !ask || !std::io::stdin().is_terminal() {
+    if index.is_some() || eps.len() < 2 || !std::io::stdin().is_terminal() {
         return pick_file(files, index).map(Some);
     }
     let lines: String = eps
@@ -491,6 +517,25 @@ mod tests {
         assert_eq!(cli.user.as_deref(), Some("bob"));
         assert_eq!(cli.category, Category::Series);
         assert_eq!(cli.source, ["-dash query"]);
+    }
+
+    #[test]
+    fn progress_lines() {
+        let mut status = Status {
+            checking: true,
+            downloaded: 50 << 20,
+            size: 200 << 20,
+            download_speed: 3 << 20,
+            upload_speed: 0,
+            peers: 12,
+            seen: 40,
+        };
+        assert_eq!(progress_line(&status), "Checking existing data...");
+        status.checking = false;
+        assert_eq!(
+            progress_line(&status),
+            " 25.0%     3.0 MiB/s  12 peers, 40 seen"
+        );
     }
 
     #[test]

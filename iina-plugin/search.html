@@ -197,7 +197,11 @@
 
     function showResults({ results, note }) {
       lastResults = { results, note };
-      $("crumb").hidden = true;
+      if (!$("crumb").hidden) {
+        // Leaving the episodes, whose torrent peerflix waits with.
+        $("crumb").hidden = true;
+        iina.postMessage("back", null);
+      }
       show(
         results.map((r) => {
           const li = row(r.title, [`${r.date} · ${r.size} · `, health(r), ` · ${r.site}`], () =>
@@ -232,7 +236,7 @@
       $("crumb").hidden = false;
       show(
         episodes.map((e) => {
-          const li = row(e.path, [e.size], () => pick(li, "play", { source, index: e.index }));
+          const li = row(e.path, [e.size], () => pick(li, "play", { source, title, index: e.index }));
           return li;
         }),
         ""
