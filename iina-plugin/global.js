@@ -2,7 +2,7 @@
 // peerflix does the searching and streaming; see --json in its README.
 
 const { global, http, menu, preferences, standaloneWindow: win, utils } = iina;
-const { describe, sleep } = require("./status.js");
+const { describe } = require("./status.js");
 
 // How often the streams' status is shown anew, in milliseconds.
 const POLL = 1000;
@@ -172,6 +172,15 @@ function onMain(promise) {
   return promise.finally(() => sleep(0));
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// The JSON peerflix answered with.
+function body(res) {
+  return res.data || JSON.parse(res.text);
+}
+
 function stop(control) {
   http.delete(control, {}).catch(() => {});
 }
@@ -182,7 +191,7 @@ async function start(control, index) {
   let stream;
   try {
     const res = await onMain(http.put(index == null ? control : `${control}?index=${index}`, {}));
-    stream = res.data || JSON.parse(res.text);
+    stream = body(res);
   } catch (res) {
     return failed(new Error(res.text?.trim() || "peerflix didn't answer."));
   }
@@ -204,7 +213,7 @@ async function watch() {
     for (const [id, { name, control }] of streams) {
       try {
         const res = await onMain(http.get(control, {}));
-        const status = res.data || JSON.parse(res.text);
+        const status = body(res);
         global.postMessage(id, "status", status);
         shown.push({ name, text: describe(status) });
       } catch {

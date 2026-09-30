@@ -3,7 +3,7 @@
 
 function describe(s) {
   if (s.checking) return "Checking downloaded data…";
-  if (s.downloaded >= s.size) return `Downloaded ${bytes(s.size)}`;
+  if (done(s)) return `Downloaded ${bytes(s.size)}`;
   const percent = ((100 * s.downloaded) / Math.max(s.size, 1)).toFixed(1);
   const peers = `${s.peers} ${s.peers === 1 ? "peer" : "peers"}`;
   return `${percent}% of ${bytes(s.size)} · ${bytes(s.download_speed)}/s · ${peers}`;
@@ -25,8 +25,4 @@ function bytes(n) {
   return `${(n / div).toFixed(1)} ${"KMGTPE"[exp]}iB`;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-module.exports = { describe, done, sleep };
+module.exports = { describe, done };

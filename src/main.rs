@@ -14,16 +14,12 @@ use std::{
 use anyhow::Context;
 use clap::Parser;
 use librqbit::{AddTorrent, ManagedTorrent, Session};
-use tokio::{
-    net::TcpListener,
-    signal::unix::SignalKind,
-    sync::{mpsc, oneshot},
-};
+use tokio::{net::TcpListener, signal::unix::SignalKind, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
 use peerflix::{
     search::{Category, Endpoints},
-    stream::{Connections, Pick, Server},
+    stream::{Connections, Pick, Reply, Server},
     torrent::{
         self, Status, add_torrent, complete_files, fetch_metadata,
         files::{TorrentFile, episodes, pick_file, subtitles, torrent_files},
@@ -262,7 +258,9 @@ async fn stream_torrent(
     let picked = if cli.json {
         let control = server.control_url();
         json::print_files(&mut std::io::stdout().lock(), &files, &eps, &control)?;
-        wait_for_pick(cancel, picks, &files, cli.index).await
+        wait_for_pick(cancel, picks, &files, cli.index)
+            .await
+            .map(|(id, reply)| (id, Some(reply)))
     } else {
         drop(picks);
         select_file(cancel, &files, &eps, cli.index)
@@ -330,7 +328,7 @@ async fn wait_for_pick(
     mut picks: mpsc::Receiver<Pick>,
     files: &[TorrentFile],
     default: Option<usize>,
-) -> Option<(usize, Option<oneshot::Sender<Result<String, String>>>)> {
+) -> Option<(usize, Reply)> {
     let deadline = tokio::time::sleep(PICK_WAIT);
     tokio::pin!(deadline);
     loop {
@@ -343,7 +341,7 @@ async fn wait_for_pick(
             pick = picks.recv() => pick?,
         };
         match pick_file(files, pick.index.or(default)) {
-            Ok(id) => return Some((id, Some(pick.reply))),
+            Ok(id) => return Some((id, pick.reply)),
             Err(e) => {
                 let _ = pick.reply.send(Err(format!("{e:#}")));
             }
@@ -517,6 +515,47 @@ mod tests {
         assert_eq!(cli.user.as_deref(), Some("bob"));
         assert_eq!(cli.category, Category::Series);
         assert_eq!(cli.source, ["-dash query"]);
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_file_that_exists() {
+        let files: Vec<_> = ["a.mkv", "b.mkv"]
+            .map(|path| TorrentFile {
+                path: path.into(),
+                len: 1,
+                padding: false,
+            })
+            .into();
+        let cancel = CancellationToken::new();
+        let (picks, received) = mpsc::channel(2);
+        let pick = |index| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            (Pick { index, reply }, answer)
+        };
+        let (bad, bad_answer) = pick(Some(9));
+        let (good, _) = pick(None);
+        picks.send(bad).await.unwrap();
+        picks.send(good).await.unwrap();
+        // A pick of no file in particular streams --index's.
+        let (id, _) = wait_for_pick(&cancel, received, &files, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(id, 1);
+        assert!(
+            bad_answer
+                .await
+                .unwrap()
+                .unwrap_err()
+                .contains("out of range")
+        );
+
+        let (_picks, received) = mpsc::channel(1);
+        cancel.cancel();
+        assert!(
+            wait_for_pick(&cancel, received, &files, None)
+                .await
+                .is_none()
+        );
     }
 
     #[test]

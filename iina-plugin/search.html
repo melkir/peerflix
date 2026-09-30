@@ -96,7 +96,7 @@
     <button id="back">‹ Results</button>
     <span id="crumb-title"></span>
   </nav>
-  <main>
+  <main id="main">
     <ul id="list"></ul>
     <p id="empty" role="status"></p>
   </main>
@@ -136,12 +136,12 @@
       const query = $("query").value;
       // A pasted magnet link or URL plays straight away.
       if (isSource(query)) {
-        const li = row(query.trim(), [], () => pick(li, "choose", { source: query.trim(), title: query.trim() }));
-        show([li], "");
+        const li = row(query.trim(), [], (li) => pick(li, "choose", { source: query.trim(), title: query.trim() }));
+        show([li]);
         li.click();
         return;
       }
-      document.querySelector("main").classList.add("searching");
+      $("main").classList.add("searching");
       if (!$("list").children.length) setEmpty("Searching…");
       iina.postMessage("search", { category, query });
     }
@@ -158,6 +158,7 @@
       }
     }
 
+    // Calls onClick with the row when it's clicked.
     function row(title, meta, onClick) {
       const li = document.createElement("li");
       const t = document.createElement("div");
@@ -169,7 +170,7 @@
       const s = document.createElement("div");
       s.className = "state";
       li.append(t, m, s);
-      li.addEventListener("click", onClick);
+      li.addEventListener("click", () => onClick(li));
       return li;
     }
 
@@ -181,8 +182,8 @@
     }
 
     // Shows rows in the list, with note, if any, after them.
-    function show(rows, note) {
-      document.querySelector("main").classList.remove("searching");
+    function show(rows, note = "") {
+      $("main").classList.remove("searching");
       const items = [...rows];
       if (note) {
         const li = document.createElement("li");
@@ -191,7 +192,7 @@
         items.push(li);
       }
       $("list").replaceChildren(...items);
-      $("list").parentElement.scrollTop = 0;
+      $("main").scrollTop = 0;
       setEmpty("");
     }
 
@@ -203,12 +204,11 @@
         iina.postMessage("back", null);
       }
       show(
-        results.map((r) => {
-          const li = row(r.title, [`${r.date} · ${r.size} · `, health(r), ` · ${r.site}`], () =>
+        results.map((r) =>
+          row(r.title, [`${r.date} · ${r.size} · `, health(r), ` · ${r.site}`], (li) =>
             pick(li, "choose", { source: r.url, title: r.title })
-          );
-          return li;
-        }),
+          )
+        ),
         results.length ? note : ""
       );
       if (!results.length) {
@@ -226,7 +226,7 @@
 
     iina.onMessage("searchFailed", ({ category: c, query, text }) => {
       if (c !== category || query !== $("query").value) return;
-      show([], "");
+      show([]);
       setEmpty(text, true);
     });
 
@@ -234,13 +234,7 @@
       picked = null;
       $("crumb-title").textContent = title;
       $("crumb").hidden = false;
-      show(
-        episodes.map((e) => {
-          const li = row(e.path, [e.size], () => pick(li, "play", { source, title, index: e.index }));
-          return li;
-        }),
-        ""
-      );
+      show(episodes.map((e) => row(e.path, [e.size], (li) => pick(li, "play", { source, title, index: e.index }))));
     });
 
     iina.onMessage("progress", ({ text }) => {

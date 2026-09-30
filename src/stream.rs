@@ -24,10 +24,10 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
-use tokio::sync::{mpsc, oneshot};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
     net::TcpListener,
+    sync::{mpsc, oneshot},
 };
 use tokio_util::{io::ReaderStream, sync::CancellationToken, task::AbortOnDropHandle};
 
@@ -55,8 +55,11 @@ pub const CONTROL_PATH: &str = "peerflix/stream";
 /// or why streaming didn't start.
 pub struct Pick {
     pub index: Option<usize>,
-    pub reply: oneshot::Sender<Result<String, String>>,
+    pub reply: Reply,
 }
+
+/// Where to send a pick's answer: the stream's JSON, or why it didn't start.
+pub type Reply = oneshot::Sender<Result<String, String>>;
 
 /// An HTTP server on localhost for a stream, until dropped.
 ///

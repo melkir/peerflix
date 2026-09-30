@@ -290,8 +290,7 @@ mod tests {
         let (server, _) = Server::start(listener, stop.clone()).unwrap();
         // librqbit's stream() waits for the initial check, which is too quick
         // here to overlap with the requests.
-        let stream = serve_files(&server, &torrent, &files, id, &[]);
-        let url = stream.url;
+        let url = serve_files(&server, &torrent, &files, id, &[]).url;
 
         let client = reqwest::Client::new();
         let resp = client.get(&url).send().await.unwrap();
