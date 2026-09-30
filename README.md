@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/melkir/peerflix/actions/workflows/ci.yml/badge.svg)](https://github.com/melkir/peerflix/actions/workflows/ci.yml)
 
-Stream a torrent straight into [IINA](https://iina.io).
+Search for anime, movies and series, and stream the torrent straight into [IINA](https://iina.io),
+from the terminal or from IINA itself.
 
 <img width="800" height="450" alt="peerflix demo: search, pick a torrent, and it plays in IINA" src="https://github.com/user-attachments/assets/e9a69810-ebc9-4a66-8468-88c7ca1a0085" />
 
@@ -12,17 +13,41 @@ Stream a torrent straight into [IINA](https://iina.io).
 
 ```sh
 mise use -g github:melkir/peerflix                                 # prebuilt Apple Silicon binary
-cargo install --locked --git https://github.com/melkir/peerflix   # builds ~/.cargo/bin/peerflix
+cargo install --locked --git https://github.com/melkir/peerflix   # or build it
 ```
 
-[mise](https://mise.jdx.dev) fetches the binary from [Releases](https://github.com/melkir/peerflix/releases)
-and `mise upgrade` keeps it current; you can also download it from there by hand.
+Search needs [fzf](https://github.com/junegunn/fzf) 0.60 or later on your `PATH`. For fish
+completions, `ln -s (pwd)/completions/peerflix.fish ~/.config/fish/completions/` from a clone.
 
-From a clone, `cargo install --locked --path .` does the same, and
-`ln -s (pwd)/completions/peerflix.fish ~/.config/fish/completions/` adds fish completions.
-To try it without installing, `cargo run --release -- <args>`.
+## Search
 
-## Usage
+```sh
+peerflix                           # browse the newest anime
+peerflix frieren                   # search anime
+peerflix -c movies sintel          # start in movies
+peerflix -c series pioneer one s01 # a season, or S01E03, 1x03
+peerflix -c movies tt1254207       # by IMDb ID (movies and series)
+peerflix -u NAME                   # one nyaa uploader's anime (name or profile URL)
+peerflix -t frieren                # trusted nyaa uploads only
+```
+
+Typing filters the loaded results at once while the sites are searched again for the new query.
+**Tab** and **Shift-Tab** switch between the categories, keeping what you typed; **Enter** streams
+the pick, **Esc** quits.
+
+| category | sites |
+|---|---|
+| anime | nyaa's Anime category, its 75 newest matches |
+| movies | YTS, and The Pirate Bay's SD, HD and 4K movies |
+| series | EZTV, looked up through IMDb, and The Pirate Bay's SD, HD and 4K TV shows |
+
+Each result shows its date, size and seeders, green when they outnumber leechers, yellow when
+even, orange when fewer. Dead torrents are left out, as are cams, telesyncs and screeners among
+movies, and a torrent found on both sites of a category is listed once. The sites are searched in parallel and each
+one's results show as soon as it answers; one that doesn't answer in 8 seconds is named above the
+results.
+
+## Stream
 
 ```sh
 peerflix 'magnet:?xt=urn:btih:...'
@@ -30,155 +55,92 @@ peerflix movie.torrent
 peerflix https://webtorrent.io/torrents/sintel.torrent
 ```
 
-When a torrent holds several episodes, such as a season pack, fzf lists them in order to pick
-one; `--index` skips the question, as does running without a terminal, which streams the largest
-video.
+When the torrent holds several episodes, such as a season pack, fzf lists them to pick one. The
+subtitles that come with the video (`.srt`, `.ass`, `.ssa`, `.vtt`) are loaded in IINA too. While
+it plays, one line shows the video's progress, the download speed and the peers.
 
-Subtitle files (`.srt`, `.ass`, `.ssa`, `.vtt`) that come with the video in the torrent are
-downloaded along with it and loaded in IINA: those named after the episode
-(`Show.S01E03.en.srt`), in a folder named after it (`Subs/Show.S01E03/`) or tagged with the same
-`S01E03`, or all of them when the torrent holds a single video.
+The data stays in `$TMPDIR/peerflix` (or `--dir`), so playing the same torrent again reuses what
+was downloaded. Files are named `NAME.part` until they're complete. peerflix exits when IINA quits,
+or on Ctrl-C.
 
-To try it out, [WebTorrent's free torrents](https://webtorrent.io/free-torrents) are open movies
-such as Sintel and Big Buck Bunny.
+To try it, [WebTorrent's free torrents](https://webtorrent.io/free-torrents) are open movies such as
+Sintel and Big Buck Bunny.
 
-## Search
-
-```sh
-peerflix                                  # type to search anime
-peerflix big buck bunny                   # start with a query
-peerflix -c movies sintel                 # start in movies
-peerflix -c series pioneer one s01        # one season (or S01E03, 1x03) of a show
-peerflix --user NAME                      # browse/search one nyaa uploader's anime
-peerflix --user NAME QUERY
-```
-
-Search has three categories, and Tab (or Shift-Tab to go back) switches between them, keeping
-what you typed. The prompt shows the current one:
-
-- **anime**: nyaa's Anime category, the 75 newest matches, so type an episode number to reach
-  older ones.
-- **movies**: YTS, one line per movie and quality, and The Pirate Bay's SD, HD and 4K movies
-  through its apibay API, both most seeded first. Cams, telesyncs and screeners are left out.
-- **series**: EZTV and The Pirate Bay's SD, HD and 4K TV shows. EZTV only looks up shows by IMDb
-  ID, so the query goes through IMDb's title suggestions first and the best matching show is
-  listed, newest first. A trailing `S02`, `S02E03` or `2x03` narrows EZTV's
-  results to that season or episode.
-
-An IMDb ID instead of a title, such as `tt1254207` or `tt1748166 S02`, looks the movie or show up
-by ID on YTS, EZTV and The Pirate Bay. nyaa has no IMDb IDs.
-
-Before you type anything, anime lists nyaa's newest uploads, movies The Pirate Bay's top 100 HD
-movies, and series its top 100 HD TV shows.
-
-Each result shows its date, size and number of seeders, and in movies and series the site it
-came from. The seeder count is green when seeders outnumber leechers, yellow when they're even,
-and orange when leechers outnumber them.
-Dead torrents, which have no seeders, are left out. When a search finds nothing, or a site
-doesn't answer, a line above the results says so. The sites of a category are queried in parallel,
-and each one's results show up as soon as it answers, so a slow or unreachable site (which gets 8
-seconds) never holds up the other. A torrent the other site already listed isn't shown twice.
-
-Search runs in [fzf](https://github.com/junegunn/fzf) 0.60 or later, which must be on your
-`PATH`. Each keystroke instantly filters the loaded results by title (space separated terms, matches highlighted) while the sites are re-queried in the background for the new query. Enter streams the selection to IINA, Esc quits.
-
-`--print` writes the results for the search terms (with `-c`, for that category) as `URL<TAB>columns` lines, so you can pipe them into your own tools:
-
-```sh
-peerflix --print big buck bunny | fzf --ansi -d '\t' --with-nth 2.. --nth 2 --accept-nth 1 | xargs peerflix
-```
-
-`--json` writes them as one JSON object once every site has answered, for programs that search
-through peerflix: `results`, each with its `site`, `url` (magnet or .torrent), `title`, `date`,
-`size`, `seeders`, `leechers` and `info_hash`, then the sites that failed, as `unanswered` (names)
-and `errors` (messages).
-
-```sh
-peerflix --json -c movies tt1254207 | jq -r '.results[0].url' | xargs peerflix
-```
-
-With a torrent, `--json` is for programs that play it themselves, such as the IINA plugin below:
-
-- `--json --list SOURCE` writes its `files`, each with its `index`, `path` and `size`, and
-  `episodes`, the indexes of the videos worth choosing between, in order.
-- `--json SOURCE` (with `-i` to pick a file) streams without launching IINA, and once the stream is
-  served writes one line with its `name`, `url`, `subtitles` (each a `name` and `url`), `control`
-  and peerflix's `pid`. It serves until a `DELETE` to `control`, until no player has been connected
-  for 30 seconds, or until killed.
-
-A `GET` to `control` (`http://127.0.0.1:PORT/peerflix/stream`) returns how the download is going,
-whatever the flags:
-
-```json
-{"checking":false,"downloaded":314572800,"size":1395864371,"download_speed":4718592,"upload_speed":65536,"peers":14,"seen":52}
-```
-
-`downloaded` and `size` are the streamed file's, in bytes; the speeds, in bytes per second, and the
-peers are the torrent's. `checking` is true while data from an earlier run is being checked.
-
-Flags:
-
-| flag | default | |
-|---|---|---|
-| `-i, --index N` | ask, or largest video | file to stream (see `--list`) |
-| `-l, --list` | | list files and exit |
-| `-p, --port N` | 8888 | local HTTP port (0 = random); a random one if 8888 is taken |
-| `-d, --dir PATH` | `$TMPDIR/peerflix` | where to store data |
-| `--no-upnp` | | don't ask the router to forward the torrent port |
-| `-n, --no-play` | | only serve `http://127.0.0.1:PORT/<name>` |
-| `-c, --category NAME` | anime | category to start searching in: `anime`, `movies` or `series` |
-| `-t, --trusted` | | only search trusted nyaa uploads (anime) |
-| `--print` | | print search results and exit |
-| `--json` | | print JSON for programs: search results, `--list`'s files, or the stream's URLs |
-| `-u, --user NAME` | | restrict anime search to a nyaa uploader, name or profile URL |
-| `-V, --version` | | print the version and exit |
-
-`PEERFLIX_NYAA_URL`, `PEERFLIX_YTS_URL`, `PEERFLIX_EZTV_URL`, `PEERFLIX_TPB_URL` and `PEERFLIX_IMDB_URL` point search
-at other hosts, such as a mirror when a site moves, or a local mock.
-
-peerflix exits when IINA quits (or on Ctrl-C). Downloaded data stays in the data directory, so
-playing the same torrent again checks and reuses it instead of downloading it again. Only the files
-being downloaded are created there, named `NAME.part` until they're complete; a neighbouring file
-that shares a piece with them can also be left as a small `.part`. macOS clears `$TMPDIR` of files
-unused for a few days; use `--dir` to keep data somewhere else.
+| flag | |
+|---|---|
+| `-c, --category NAME` | category to start searching in: `anime` (default), `movies` or `series` |
+| `-u, --user NAME` | only search this nyaa uploader's anime |
+| `-t, --trusted` | only search trusted nyaa uploads |
+| `-i, --index N` | file to stream, instead of picking the episode in fzf |
+| `-d, --dir PATH` | where to keep downloads (default `$TMPDIR/peerflix`) |
+| `-p, --port N` | local HTTP port (default 8888, or a free one if taken; 0 = random) |
+| `-n, --no-play` | only serve `http://127.0.0.1:PORT/<name>`, without launching IINA |
+| `--no-upnp` | don't ask the router to forward the torrent port |
+| `--json` | print JSON for programs, see below |
 
 ## IINA plugin
 
-[`iina-plugin/`](iina-plugin) searches and streams from inside IINA: **Plugin › Search Torrents…**
-opens a window with the three categories, where typing searches as in fzf (titles, IMDb IDs, or a
-pasted magnet link). Picking a torrent opens it in a new player with its subtitles, after asking
-which episode when it holds several. The player shows the download's progress, speed and peers in a
-corner until the file is downloaded (**Plugin › Show Download Status** hides it), as does the search
-window's bottom bar for every stream playing, and the stream stops as soon as the player closes. It
-runs peerflix with `--json` underneath.
+**Plugin › Search Torrents…** opens the same search in a window: type, switch category, pick a
+torrent (and an episode when it holds several), and it plays in a new player with its subtitles.
+The player shows the download's progress, speed and peers in a corner until the file is downloaded
+(**Plugin › Show Download Status** hides it), and so does a bar at the bottom of the search window
+for every stream playing. Closing the player stops the stream.
 
-To install it, enter `melkir/peerflix` under **Settings › Plugins › Install from GitHub…** in IINA,
-which installs the plugin attached to the latest release; doing it again updates it. It needs
-peerflix 0.5.0 or later, which it looks for in the `PATH`, `~/.cargo/bin`, `/opt/homebrew/bin`,
-`/usr/local/bin`, then mise's shims, or where the plugin's preferences say. With peerflix 0.5.0, it
-shows no download status, and a stream stops 30 seconds after its player closes.
+To install it, enter `melkir/peerflix` under **Settings › Plugins › Install from GitHub…** in IINA;
+doing it again updates it. It runs the peerflix of the same release, which it looks for in the
+`PATH`, `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, then mise's shims, or where its
+preferences say.
 
-To work on it, link the folder into IINA's plugins instead, and restart IINA after changes:
+To work on it, link the folder into IINA's plugins, and restart IINA after changes:
 
 ```sh
 ln -s (pwd)/iina-plugin ~/Library/Application\ Support/com.colliderli.iina/plugins/peerflix.iinaplugin-dev
 ```
 
-## Development
+## JSON
 
-[mise](https://mise.jdx.dev) installs the pinned Rust toolchain and cargo-release and runs the
-same tasks as CI:
+`--json` is how programs such as the plugin search and stream through peerflix.
+
+With search terms, it writes one line once every site has answered: `results`, each with its
+`site`, `url` (magnet or .torrent), `title`, `date`, `size`, `seeders`, `leechers` and `info_hash`,
+and the sites that failed, as `unanswered` names and `errors`.
 
 ```sh
-mise install          # install the tools
+peerflix --json -c movies tt1254207 | jq -r '.results[0].url' | xargs peerflix
+```
+
+With a torrent, it writes the torrent's `files` (each an `index`, `path` and `size`), its
+`episodes` (the indexes worth choosing between, in order) and a `control` URL, then waits for the
+program there:
+
+- `PUT control` streams the largest video, or `PUT control?index=N` file N, and answers with the
+  stream's `name`, `url` and `subtitles` (each a `name` and `url`).
+- `GET control` answers with the stream's status, as in
+  `{"checking":false,"downloaded":314572800,"size":1395864371,"download_speed":4718592,"upload_speed":65536,"peers":14,"seen":52}`:
+  the video's bytes, the torrent's bytes per second and peers, and whether data from an earlier
+  run is still being checked.
+- `DELETE control` stops peerflix.
+
+peerflix also stops 10 minutes after listing the files if nothing was picked, and 30 seconds
+after the last player disconnects.
+
+`PEERFLIX_NYAA_URL`, `PEERFLIX_YTS_URL`, `PEERFLIX_EZTV_URL`, `PEERFLIX_TPB_URL` and
+`PEERFLIX_IMDB_URL` point search at other hosts, such as a mirror when a site moves, or a mock.
+
+## Development
+
+[mise](https://mise.jdx.dev) installs the pinned toolchain and runs the same checks as CI:
+
+```sh
+mise install
 mise run ci           # fmt check, clippy, test and build
 ```
 
-To release, run [cargo-release](https://github.com/crate-ci/cargo-release) on `main`. It bumps
-the version in `Cargo.toml`, commits, tags `vX.Y.Z` and pushes; the tag makes GitHub Actions
-build the Apple Silicon binary and publish the release:
+To release, run [cargo-release](https://github.com/crate-ci/cargo-release) on `main`: it bumps the
+version (the plugin's too), tags `vX.Y.Z` and pushes, and the tag has GitHub Actions publish the
+binary and the plugin.
 
 ```sh
-cargo release patch            # dry run
-cargo release patch --execute
+cargo release minor            # dry run
+cargo release minor --execute
 ```
