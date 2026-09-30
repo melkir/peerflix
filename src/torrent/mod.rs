@@ -12,12 +12,13 @@ use anyhow::{Context, bail};
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
     ListenerOptions, ManagedTorrent, PeerConnectionOptions, Session, SessionOptions, TorrentStats,
-    storage::StorageFactoryExt,
+    TorrentStatsState, storage::StorageFactoryExt,
 };
+use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
-use crate::stream::{self, Connections, Reader, path_escape};
+use crate::stream::{self, CONTROL_PATH, Connections, Control, Reader, path_escape};
 use files::TorrentFile;
 use storage::PartStorage;
 
@@ -105,18 +106,56 @@ pub struct Stream {
     /// The names and URLs of the subtitles served alongside.
     pub sub_names: Vec<String>,
     pub sub_urls: Vec<String>,
+    /// Where to GET the stream's Status, or DELETE to stop streaming.
+    pub control_url: String,
     /// The connections players have open to the stream.
     pub connections: Connections,
     _server: AbortOnDropHandle<()>,
 }
 
-/// Starts serving file id of torrent and its subtitles subs on listener.
+/// How the streamed file's download is going.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Status {
+    /// Whether the data already on disk is still being checked, which comes
+    /// before downloading.
+    pub checking: bool,
+    /// Bytes of the file downloaded, of its size.
+    pub downloaded: u64,
+    pub size: u64,
+    /// Bytes per second, for the whole torrent.
+    pub download_speed: u64,
+    pub upload_speed: u64,
+    /// Peers connected, and seen in all.
+    pub peers: u32,
+    pub seen: u32,
+}
+
+impl Status {
+    /// The status of file id, of size bytes, given the torrent's stats.
+    pub fn new(stats: &TorrentStats, id: usize, size: u64) -> Status {
+        let live = stats.live.as_ref();
+        let peers = live.map(|l| &l.snapshot.peer_stats);
+        Status {
+            checking: matches!(stats.state, TorrentStatsState::Initializing { .. }),
+            downloaded: stats.file_progress.get(id).copied().unwrap_or(0),
+            size,
+            download_speed: live.map_or(0, |l| l.download_speed.as_bytes()),
+            upload_speed: live.map_or(0, |l| l.upload_speed.as_bytes()),
+            peers: peers.map_or(0, |p| p.live),
+            seen: peers.map_or(0, |p| p.seen),
+        }
+    }
+}
+
+/// Starts serving file id of torrent and its subtitles subs on listener,
+/// with its Status and a way to cancel stop at the control URL.
 pub fn serve_files(
     listener: TcpListener,
     torrent: &Arc<ManagedTorrent>,
     files: &[TorrentFile],
     id: usize,
     subs: &[usize],
+    stop: CancellationToken,
 ) -> anyhow::Result<Stream> {
     let base = format!("http://{}", listener.local_addr()?);
     let name = served_name(&files[id].path, &[]);
@@ -130,20 +169,35 @@ pub fn serve_files(
         let sub_name = served_name(&files[i].path, &served);
         served.push(torrent_file(torrent.clone(), i, sub_name, files[i].len));
     }
+    let control = control(torrent.clone(), id, files[id].len, stop);
     let connections = Connections::default();
     let url_of = |name: &str| format!("{base}/{}", path_escape(name));
     Ok(Stream {
         url: url_of(&name),
         sub_urls: served[1..].iter().map(|f| url_of(&f.name)).collect(),
         sub_names: served[1..].iter().map(|f| f.name.clone()).collect(),
+        control_url: format!("{base}/{CONTROL_PATH}"),
         name,
         connections: connections.clone(),
         _server: AbortOnDropHandle::new(tokio::spawn(stream::serve(
             listener,
-            served.into(),
+            served,
+            control,
             connections,
         ))),
     })
+}
+
+/// The control of the stream of file id of torrent, of size bytes: its
+/// Status, and cancelling stop to end it.
+fn control(torrent: Arc<ManagedTorrent>, id: usize, size: u64, stop: CancellationToken) -> Control {
+    Control {
+        status: Box::new(move || {
+            let status = Status::new(&torrent.stats(), id, size);
+            serde_json::to_string(&status).expect("Status serializes")
+        }),
+        stop,
+    }
 }
 
 /// Drops their .part suffix from the downloading files that have finished,
@@ -248,13 +302,16 @@ mod tests {
             .unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/video.mkv", listener.local_addr().unwrap());
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("{base}/video.mkv");
         // librqbit's stream() waits for the initial check, which is too quick
         // here to overlap with the requests.
         let file = torrent_file(torrent.clone(), id, "video.mkv".into(), files[id].len);
+        let stop = CancellationToken::new();
         let _server = AbortOnDropHandle::new(tokio::spawn(stream::serve(
             listener,
-            Arc::new([file]),
+            vec![file],
+            control(torrent.clone(), id, files[id].len, stop.clone()),
             Connections::default(),
         )));
 
@@ -270,6 +327,21 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 206);
         assert_eq!(resp.text().await.unwrap(), data[20000..20010]);
+
+        let control = format!("{base}/{CONTROL_PATH}");
+        let status: serde_json::Value = client
+            .get(&control)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["checking"], false);
+        assert_eq!(status["downloaded"], data.len());
+        assert_eq!(status["size"], data.len());
+        client.delete(&control).send().await.unwrap();
+        assert!(stop.is_cancelled());
         session.stop().await;
     }
 }

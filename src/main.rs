@@ -104,8 +104,8 @@ struct Cli {
     print: bool,
 
     /// Print JSON for programs: search results, --list's files, or the stream's
-    /// URLs once it's served, then serve it without launching IINA until no
-    /// player has been connected for 30 seconds
+    /// URLs once it's served, then serve it without launching IINA until its
+    /// control URL gets a DELETE or no player has been connected for 30 seconds
     #[arg(long, conflicts_with = "print")]
     json: bool,
 }
@@ -287,7 +287,7 @@ async fn stream_torrent(
     let torrent = torrent?;
 
     let listener = bind_listener(cli.port).await?;
-    let stream = serve_files(listener, &torrent, &files, id, &subs)?;
+    let stream = serve_files(listener, &torrent, &files, id, &subs, cancel.clone())?;
     eprintln!(
         "Streaming {} ({})\n{}",
         stream.name,

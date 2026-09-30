@@ -83,7 +83,8 @@ pub fn print_files(w: &mut impl Write, files: &[TorrentFile], eps: &[usize]) -> 
 }
 
 /// Writes the stream being served as a JSON line: its name and url, its
-/// subtitles, each with a name and url, and peerflix's pid, to stop it with.
+/// subtitles, each with a name and url, its control URL, to GET its status
+/// from or DELETE to stop it, and peerflix's pid.
 pub fn print_stream(w: &mut impl Write, stream: &Stream) -> anyhow::Result<()> {
     #[derive(Serialize)]
     struct Subtitle<'a> {
@@ -95,6 +96,7 @@ pub fn print_stream(w: &mut impl Write, stream: &Stream) -> anyhow::Result<()> {
         name: &'a str,
         url: &'a str,
         subtitles: Vec<Subtitle<'a>>,
+        control: &'a str,
         pid: u32,
     }
     let subtitles = stream
@@ -109,6 +111,7 @@ pub fn print_stream(w: &mut impl Write, stream: &Stream) -> anyhow::Result<()> {
             name: &stream.name,
             url: &stream.url,
             subtitles,
+            control: &stream.control_url,
             pid: std::process::id(),
         },
     )?;

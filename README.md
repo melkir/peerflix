@@ -102,8 +102,19 @@ With a torrent, `--json` is for programs that play it themselves, such as the II
 - `--json --list SOURCE` writes its `files`, each with its `index`, `path` and `size`, and
   `episodes`, the indexes of the videos worth choosing between, in order.
 - `--json SOURCE` (with `-i` to pick a file) streams without launching IINA, and once the stream is
-  served writes one line with its `name`, `url`, `subtitles` (each a `name` and `url`) and
-  peerflix's `pid`. It serves until no player has been connected for 30 seconds, or until killed.
+  served writes one line with its `name`, `url`, `subtitles` (each a `name` and `url`), `control`
+  and peerflix's `pid`. It serves until a `DELETE` to `control`, until no player has been connected
+  for 30 seconds, or until killed.
+
+A `GET` to `control` (`http://127.0.0.1:PORT/peerflix/stream`) returns how the download is going,
+whatever the flags:
+
+```json
+{"checking":false,"downloaded":314572800,"size":1395864371,"download_speed":4718592,"upload_speed":65536,"peers":14,"seen":52}
+```
+
+`downloaded` and `size` are the streamed file's, in bytes; the speeds, in bytes per second, and the
+peers are the torrent's. `checking` is true while data from an earlier run is being checked.
 
 Flags:
 
