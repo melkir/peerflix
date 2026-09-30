@@ -2,13 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>peerflix</title>
+  <title>Search Torrents</title>
   <style>
     :root {
       color-scheme: light dark;
       --muted: color-mix(in srgb, CanvasText 55%, transparent);
       --line: color-mix(in srgb, CanvasText 12%, transparent);
       --hover: color-mix(in srgb, CanvasText 7%, transparent);
+      --bar: color-mix(in srgb, CanvasText 4%, Canvas);
       --good: #2f9e44;
       --even: #c28a00;
       --bad: #e8590c;
@@ -23,7 +24,8 @@
       height: 100vh;
     }
     header { padding: 12px; border-bottom: 1px solid var(--line); }
-    .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+    input[type="search"] { width: 100%; padding: 6px 8px; font: inherit; }
+    .tabs { display: flex; gap: 4px; margin-top: 8px; }
     .tabs button {
       flex: 1;
       padding: 4px 0;
@@ -34,59 +36,119 @@
       font: inherit;
     }
     .tabs button[aria-pressed="true"] { background: AccentColor; color: AccentColorText; border-color: AccentColor; }
-    input[type="search"] { width: 100%; padding: 6px 8px; font: inherit; }
-    #status { margin-top: 8px; color: var(--muted); min-height: 1.3em; }
-    #status.error { color: var(--bad); }
-    #back { display: none; margin-bottom: 8px; }
+    #crumb {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    #crumb[hidden] { display: none; }
+    #crumb-title { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     main { flex: 1; overflow-y: auto; }
+    #list { transition: opacity 0.15s; }
+    main.searching #list { opacity: 0.5; }
     ul { list-style: none; margin: 0; padding: 0; }
     li { padding: 8px 12px; border-bottom: 1px solid var(--line); cursor: default; }
     li:hover { background: var(--hover); }
     .title { overflow-wrap: anywhere; }
-    .meta { margin-top: 2px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .meta, .state, .note { margin-top: 2px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .state:empty { display: none; }
+    li.failed .state { color: var(--bad); }
+    li.pending .state::before {
+      content: "";
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      margin-right: 6px;
+      border: 1.5px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 50%;
+      vertical-align: -1px;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { li.pending .state::before { animation: none; } }
+    li.note:hover { background: none; }
+    #empty { padding: 24px 12px; margin: 0; text-align: center; color: var(--muted); }
+    #empty:empty { display: none; }
+    #empty.error { color: var(--bad); }
     .good { color: var(--good); }
     .even { color: var(--even); }
     .bad { color: var(--bad); }
+    footer { border-top: 1px solid var(--line); background: var(--bar); font-size: 11px; }
+    footer:empty { display: none; }
+    footer div { display: flex; gap: 12px; padding: 5px 12px; font-variant-numeric: tabular-nums; }
+    footer .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    footer .text { color: var(--muted); white-space: nowrap; }
   </style>
 </head>
 <body>
   <header>
+    <input type="search" id="query" placeholder="Title, IMDb ID (tt1254207), or a magnet link" autofocus />
     <div class="tabs" role="group" aria-label="Category">
       <button data-category="anime">Anime</button>
       <button data-category="movies">Movies</button>
       <button data-category="series">Series</button>
     </div>
-    <button id="back">‹ Results</button>
-    <input type="search" id="query" placeholder="Title, IMDb ID (tt1254207), or a magnet link" autofocus />
-    <div id="status" role="status"></div>
   </header>
-  <main><ul id="list"></ul></main>
+  <nav id="crumb" hidden>
+    <button id="back">‹ Results</button>
+    <span id="crumb-title"></span>
+  </nav>
+  <main>
+    <ul id="list"></ul>
+    <p id="empty" role="status"></p>
+  </main>
+  <footer id="streams" role="status" aria-label="Streams"></footer>
 
   <script>
     const $ = (id) => document.getElementById(id);
     let category = "anime";
     let timer = null;
     let lastResults = null;
-    // Set while a picked result is starting, so a second click doesn't
-    // start it twice; the plugin's next message clears it.
-    let busy = false;
+    // The row picked and starting, which shows how it goes; while it's set,
+    // other picks wait.
+    let picked = null;
 
-    // Sends a pick to the plugin, unless one is already starting.
-    function pick(name, data) {
-      if (busy) return;
-      busy = true;
+    function isSource(query) {
+      return /^(magnet:|https?:\/\/)/.test(query.trim());
+    }
+
+    // Sends a pick to the plugin, unless another one is starting.
+    function pick(li, name, data) {
+      if (picked) return;
+      for (const other of document.querySelectorAll("li.failed")) setState(other, "");
+      picked = li;
+      setState(li, name === "choose" ? "Fetching files…" : "Starting…", "pending");
       iina.postMessage(name, data);
+    }
+
+    // Shows text under the row's details, as kind ("pending" or "failed").
+    function setState(li, text, kind) {
+      li.classList.remove("pending", "failed");
+      if (kind) li.classList.add(kind);
+      li.querySelector(".state").textContent = text;
     }
 
     function search() {
       clearTimeout(timer);
-      setStatus("Searching…");
-      iina.postMessage("search", { category, query: $("query").value });
+      const query = $("query").value;
+      // A pasted magnet link or URL plays straight away.
+      if (isSource(query)) {
+        const li = row(query.trim(), [], () => pick(li, "choose", { source: query.trim(), title: query.trim() }));
+        show([li], "");
+        li.click();
+        return;
+      }
+      document.querySelector("main").classList.add("searching");
+      if (!$("list").children.length) setEmpty("Searching…");
+      iina.postMessage("search", { category, query });
     }
 
-    function setStatus(text, error = false) {
-      $("status").textContent = text;
-      $("status").classList.toggle("error", error);
+    function setEmpty(text, error = false) {
+      $("empty").textContent = text;
+      $("empty").classList.toggle("error", error);
     }
 
     function setCategory(name) {
@@ -104,7 +166,9 @@
       const m = document.createElement("div");
       m.className = "meta";
       m.append(...meta);
-      li.append(t, m);
+      const s = document.createElement("div");
+      s.className = "state";
+      li.append(t, m, s);
       li.addEventListener("click", onClick);
       return li;
     }
@@ -116,20 +180,38 @@
       return span;
     }
 
+    // Shows rows in the list, with note, if any, after them.
+    function show(rows, note) {
+      document.querySelector("main").classList.remove("searching");
+      const items = [...rows];
+      if (note) {
+        const li = document.createElement("li");
+        li.className = "note";
+        li.textContent = note;
+        items.push(li);
+      }
+      $("list").replaceChildren(...items);
+      $("list").parentElement.scrollTop = 0;
+      setEmpty("");
+    }
+
     function showResults({ results, note }) {
       lastResults = { results, note };
-      $("back").style.display = "none";
-      $("list").replaceChildren(
-        ...results.map((r) =>
-          row(r.title, [`${r.date} · ${r.size} · `, health(r), ` · ${r.site}`], () =>
-            pick("choose", { source: r.url, title: r.title })
-          )
-        )
+      $("crumb").hidden = true;
+      show(
+        results.map((r) => {
+          const li = row(r.title, [`${r.date} · ${r.size} · `, health(r), ` · ${r.site}`], () =>
+            pick(li, "choose", { source: r.url, title: r.title })
+          );
+          return li;
+        }),
+        results.length ? note : ""
       );
-      $("list").parentElement.scrollTop = 0;
-      const q = $("query").value.trim();
-      const none = results.length ? "" : q ? `No ${category} results for “${q}”.` : `No ${category} to show.`;
-      setStatus([note, none].filter(Boolean).join(" "));
+      if (!results.length) {
+        const q = $("query").value.trim();
+        const none = q ? `No ${category} results for “${q}”.` : `No ${category} to show.`;
+        setEmpty([none, note].filter(Boolean).join(" "));
+      }
     }
 
     iina.onMessage("results", (data) => {
@@ -138,22 +220,54 @@
       showResults(data);
     });
 
-    iina.onMessage("episodes", ({ source, title, episodes }) => {
-      busy = false;
-      $("back").style.display = "block";
-      $("list").replaceChildren(
-        ...episodes.map((e) =>
-          row(e.path, [e.size], () => pick("play", { source, index: e.index, title: e.path }))
-        )
-      );
-      $("list").parentElement.scrollTop = 0;
-      setStatus(`${title}: pick an episode.`);
+    iina.onMessage("searchFailed", ({ category: c, query, text }) => {
+      if (c !== category || query !== $("query").value) return;
+      show([], "");
+      setEmpty(text, true);
     });
 
-    iina.onMessage("status", ({ text, error }) => {
-      // An empty status means the stream started; an error, that it didn't.
-      if (!text || error) busy = false;
-      setStatus(text, error);
+    iina.onMessage("episodes", ({ source, title, episodes }) => {
+      picked = null;
+      $("crumb-title").textContent = title;
+      $("crumb").hidden = false;
+      show(
+        episodes.map((e) => {
+          const li = row(e.path, [e.size], () => pick(li, "play", { source, index: e.index }));
+          return li;
+        }),
+        ""
+      );
+    });
+
+    iina.onMessage("progress", ({ text }) => {
+      if (picked) setState(picked, text, "pending");
+    });
+
+    iina.onMessage("started", () => {
+      if (picked) setState(picked, "");
+      picked = null;
+    });
+
+    iina.onMessage("failed", ({ text }) => {
+      if (picked) setState(picked, text, "failed");
+      picked = null;
+    });
+
+    // Each stream being played, with how its download is going.
+    iina.onMessage("streams", (streams) => {
+      $("streams").replaceChildren(
+        ...streams.map(({ name, text }) => {
+          const div = document.createElement("div");
+          const n = document.createElement("span");
+          n.className = "name";
+          n.textContent = name;
+          const t = document.createElement("span");
+          t.className = "text";
+          t.textContent = text;
+          div.append(n, t);
+          return div;
+        })
+      );
     });
 
     $("back").addEventListener("click", () => lastResults && showResults(lastResults));

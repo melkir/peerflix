@@ -9,7 +9,8 @@
   },
   "entry": "main.js",
   "globalEntry": "global.js",
-  "permissions": ["file-system"],
+  "permissions": ["file-system", "network-request", "video-overlay"],
+  "allowedDomains": ["127.0.0.1"],
   "preferencesPage": "pref.html",
   "preferenceDefaults": {
     "peerflix_path": ""

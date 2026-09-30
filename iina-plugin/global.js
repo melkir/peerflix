@@ -1,7 +1,11 @@
 // The search window, and the players it opens on peerflix's streams.
 // peerflix does the searching and streaming; see --json in its README.
 
-const { global, menu, preferences, standaloneWindow: win, utils } = iina;
+const { global, http, menu, preferences, standaloneWindow: win, utils } = iina;
+const { describe, sleep } = require("./status.js");
+
+// How often the streams' status is shown anew, in milliseconds.
+const POLL = 1000;
 
 // Where peerflix is looked for when its preference is empty. Apps started
 // from the Dock don't get the shell's PATH. mise's shim comes last, as it
@@ -45,9 +49,12 @@ done
 /bin/rm -f "$out" "$err"
 `;
 
-// The subtitles of the players opened on streams, by player ID, until the
-// player asks for them.
-const subtitles = {};
+// The streams players were opened on, each a name and control URL, by
+// player ID, until the player closes.
+const streams = new Map();
+// Whether the streams' status is being sent to their players and the search
+// window.
+let watching = false;
 
 // Counts searches, so that a slow one can't replace a newer one's results.
 let searches = 0;
@@ -56,11 +63,12 @@ menu.addItem(menu.item("Search Torrents…", showWindow));
 
 function showWindow() {
   win.loadFile("search.html");
-  win.setProperty({ title: "peerflix", resizable: true, hideTitleBar: false });
+  // IINA adds " — peerflix", the plugin's name.
+  win.setProperty({ title: "Search Torrents", resizable: true, hideTitleBar: false });
   win.setFrame(560, 640);
   win.onMessage("search", search);
   win.onMessage("choose", choose);
-  win.onMessage("play", ({ source, index, title }) => play(source, index, title));
+  win.onMessage("play", play);
   win.open();
 }
 
@@ -94,19 +102,7 @@ async function run(args) {
   return res.stdout;
 }
 
-function isSource(query) {
-  return /^(magnet:|https?:\/\/)/.test(query.trim());
-}
-
-function status(text, error = false) {
-  win.postMessage("status", { text, error });
-}
-
 async function search({ category, query }) {
-  // A pasted magnet link or URL plays straight away.
-  if (isSource(query)) {
-    return choose({ source: query.trim(), title: query.trim() });
-  }
   const id = ++searches;
   try {
     const out = JSON.parse(await run(["--json", "-c", category, "--", query]));
@@ -115,27 +111,39 @@ async function search({ category, query }) {
     const note = failed.concat(out.errors.map((e) => `${e}.`)).join(" ");
     win.postMessage("results", { category, query, results: out.results, note });
   } catch (e) {
-    if (id === searches) status(e.message, true);
+    if (id === searches) win.postMessage("searchFailed", { category, query, text: e.message });
   }
 }
 
-// Plays source, or lists its episodes to pick from when it has several.
+// The search window shows how a picked torrent is starting on its row.
+function progress(text) {
+  win.postMessage("progress", { text });
+}
+
+function failed(e) {
+  win.postMessage("failed", { text: e.message });
+}
+
+// Plays source, or lists its episodes to pick from when it has several. The
+// search window shows "Fetching files…" meanwhile.
 async function choose({ source, title }) {
-  status(`Fetching the files of ${title}…`);
   try {
     const { files, episodes } = JSON.parse(await run(["--json", "--list", "--", source]));
-    if (episodes.length < 2) return play(source, null, title);
+    if (episodes.length < 2) {
+      progress("Starting…");
+      return play({ source, index: null });
+    }
     const byIndex = Object.fromEntries(files.map((f) => [f.index, f]));
     win.postMessage("episodes", { source, title, episodes: episodes.map((i) => byIndex[i]) });
   } catch (e) {
-    status(e.message, true);
+    failed(e);
   }
 }
 
 // Streams file index of source, or the torrent's largest video, in a new
-// player. peerflix serves it until no player has been connected for a while.
-async function play(source, index, title) {
-  status(`Starting ${title}…`);
+// player. peerflix serves it until the player closes. The search window shows
+// "Starting…" meanwhile.
+async function play({ source, index }) {
   const args = ["--json"];
   if (index != null) args.push("-i", String(index));
   args.push("--", source);
@@ -143,20 +151,51 @@ async function play(source, index, title) {
     const stream = JSON.parse(await run(args));
     // exec resolves on the main thread, where IINA must create windows.
     const id = global.createPlayerInstance({ url: stream.url, label: "peerflix", enablePlugins: true });
-    subtitles[id] = stream.subtitles.map((s) => s.url);
-    status("");
+    // The player's main.js has run by now, though its video may not have loaded.
+    global.postMessage(id, "subtitles", stream.subtitles.map((s) => s.url));
+    win.postMessage("started", null);
+    // peerflix 0.5.0 has no control URL to get the status from.
+    if (stream.control) {
+      streams.set(id, { name: stream.name, control: stream.control });
+      watch();
+    }
   } catch (e) {
-    status(e.message, true);
+    failed(e);
   }
 }
 
-// A player opened on a stream asks for its subtitles once the video loads.
-// IINA names the players it opens for plugins "<id>-<plugin identifier>".
-global.onMessage("loaded", (_, player) => {
-  const id = parseInt(player, 10);
-  const urls = subtitles[id];
-  if (urls) {
-    delete subtitles[id];
-    global.postMessage(id, "subtitles", urls);
+// Sends each stream's status to its player, and all of them to the search
+// window, anew every POLL until none is left.
+async function watch() {
+  if (watching) return;
+  watching = true;
+  while (streams.size) {
+    const shown = [];
+    for (const [id, { name, control }] of streams) {
+      try {
+        const res = await http.get(control, {});
+        const status = res.data || JSON.parse(res.text);
+        global.postMessage(id, "status", status);
+        shown.push({ name, text: describe(status) });
+      } catch {
+        // peerflix is gone; there's nothing to show.
+      }
+    }
+    win.postMessage("streams", shown);
+    await sleep(POLL);
   }
+  win.postMessage("streams", []);
+  watching = false;
+}
+
+// A player that closes is done with its stream. Should this not get through,
+// peerflix still stops on its own once no player has been connected for 30
+// seconds. IINA names the players it opens for plugins "<id>-<plugin
+// identifier>".
+global.onMessage("closed", (_, player) => {
+  const id = parseInt(player, 10);
+  const stream = streams.get(id);
+  if (!stream) return;
+  streams.delete(id);
+  http.delete(stream.control, {}).catch(() => {});
 });

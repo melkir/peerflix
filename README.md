@@ -147,13 +147,16 @@ unused for a few days; use `--dir` to keep data somewhere else.
 [`iina-plugin/`](iina-plugin) searches and streams from inside IINA: **Plugin › Search Torrents…**
 opens a window with the three categories, where typing searches as in fzf (titles, IMDb IDs, or a
 pasted magnet link). Picking a torrent opens it in a new player with its subtitles, after asking
-which episode when it holds several, and the stream stops shortly after the player closes. It runs
-peerflix with `--json` underneath.
+which episode when it holds several. The player shows the download's progress, speed and peers in a
+corner until the file is downloaded (**Plugin › Show Download Status** hides it), as does the search
+window's bottom bar for every stream playing, and the stream stops as soon as the player closes. It
+runs peerflix with `--json` underneath.
 
 To install it, enter `melkir/peerflix` under **Settings › Plugins › Install from GitHub…** in IINA,
 which installs the plugin attached to the latest release; doing it again updates it. It needs
 peerflix 0.5.0 or later, which it looks for in the `PATH`, `~/.cargo/bin`, `/opt/homebrew/bin`,
-`/usr/local/bin`, then mise's shims, or where the plugin's preferences say.
+`/usr/local/bin`, then mise's shims, or where the plugin's preferences say. With peerflix 0.5.0, it
+shows no download status, and a stream stops 30 seconds after its player closes.
 
 To work on it, link the folder into IINA's plugins instead, and restart IINA after changes:
 
