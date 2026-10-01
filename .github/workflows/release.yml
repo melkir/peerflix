@@ -37,7 +37,7 @@ jobs:
           (cd iina-plugin && zip -qrX "../$plugin" . -x '.*')
           # No platform in the name, so mise installs the tarball, not the app.
           app="peerflix-app-$GITHUB_REF_NAME.zip"
-          ditto -c -k --keepParent target/app/peerflix.app "$app"
+          ditto -c -k --keepParent target/app/Peerflix.app "$app"
           shasum -a 256 "$name.tar.gz" "$plugin" "$app" > checksums.txt
       - run: gh release create "$GITHUB_REF_NAME" --generate-notes *.tar.gz *.iinaplgz *.zip checksums.txt
         env:

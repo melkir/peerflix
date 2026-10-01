@@ -8,6 +8,7 @@ use librqbit::ListOnlyResponse;
 
 use crate::http::content_type;
 
+#[derive(Clone)]
 pub struct TorrentFile {
     pub path: String,
     pub len: u64,

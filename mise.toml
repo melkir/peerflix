@@ -7,7 +7,7 @@ description = "Build target/release/peerflix"
 run = "cargo build --release --locked"
 
 [tasks.app]
-description = "Build target/app/peerflix.app"
+description = "Build target/app/Peerflix.app"
 run = "crates/peerflix-app/bundle.sh"
 
 [tasks.lint]

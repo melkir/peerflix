@@ -85,8 +85,8 @@ fn main() {
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.set_menus([Menu {
-                name: "peerflix".into(),
-                items: vec![MenuItem::action("Quit peerflix", Quit)],
+                name: "Peerflix".into(),
+                items: vec![MenuItem::action("Quit Peerflix", Quit)],
                 disabled: false,
             }]);
             // Stop the streams, which closes their players and names their
@@ -108,7 +108,7 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("peerflix".into()),
+                    title: Some("Peerflix".into()),
                     ..Default::default()
                 }),
                 ..Default::default()

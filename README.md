@@ -103,10 +103,10 @@ ln -s (pwd)/iina-plugin ~/Library/Application\ Support/com.colliderli.iina/plugi
 
 ## App
 
-peerflix.app is the same search in a window, built with [GPUI Kit](https://gpui-kit.com): type to
+Peerflix.app is the same search in a window, built with [GPUI Kit](https://gpui-kit.com): type to
 search, **Tab** and **Shift-Tab** switch category, the arrows move through the results, and
 **Enter** or a double click opens one. When the torrent holds several episodes, they're listed to
-pick one (**Esc** goes back), and a torrent that's slow to answer says so. Each stream plays in an
+play one after another (**Esc** goes back), and a torrent that's slow to answer says so. Each stream plays in an
 IINA of its own, with a row at the bottom of the window showing its progress, speed and peers, and
 buttons to pause its download and to stop it. A stream stops when its player quits, with its button,
 or when the app quits, which closes its player and stops the download; playing the torrent again
@@ -114,9 +114,9 @@ resumes it. A player left open without its window stops after 30 seconds without
 another episode of a torrent that's playing replaces its stream.
 
 Download `peerflix-app-vX.Y.Z.zip` from the [latest release](https://github.com/melkir/peerflix/releases/latest)
-(Apple Silicon) and move `peerflix.app` to `/Applications`. It isn't notarized, so macOS blocks it
-at first: run `xattr -dr com.apple.quarantine /Applications/peerflix.app` once. To build it instead,
-`mise run app` writes `target/app/peerflix.app`.
+(Apple Silicon) and move `Peerflix.app` to `/Applications`. It isn't notarized, so macOS blocks it
+at first: run `xattr -dr com.apple.quarantine /Applications/Peerflix.app` once. To build it instead,
+`mise run app` writes `target/app/Peerflix.app`.
 
 ## JSON
 
@@ -158,7 +158,7 @@ after the last player disconnects.
 ```sh
 mise install
 mise run ci           # fmt check, clippy, test and build
-mise run app          # build target/app/peerflix.app
+mise run app          # build target/app/Peerflix.app
 ```
 
 The workspace holds three crates: `peerflix-core`, the searching and streaming both front ends use,

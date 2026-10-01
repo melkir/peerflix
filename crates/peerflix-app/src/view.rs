@@ -14,7 +14,7 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
+    AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
     IntoElement, ParentElement as _, Pixels, Render, SharedString, Styled as _, Subscription, Task,
     Window, div, prelude::FluentBuilder as _,
 };
@@ -69,10 +69,10 @@ enum Page {
         _listing: Task<()>,
         _slow: Task<()>,
     },
-    /// The episodes of the torrent titled title, to pick one.
+    /// The episodes of the torrent titled title, to pick one after another.
     Episodes {
         title: SharedString,
-        listing: Box<Listing>,
+        listing: Arc<Listing>,
         table: Entity<TableState<Episodes>>,
         _subscription: Subscription,
     },
@@ -317,7 +317,7 @@ impl Peerflix {
         };
         if listing.episodes.len() < 2 {
             match pick_file(&listing.files, None) {
-                Ok(id) => self.play(title, listing, id, cx),
+                Ok(id) => self.play(title, Arc::new(listing), id, cx),
                 Err(e) => self.note = format!("Couldn't open {title}: {e:#}").into(),
             }
             return self.back(window, cx);
@@ -328,42 +328,41 @@ impl Peerflix {
             table.set_selected_row(0, cx);
             table
         });
-        let subscription = cx.subscribe_in(&table, window, |this, _, event, window, cx| {
+        let subscription = cx.subscribe(&table, |this, _, event, cx| {
             if let TableEvent::DoubleClickedRow(_) = event {
-                this.play_selected(window, cx);
+                this.play_selected(cx);
             }
         });
         table.read(cx).focus_handle(cx).focus(window, cx);
         self.page = Page::Episodes {
             title,
-            listing: Box::new(listing),
+            listing: Arc::new(listing),
             table,
             _subscription: subscription,
         };
         cx.notify();
     }
 
-    /// The file id of the episode selected, if episodes are listed.
-    fn selected_episode(&self, cx: &App) -> Option<usize> {
-        let Page::Episodes { table, .. } = &self.page else {
-            return None;
-        };
-        let table = table.read(cx);
-        let row = table.selected_row()?;
-        table.delegate().files.get(row).map(|&(id, ..)| id)
-    }
-
-    /// Streams the selected episode.
-    fn play_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected_episode(cx) else {
+    /// Streams the selected episode, staying on the episodes to play another.
+    fn play_selected(&mut self, cx: &mut Context<Self>) {
+        let Page::Episodes {
+            title,
+            listing,
+            table,
+            ..
+        } = &self.page
+        else {
             return;
         };
-        if let Page::Episodes { title, listing, .. } =
-            std::mem::replace(&mut self.page, Page::Results)
-        {
-            self.play(title, *listing, id, cx);
-        }
-        self.back(window, cx);
+        let table = table.read(cx);
+        let Some(&(id, ..)) = table
+            .selected_row()
+            .and_then(|row| table.delegate().files.get(row))
+        else {
+            return;
+        };
+        let (title, listing) = (title.clone(), listing.clone());
+        self.play(title, listing, id, cx);
     }
 
     /// Goes back to the results, giving up the torrent being opened or picked
@@ -375,7 +374,13 @@ impl Peerflix {
     }
 
     /// Streams file id of listing, the files of the torrent titled title.
-    fn play(&mut self, title: SharedString, listing: Listing, id: usize, cx: &mut Context<Self>) {
+    fn play(
+        &mut self,
+        title: SharedString,
+        listing: Arc<Listing>,
+        id: usize,
+        cx: &mut Context<Self>,
+    ) {
         self.streams
             .update(cx, |streams, cx| streams.play(title, listing, id, cx));
     }
@@ -459,9 +464,7 @@ impl Peerflix {
                                 .primary()
                                 .small()
                                 .label("Play")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.play_selected(window, cx);
-                                })),
+                                .on_click(cx.listener(|this, _, _, cx| this.play_selected(cx))),
                         ),
                 )
                 .child(div().flex_1().child(DataTable::new(table).stripe(true)))
@@ -484,7 +487,7 @@ impl Render for Peerflix {
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.select(1, cx)))
             .on_action(
                 cx.listener(|this, _: &Confirm, window, cx| match this.page {
-                    Page::Episodes { .. } => this.play_selected(window, cx),
+                    Page::Episodes { .. } => this.play_selected(cx),
                     _ => this.open_selected(window, cx),
                 }),
             )

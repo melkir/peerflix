@@ -79,7 +79,7 @@ pub(crate) async fn fetch_metadata(
 /// session's directory is checked and reused.
 pub(crate) async fn add_torrent(
     session: &Arc<Session>,
-    meta: ListOnlyResponse,
+    meta: &ListOnlyResponse,
     storage: &PartStorage,
     wanted: &[usize],
 ) -> anyhow::Result<Arc<ManagedTorrent>> {
@@ -89,7 +89,7 @@ pub(crate) async fn add_torrent(
         output_folder: Some(meta.output_folder.to_string_lossy().into_owned()),
         storage_factory: Some(storage.clone().boxed()),
         overwrite: true,
-        initial_peers: Some(meta.seen_peers),
+        initial_peers: Some(meta.seen_peers.clone()),
         peer_opts: Some(PeerConnectionOptions {
             // The piece at the player's position after a seek is requested
             // behind everything already queued to a peer. librqbit queues 128
@@ -101,7 +101,10 @@ pub(crate) async fn add_torrent(
         ..Default::default()
     };
     session
-        .add_torrent(AddTorrent::from_bytes(meta.torrent_bytes), Some(opts))
+        .add_torrent(
+            AddTorrent::from_bytes(meta.torrent_bytes.clone()),
+            Some(opts),
+        )
         .await?
         .into_handle()
         .context("torrent was not added")

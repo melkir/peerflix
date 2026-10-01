@@ -88,7 +88,7 @@ impl Streams {
     pub fn play(
         &mut self,
         title: SharedString,
-        listing: Listing,
+        listing: Arc<Listing>,
         id: usize,
         cx: &mut Context<Self>,
     ) {
@@ -113,7 +113,7 @@ impl Streams {
                 if let Some(previous) = previous {
                     let _ = previous.await;
                 }
-                let result = stream(&session, listing, id, &run_stop, &events).await;
+                let result = stream(&session, &listing, id, &run_stop, &events).await;
                 let _ = events.send(Event::Ended(result.map_err(|e| format!("{e:#}"))));
             },
             &rt.tokio,
@@ -321,7 +321,7 @@ impl Render for Streams {
 /// sending how it's going to events. The player closes as the stream ends.
 async fn stream(
     session: &Arc<Session>,
-    listing: Listing,
+    listing: &Listing,
     id: usize,
     stop: &CancellationToken,
     events: &UnboundedSender<Event>,

@@ -58,9 +58,10 @@ impl Listing {
 
     /// Starts downloading file id and the subtitles that go with it, and
     /// serves them on server, until the Playing returned is done watching.
-    /// The torrent can only play once at a time in a session.
+    /// The torrent can only play once at a time in a session, but the
+    /// listing can play another of its files once that's done.
     pub async fn play(
-        self,
+        &self,
         session: &Arc<Session>,
         server: &Server,
         id: usize,
@@ -76,7 +77,7 @@ impl Listing {
         if session.get(TorrentIdOrHash::Hash(meta.info_hash)).is_some() {
             bail!("the torrent is already playing");
         }
-        let subs = subtitles(&files, id, episodes.len() <= 1);
+        let subs = subtitles(files, id, episodes.len() <= 1);
         let downloading: Vec<usize> = [id].into_iter().chain(subs.iter().copied()).collect();
         let storage = PartStorage::new(meta.output_folder.clone());
         let torrent = add_torrent(session, meta, &storage, &downloading).await?;
@@ -89,7 +90,7 @@ impl Listing {
         let stream = serve_files(
             server,
             &control.torrent,
-            &files,
+            files,
             id,
             &subs,
             Arc::new(control.clone()),
@@ -98,7 +99,7 @@ impl Listing {
             stream,
             control,
             storage,
-            files,
+            files: files.clone(),
             downloading,
         })
     }
@@ -314,8 +315,7 @@ mod tests {
         assert_eq!(status["text"], "100.0%  downloaded");
 
         // It plays once at a time.
-        let again = list(&session, source).await.unwrap();
-        let err = again.play(&session, &server, id).await.err().unwrap();
+        let err = listing.play(&session, &server, id).await.err().unwrap();
         assert!(err.to_string().contains("already playing"), "{err:#}");
 
         // Paused from the control too; with the data all there, the status
@@ -345,11 +345,11 @@ mod tests {
             .unwrap();
         assert_eq!(statuses, [data.len() as u64]);
 
-        // Done watching, it's out of the session, so it can play again.
-        let again = list(&session, source).await.unwrap();
+        // Done watching, it's out of the session, so the same listing can
+        // play again.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (server, _) = Server::start(listener, stop.clone()).unwrap();
-        again.play(&session, &server, id).await.unwrap();
+        listing.play(&session, &server, id).await.unwrap();
 
         client.delete(server.control_url()).send().await.unwrap();
         assert!(stop.is_cancelled());
