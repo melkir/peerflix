@@ -58,11 +58,12 @@ impl Iina {
 
 impl Drop for Iina {
     fn drop(&mut self) {
-        // None once it has exited, so a reused pid is never signalled.
-        if let Some(pid) = self.cli.id() {
+        // None once it has exited, so a reused pid is never signalled. A
+        // negative pid would signal a whole process group, so it's checked.
+        if let Some(pid) = self.cli.id().and_then(|p| libc::pid_t::try_from(p).ok()) {
             // SAFETY: kill only sends a signal.
             unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                libc::kill(pid, libc::SIGTERM);
             }
         }
     }

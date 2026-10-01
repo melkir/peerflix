@@ -8,6 +8,7 @@ mod view;
 
 use std::time::Duration;
 
+use anyhow::Context as _;
 use gpui_kit::{
     AppContext as _, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBounds,
     WindowOptions, px, size,
@@ -39,29 +40,12 @@ gpui_kit::actions!(
 
 fn main() {
     util::raise_open_file_limit();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("starting the tokio runtime");
-    let shutdown = CancellationToken::new();
-    let started = rt.block_on(async {
-        let session =
-            torrent::session(torrent::default_dir(), shutdown.child_token(), true).await?;
-        anyhow::Ok((session, search::client()?))
-    });
-    let (session, client) = match started {
+    let (rt, runtime) = match start() {
         Ok(started) => started,
         Err(e) => {
             eprintln!("error: {e:#}");
             std::process::exit(1);
         }
-    };
-    let runtime = Runtime {
-        tokio: rt.handle().clone(),
-        session,
-        client,
-        shutdown,
-        streams: TaskTracker::new(),
     };
 
     gpui_kit::application()
@@ -113,14 +97,39 @@ fn main() {
                 }),
                 ..Default::default()
             };
-            gpui_kit::open_window(options, cx, |window, cx| {
+            let opened = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| Peerflix::new(window, cx))
-            })
-            .expect("opening the window");
+            });
+            if let Err(e) = opened {
+                eprintln!("error: opening the window: {e:#}");
+                return cx.quit();
+            }
             cx.activate(true);
         });
 
     // Don't wait on librqbit's blocking disk tasks; the next run's data check
     // catches any piece they didn't finish writing.
     rt.shutdown_timeout(Duration::from_secs(1));
+}
+
+/// Starts tokio, and on it the torrent session and the search client.
+fn start() -> anyhow::Result<(tokio::runtime::Runtime, Runtime)> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the tokio runtime")?;
+    let shutdown = CancellationToken::new();
+    let (session, client) = rt.block_on(async {
+        let session =
+            torrent::session(torrent::default_dir(), shutdown.child_token(), true).await?;
+        anyhow::Ok((session, search::client()?))
+    })?;
+    let runtime = Runtime {
+        tokio: rt.handle().clone(),
+        session,
+        client,
+        shutdown,
+        streams: TaskTracker::new(),
+    };
+    Ok((rt, runtime))
 }

@@ -11,7 +11,7 @@ use std::{
     io::IoSlice,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
 };
 
 use anyhow::{Context, bail};
@@ -60,8 +60,7 @@ impl PartStorage {
     /// Renames file id from NAME.part to NAME, for once it's downloaded.
     pub fn complete(&self, id: usize) -> anyhow::Result<()> {
         let slot = self.slot(id)?;
-        let mut open = slot.open.lock().unwrap();
-        match open.as_mut() {
+        match slot.lock().as_mut() {
             Some(o) if o.at_path => Ok(()),
             // The handle stays valid across the rename.
             Some(o) => {
@@ -84,6 +83,12 @@ impl PartStorage {
 }
 
 impl Slot {
+    /// Locks the open file. A panic while it was locked leaves it consistent,
+    /// since it's only ever replaced whole, so poisoning is ignored.
+    fn lock(&self) -> MutexGuard<'_, Option<Opened>> {
+        self.open.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn part_path(&self) -> PathBuf {
         let mut p = OsString::from(self.path.as_os_str());
         p.push(".part");
@@ -94,7 +99,7 @@ impl Slot {
     /// the full length, which a finished or older download has, else the
     /// .part file, which is created only when create is set.
     fn file(&self, create: bool) -> anyhow::Result<Arc<File>> {
-        let mut open = self.open.lock().unwrap();
+        let mut open = self.lock();
         if let Some(o) = open.as_ref() {
             return Ok(o.file.clone());
         }
@@ -202,7 +207,7 @@ impl TorrentStorage for PartStorage {
 
     fn remove_file(&self, file_id: usize, _filename: &Path) -> anyhow::Result<()> {
         let slot = self.slot(file_id)?;
-        *slot.open.lock().unwrap() = None;
+        *slot.lock() = None;
         for p in [slot.part_path(), slot.path.clone()] {
             match std::fs::remove_file(&p) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {

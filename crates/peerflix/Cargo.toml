@@ -7,6 +7,9 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 peerflix-core = { workspace = true, features = ["clap"] }
 anyhow.workspace = true

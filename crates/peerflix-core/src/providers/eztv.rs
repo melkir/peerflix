@@ -89,11 +89,6 @@ async fn show_id(
     base: &str,
     query: &str,
 ) -> anyhow::Result<Option<String>> {
-    let mut url = reqwest::Url::parse(base).context("parsing the IMDb URL")?;
-    url.path_segments_mut()
-        .map_err(|()| anyhow!("invalid IMDb URL {base:?}"))?
-        .pop_if_empty()
-        .extend(["suggestion", "x", &format!("{}.json", query.to_lowercase())]);
     #[derive(Deserialize)]
     struct Suggestions {
         #[serde(default)]
@@ -105,6 +100,11 @@ async fn show_id(
         #[serde(default)]
         qid: String,
     }
+    let mut url = reqwest::Url::parse(base).context("parsing the IMDb URL")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow!("invalid IMDb URL {base:?}"))?
+        .pop_if_empty()
+        .extend(["suggestion", "x", &format!("{}.json", query.to_lowercase())]);
     let s: Suggestions = get_json(client.get(url), "imdb").await?;
     Ok(s.d
         .into_iter()

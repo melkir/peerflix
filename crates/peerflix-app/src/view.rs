@@ -173,7 +173,7 @@ impl Peerflix {
             }
             let failed = failed.await;
             let _ = this.update(cx, |this, cx| {
-                this.end_search(&query, &failed, answered, cx)
+                this.end_search(&query, &failed, answered, cx);
             });
         }));
     }

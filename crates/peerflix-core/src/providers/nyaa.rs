@@ -10,6 +10,17 @@ pub const NYAA_URL: &str = "https://nyaa.si";
 /// books, live action and software.
 const ANIME: &str = "1_0";
 
+#[derive(Deserialize)]
+struct Rss {
+    channel: Channel,
+}
+
+#[derive(Deserialize)]
+struct Channel {
+    #[serde(default)]
+    item: Vec<Item>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Item {
@@ -106,16 +117,6 @@ impl Provider for Nyaa {
                 bail!("searching nyaa: {status}");
             }
             let body = resp.text().await.context("searching nyaa")?;
-
-            #[derive(Deserialize)]
-            struct Rss {
-                channel: Channel,
-            }
-            #[derive(Deserialize)]
-            struct Channel {
-                #[serde(default)]
-                item: Vec<Item>,
-            }
             let rss: Rss = quick_xml::de::from_str(&body).context("parsing nyaa results")?;
             Ok(rss.channel.item.into_iter().map(Torrent::from).collect())
         })

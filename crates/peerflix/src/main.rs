@@ -5,9 +5,10 @@ mod cli;
 
 use std::{io::IsTerminal, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 
+use anyhow::Context;
 use clap::Parser;
 use librqbit::Session;
-use tokio::signal::unix::SignalKind;
+use tokio::signal::unix::{Signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 
 use peerflix_core::{
@@ -87,15 +88,7 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     util::raise_open_file_limit();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("starting the tokio runtime");
-    let result = rt.block_on(async_main(cli));
-    // Don't wait on librqbit's blocking disk tasks; the next run's data check
-    // catches any piece they didn't finish writing.
-    rt.shutdown_timeout(Duration::from_secs(1));
-    match result {
+    match run_on_tokio(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.is::<NoSelection>() => ExitCode::SUCCESS,
         Err(e) => {
@@ -103,6 +96,18 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_on_tokio(cli: Cli) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the tokio runtime")?;
+    let result = rt.block_on(async_main(cli));
+    // Don't wait on librqbit's blocking disk tasks; the next run's data check
+    // catches any piece they didn't finish writing.
+    rt.shutdown_timeout(Duration::from_secs(1));
+    result
 }
 
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
@@ -142,13 +147,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     // Installed after fzf, which handles Ctrl-C itself.
     let cancel = CancellationToken::new();
-    tokio::spawn(cancel_on_signal(cancel.clone()));
+    let term = tokio::signal::unix::signal(SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+    tokio::spawn(cancel_on_signal(term, cancel.clone()));
     run(&cancel, &source, &cli).await
 }
 
-async fn cancel_on_signal(cancel: CancellationToken) {
-    let mut term =
-        tokio::signal::unix::signal(SignalKind::terminate()).expect("installing SIGTERM handler");
+/// Cancels cancel on Ctrl-C or term.
+async fn cancel_on_signal(mut term: Signal, cancel: CancellationToken) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}

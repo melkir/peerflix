@@ -11,6 +11,9 @@ license.workspace = true
 # Category as a clap value, for the command line.
 clap = ["dep:clap"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true

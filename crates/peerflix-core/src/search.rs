@@ -12,7 +12,8 @@ use crate::providers::{
     yts::{self, Yts},
 };
 
-/// What to search for, each from the sites that have it.
+/// What to search for, each from the sites that have it. Declared in Tab
+/// order, which `index` relies on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum Category {
@@ -49,11 +50,8 @@ impl Category {
     }
 
     /// Where the category is in ALL.
-    pub fn index(self) -> usize {
-        Self::ALL
-            .iter()
-            .position(|&c| c == self)
-            .expect("ALL has every category")
+    pub const fn index(self) -> usize {
+        self as usize
     }
 
     /// The sites to search, at endpoints, with nyaa restricted to user's
@@ -349,7 +347,9 @@ mod tests {
         assert_eq!(Anime.shifted(1), Movies);
         assert_eq!(Anime.shifted(-1), Series);
         assert_eq!(Series.shifted(1), Anime);
-        assert_eq!(Movies.index(), 1);
+        for (i, c) in Category::ALL.into_iter().enumerate() {
+            assert_eq!(c.index(), i, "{c:?}");
+        }
     }
 
     #[test]
@@ -357,7 +357,7 @@ mod tests {
         use Category::*;
         let failed = |unanswered: &[&'static str], errors: &[&str]| Failed {
             unanswered: unanswered.to_vec(),
-            errors: errors.iter().map(|e| e.to_string()).collect(),
+            errors: errors.iter().map(ToString::to_string).collect(),
         };
         let none = failed(&[], &[]);
         assert_eq!(summary(Movies, "x", 5, &none, 2), "");

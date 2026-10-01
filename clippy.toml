@@ -1,0 +1,2 @@
+# Tests panic on purpose; unwrap_used is for the code they test.
+allow-unwrap-in-tests = true

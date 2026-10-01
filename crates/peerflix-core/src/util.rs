@@ -16,7 +16,7 @@ pub fn human_bytes(n: u64) -> String {
     format!(
         "{:.1} {}iB",
         n as f64 / div as f64,
-        "KMGTPE".as_bytes()[exp] as char
+        char::from(b"KMGTPE"[exp])
     )
 }
 

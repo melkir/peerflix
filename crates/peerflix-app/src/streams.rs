@@ -236,7 +236,7 @@ impl Streams {
             RowState::Failed(e) => (e.clone(), None),
         };
         let failed = matches!(row.state, RowState::Failed(_));
-        let pausable = status.is_some_and(|s| s.pausable());
+        let pausable = status.is_some_and(Status::pausable);
         let paused = status.is_some_and(|s| s.state == State::Paused);
         h_flex()
             .id(("stream", id))

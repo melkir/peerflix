@@ -66,7 +66,8 @@ pub fn search_interactive(
     let mut search =
         shell_quote(&exe.to_string_lossy()) + r#" --print --category "${FZF_PROMPT%> }""#;
     if !user.is_empty() {
-        search += &format!(" --user {}", shell_quote(user));
+        search += " --user ";
+        search += &shell_quote(user);
     }
     if trusted {
         search += " --trusted";
@@ -119,7 +120,7 @@ pub fn search_interactive(
         .output()
         .context(FZF);
     let _ = std::fs::remove_file(&status);
-    fzf_choice(out?)
+    fzf_choice(&out?)
 }
 
 /// Searches providers, category's sites, for query in parallel and writes
@@ -224,14 +225,14 @@ pub async fn choose(prompt: &str, lines: String) -> anyhow::Result<String> {
     // fzf may quit before reading everything.
     let _ = stdin.write_all(lines.as_bytes()).await;
     drop(stdin);
-    fzf_choice(child.wait_with_output().await.context(FZF)?)
+    fzf_choice(&child.wait_with_output().await.context(FZF)?)
 }
 
 const FZF: &str = "running fzf (0.60 or later is required)";
 
 /// Returns what fzf printed for the accepted line, or NoSelection if the user
 /// quit or nothing matched.
-fn fzf_choice(out: std::process::Output) -> anyhow::Result<String> {
+fn fzf_choice(out: &std::process::Output) -> anyhow::Result<String> {
     match out.status.code() {
         Some(0) => {}
         Some(1 | 130) => return Err(NoSelection.into()), // no match, or Esc/Ctrl-C

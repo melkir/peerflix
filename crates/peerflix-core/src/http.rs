@@ -21,7 +21,7 @@ use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::UnsyncBoxBod
 use hyper::{
     Method, Request, Response, StatusCode,
     body::Frame,
-    header::{self, HeaderValue},
+    header::{self, HeaderName, HeaderValue},
     server::conn::http1,
     service::service_fn,
 };
@@ -190,10 +190,7 @@ impl Shared {
             },
             Method::DELETE => {
                 self.stop.cancel();
-                Response::builder()
-                    .status(StatusCode::NO_CONTENT)
-                    .body(empty())
-                    .unwrap()
+                no_content()
             }
             _ => not_allowed("GET, PUT, DELETE"),
         }
@@ -205,10 +202,7 @@ impl Shared {
             return text(StatusCode::CONFLICT, "not streaming yet");
         };
         match streaming.download.set_paused(paused).await {
-            Ok(()) => Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .body(empty())
-                .unwrap(),
+            Ok(()) => no_content(),
             // Such as pausing it twice.
             Err(e) => text(StatusCode::CONFLICT, format!("{e:#}")),
         }
@@ -324,13 +318,10 @@ impl Connection {
 /// Accepts connections to a server until the task is dropped.
 async fn accept(listener: TcpListener, shared: Arc<Shared>) {
     loop {
-        let sock = match listener.accept().await {
-            Ok((sock, _)) => sock,
-            Err(_) => {
-                // Usually running out of file descriptors; give it a moment.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+        let Ok((sock, _)) = listener.accept().await else {
+            // Usually running out of file descriptors; give it a moment.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
         };
         let conn = Arc::new(Connection {
             shared: shared.clone(),
@@ -368,40 +359,52 @@ async fn handle<B>(file: &File, req: &Request<B>) -> Response<Body> {
         Range::Full => (StatusCode::OK, 0, file.len),
         Range::Partial(start, end) => (StatusCode::PARTIAL_CONTENT, start, end),
         Range::Unsatisfiable => {
-            return Response::builder()
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header(header::CONTENT_RANGE, format!("bytes */{}", file.len))
-                .body(empty())
-                .unwrap();
+            let range = content_range(format_args!("*/{}", file.len));
+            return response(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, range)],
+                empty(),
+            );
         }
     };
 
-    let mut resp = Response::builder()
-        .status(status)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_TYPE, content_type(&file.name))
-        .header(header::CONTENT_LENGTH, end - start);
+    let mut resp = response(
+        status,
+        [
+            (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(content_type(&file.name)),
+            ),
+            (header::CONTENT_LENGTH, HeaderValue::from(end - start)),
+        ],
+        empty(),
+    );
     if status == StatusCode::PARTIAL_CONTENT {
-        resp = resp.header(
-            header::CONTENT_RANGE,
-            format!("bytes {start}-{}/{}", end - 1, file.len),
-        );
+        let range = content_range(format_args!("{start}-{}/{}", end - 1, file.len));
+        resp.headers_mut().insert(header::CONTENT_RANGE, range);
     }
     if req.method() == Method::HEAD {
-        return resp.body(empty()).unwrap();
+        return resp;
     }
 
     let reader = match (file.open)().await {
         Ok(mut r) => match r.seek(SeekFrom::Start(start)).await {
             Ok(_) => r,
-            Err(e) => return error(e.into()),
+            Err(e) => return error(&e.into()),
         },
-        Err(e) => return error(e),
+        Err(e) => return error(&e),
     };
     let body = StreamBody::new(
         ReaderStream::with_capacity(reader.take(end - start), 64 << 10).map_ok(Frame::data),
     );
-    resp.body(BodyExt::boxed_unsync(body)).unwrap()
+    *resp.body_mut() = BodyExt::boxed_unsync(body);
+    resp
+}
+
+/// A Content-Range header of bytes range, such as `0-9/100`.
+fn content_range(range: std::fmt::Arguments<'_>) -> HeaderValue {
+    HeaderValue::try_from(format!("bytes {range}")).expect("byte ranges are valid header values")
 }
 
 /// Whether a Host header names the loopback address the server listens on,
@@ -423,31 +426,57 @@ fn empty() -> Body {
     Empty::new().map_err(|e| match e {}).boxed_unsync()
 }
 
+/// Builds a response directly rather than with `Response::builder`, whose
+/// header conversions can fail, which these can't.
+fn response<const N: usize>(
+    status: StatusCode,
+    headers: [(HeaderName, HeaderValue); N],
+    body: Body,
+) -> Response<Body> {
+    let mut resp = Response::new(body);
+    *resp.status_mut() = status;
+    resp.headers_mut().extend(headers);
+    resp
+}
+
+fn no_content() -> Response<Body> {
+    response(StatusCode::NO_CONTENT, [], empty())
+}
+
 fn not_allowed(allow: &'static str) -> Response<Body> {
-    Response::builder()
-        .status(StatusCode::METHOD_NOT_ALLOWED)
-        .header(header::ALLOW, allow)
-        .body(empty())
-        .unwrap()
+    response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, HeaderValue::from_static(allow))],
+        empty(),
+    )
 }
 
 fn json(body: String) -> Response<Body> {
-    Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(full(body))
-        .unwrap()
+    response(
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        full(body),
+    )
 }
 
 fn text(status: StatusCode, body: impl Into<String>) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(full(body.into()))
-        .unwrap()
+    response(
+        status,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        )],
+        full(body.into()),
+    )
 }
 
-fn error(e: anyhow::Error) -> Response<Body> {
+fn error(e: &anyhow::Error) -> Response<Body> {
     text(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}\n"))
 }
 
@@ -529,12 +558,15 @@ pub fn content_type(name: &str) -> &'static str {
 
 /// Escapes name for use as a URL path segment.
 pub fn path_escape(name: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(name.len());
     for b in name.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(b as char);
+            out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            out.push('%');
+            out.push(char::from(HEX[usize::from(b >> 4)]));
+            out.push(char::from(HEX[usize::from(b & 0xF)]));
         }
     }
     out

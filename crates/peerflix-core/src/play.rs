@@ -78,7 +78,7 @@ impl Listing {
             bail!("the torrent is already playing");
         }
         let subs = subtitles(files, id, episodes.len() <= 1);
-        let downloading: Vec<usize> = [id].into_iter().chain(subs.iter().copied()).collect();
+        let downloading: Vec<usize> = std::iter::once(id).chain(subs.iter().copied()).collect();
         let storage = PartStorage::new(meta.output_folder.clone());
         let torrent = add_torrent(session, meta, &storage, &downloading).await?;
         let control = Control {
