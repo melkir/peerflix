@@ -6,7 +6,7 @@ const { pausable } = require("./status.js");
 
 // The peerflix this plugin works with, of the same release; cargo release
 // bumps it with the plugin's version.
-const VERSION = "0.7.1";
+const VERSION = "0.7.2";
 
 // How often the streams' status is shown anew, in milliseconds.
 const POLL = 1000;
