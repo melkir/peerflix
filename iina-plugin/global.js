@@ -136,26 +136,33 @@ async function run(args) {
   return res.stdout;
 }
 
+// Sends data to the search window. IINA hands it over as JSON pasted into a
+// template literal, unescaped, so a title with a backtick, a quote or a
+// backslash would lose the message; percent-encoded, it has none of them.
+function post(name, data) {
+  win.postMessage(name, encodeURIComponent(JSON.stringify(data)));
+}
+
 async function search({ category, query }) {
   const id = ++searches;
   try {
     const { results, summary } = JSON.parse(await run(["--json", "-c", category, "--", query]));
     if (id !== searches) return;
-    win.postMessage("results", { category, query, results, summary });
+    post("results", { category, query, results, summary });
   } catch (e) {
-    if (id === searches) win.postMessage("searchFailed", { category, query, text: e.message });
+    if (id === searches) post("searchFailed", { category, query, text: e.message });
   }
 }
 
 // The search window shows how pick is starting on its row.
 function progress(pick, text) {
-  win.postMessage("progress", { pick, text });
+  post("progress", { pick, text });
 }
 
 function failed(pick, text) {
   if (pick !== current) return;
   current = null;
-  win.postMessage("failed", { pick, text });
+  post("failed", { pick, text });
 }
 
 // Starts peerflix on source, which answers with the torrent's files and
@@ -178,7 +185,7 @@ async function open({ pick, source, title, index = null }) {
     pending = { source, control, infoHash };
     current = null;
     const byIndex = Object.fromEntries(files.map((f) => [f.index, f]));
-    win.postMessage("episodes", { pick, source, title, episodes: episodes.map((i) => byIndex[i]) });
+    post("episodes", { pick, source, title, episodes: episodes.map((i) => byIndex[i]) });
   } catch (e) {
     failed(pick, e.message);
   }
@@ -261,7 +268,7 @@ async function streamFile(pick, control, index, infoHash) {
   const id = global.createPlayerInstance({ url: served.url, label: "peerflix", enablePlugins: true });
   // The player's main.js has run by now, though its video may not have loaded.
   global.postMessage(id, "subtitles", served.subtitles.map((s) => s.url));
-  win.postMessage("started", { pick });
+  post("started", { pick });
   streams.set(id, { name: served.name, infoHash, control, status: null });
   watch();
 }
@@ -323,7 +330,7 @@ function showStreams() {
     const paused = status.state === "paused";
     shown.push({ id, name, text: status.text, paused, pausable: pausable(status) });
   }
-  win.postMessage("streams", shown);
+  post("streams", shown);
 }
 
 // Pauses the download of the stream player id plays, or resumes it, from

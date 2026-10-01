@@ -119,6 +119,12 @@
   <script>
     const $ = (id) => document.getElementById(id);
 
+    // Handles the plugin's messages, which come percent-encoded; see post()
+    // in global.js.
+    function onMessage(name, callback) {
+      iina.onMessage(name, (data) => callback(JSON.parse(decodeURIComponent(data))));
+    }
+
     // What the window shows. render() draws the page from it, and actions
     // change it, then render.
     const state = {
@@ -358,27 +364,27 @@
       return b;
     }
 
-    iina.onMessage("results", (data) => {
+    onMessage("results", (data) => {
       // Only the current category and query's results.
       if (data.category !== state.category || data.query !== $("query").value) return;
       setList({ results: data, error: "", torrent: null, searching: false });
     });
 
-    iina.onMessage("searchFailed", ({ category, query, text }) => {
+    onMessage("searchFailed", ({ category, query, text }) => {
       if (category !== state.category || query !== $("query").value) return;
       setList({ results: null, error: text, torrent: null, searching: false });
     });
 
-    iina.onMessage("episodes", ({ pick, source, title, episodes }) => {
+    onMessage("episodes", ({ pick, source, title, episodes }) => {
       if (pick !== state.picking?.pick) return;
       setList({ torrent: { source, title, episodes }, picking: null });
     });
 
-    iina.onMessage("progress", ({ pick, text }) => updatePick(pick, { text }));
-    iina.onMessage("started", ({ pick }) => updatePick(pick, null));
-    iina.onMessage("failed", ({ pick, text }) => updatePick(pick, { text, kind: "failed" }));
+    onMessage("progress", ({ pick, text }) => updatePick(pick, { text }));
+    onMessage("started", ({ pick }) => updatePick(pick, null));
+    onMessage("failed", ({ pick, text }) => updatePick(pick, { text, kind: "failed" }));
 
-    iina.onMessage("streams", (streams) => {
+    onMessage("streams", (streams) => {
       state.streams = streams;
       renderStreams();
     });
