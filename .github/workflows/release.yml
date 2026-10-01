@@ -13,6 +13,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v5
+      # The dependencies CI's release job built on main.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: false
       - run: cargo build --release --locked
         env:
           PEERFLIX_VERSION: ${{ github.ref_name }}
