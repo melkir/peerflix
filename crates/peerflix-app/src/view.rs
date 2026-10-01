@@ -1,23 +1,29 @@
 //! The window: a search over a category's sites, a torrent's episodes to pick
 //! from, and the streams playing.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, Sizable as _, Theme,
+    ActiveTheme as _, Icon, IconName, Sizable as _, Theme, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
+    notification::Notification,
     spinner::Spinner,
     tab::{Tab, TabBar},
-    table::{DataTable, TableEvent, TableState},
+    table::{DataTable, TableDelegate, TableEvent, TableState},
     v_flex,
 };
 use gpui_kit::{
-    AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
     IntoElement, ParentElement as _, Pixels, Render, SharedString, Styled as _, Subscription, Task,
-    Window, div, prelude::FluentBuilder as _,
+    Window, div, prelude::FluentBuilder as _, px,
 };
+// The full Lucide catalog's names, beside gpui-component's IconName.
+use gpui_kit::assets::IconName as AssetIcon;
 use peerflix_core::{
     play::{self, Listing},
     providers::{Provider, Query, Torrent},
@@ -40,6 +46,10 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 /// take a while.
 const SLOW: Duration = Duration::from_secs(15);
 
+/// How long a category's results without search terms are shown again
+/// without searching anew. Older ones still show at once while they refresh.
+const FRESH: Duration = Duration::from_secs(5 * 60);
+
 pub struct Peerflix {
     category: Category,
     endpoints: Endpoints,
@@ -47,15 +57,32 @@ pub struct Peerflix {
     providers: Vec<Arc<dyn Provider>>,
     query: Entity<InputState>,
     results: Entity<TableState<Results>>,
-    /// What went wrong with the last search or torrent, if anything.
+    /// Why the last search found nothing, shown under nothing_icon in place
+    /// of the table. Problems beside results are notifications instead.
     note: SharedString,
+    /// Pictures why the last search found nothing.
+    nothing_icon: AssetIcon,
     /// The search running, if any; dropping it stops it.
     search: Option<Task<()>>,
+    /// Each category's results without search terms, by its index, to show
+    /// at once when its tab is picked again or the search box is cleared.
+    browse: [Option<Browse>; Category::ALL.len()],
     page: Page,
     streams: Entity<Streams>,
     /// The window's width, which the tables' first columns fill.
     width: Pixels,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Identifies the notification that some sites' search failed, so a new one
+/// replaces it rather than piling up as each keystroke searches.
+struct SitesFailed;
+
+/// A category's results without search terms, as they were last found.
+struct Browse {
+    found: Vec<Found>,
+    note: SharedString,
+    at: Instant,
 }
 
 /// What the window shows below the search box.
@@ -83,10 +110,12 @@ impl Peerflix {
         // Light or dark as the system is, following it when it changes.
         Theme::sync_system_appearance(Some(window), cx);
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search anime"));
-        let results = cx.new(|cx| TableState::new(Results::new(), window, cx));
+        // A header click sorts the results rather than selecting its column.
+        let results =
+            cx.new(|cx| TableState::new(Results::new(), window, cx).col_selectable(false));
         let subscriptions = vec![
             cx.subscribe_in(&query, window, |this, _, event, window, cx| match event {
-                InputEvent::Change => this.search(true, cx),
+                InputEvent::Change => this.search(true, window, cx),
                 InputEvent::PressEnter { .. } => this.open_selected(window, cx),
                 _ => {}
             }),
@@ -113,15 +142,21 @@ impl Peerflix {
             query,
             results,
             note: SharedString::default(),
+            nothing_icon: AssetIcon::SearchX,
             search: None,
+            browse: Default::default(),
             page: Page::Results,
             streams: cx.new(|_| Streams::default()),
             width: window.viewport_size().width,
             _subscriptions: subscriptions,
         };
         this.fit_columns(cx);
-        // With no terms, that's the newest anime.
-        this.search(false, cx);
+        // With no terms, that's the newest anime. The other tabs' are
+        // fetched meanwhile, so they show at once.
+        this.search(false, window, cx);
+        for other in category.others() {
+            this.prefetch(other, cx);
+        }
         this
     }
 
@@ -135,34 +170,41 @@ impl Peerflix {
             query.focus(window, cx);
         });
         self.back(window, cx);
-        self.search(false, cx);
+        self.search(false, window, cx);
     }
 
     /// Searches the category's sites for what's typed, after DEBOUNCE if
     /// debounce, replacing the search running. The results so far stay until
-    /// the first site answers.
-    fn search(&mut self, debounce: bool, cx: &mut Context<Self>) {
+    /// the first site answers. Without search terms, the category's cached
+    /// results show at once instead, searched anew only once they're older
+    /// than FRESH.
+    fn search(&mut self, debounce: bool, window: &mut Window, cx: &mut Context<Self>) {
         let query = Query::new(&self.query.read(cx).value());
+        if is_browse(&query) && self.show_browse(cx) {
+            return;
+        }
+        // What the last search found, or didn't, no longer applies.
+        self.note = SharedString::default();
         let providers = self.providers.clone();
         let client = cx.global::<Runtime>().client.clone();
         self.results.update(cx, |table, cx| {
             table.delegate_mut().searching = true;
             cx.notify();
         });
-        self.search = Some(cx.spawn(async move |this, cx| {
-            if debounce {
-                cx.background_executor().timer(DEBOUNCE).await;
-            }
-            let (found, mut answers) = mpsc::unbounded_channel();
-            let failed = cx.update(|cx| {
-                let query = query.clone();
-                runtime::spawn(cx, async move {
-                    search::search(&client, &providers, &query, |site, torrents| {
-                        let _ = found.send((site, torrents));
-                    })
-                    .await
+        let (found, mut answers) = mpsc::unbounded_channel();
+        let failed = runtime::spawn(cx, {
+            let query = query.clone();
+            async move {
+                if debounce {
+                    tokio::time::sleep(DEBOUNCE).await;
+                }
+                search::search(&client, &providers, &query, |site, torrents| {
+                    let _ = found.send((site, torrents));
                 })
-            });
+                .await
+            }
+        });
+        self.search = Some(cx.spawn_in(window, async move |this, cx| {
             let mut answered = false;
             while let Some((site, torrents)) = answers.recv().await {
                 let first = !std::mem::replace(&mut answered, true);
@@ -172,10 +214,79 @@ impl Peerflix {
                 }
             }
             let failed = failed.await;
-            let _ = this.update(cx, |this, cx| {
-                this.end_search(&query, &failed, answered, cx);
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.end_search(&query, &failed, answered, window, cx);
             });
         }));
+    }
+
+    /// Shows the category's cached results without search terms, if there
+    /// are any, stopping the search running. Returns whether they're fresh,
+    /// needing no new search.
+    fn show_browse(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(browse) = &self.browse[self.category.index()] else {
+            return false;
+        };
+        self.search = None;
+        self.note = browse.note.clone();
+        // Only searches no site failed are cached.
+        self.nothing_icon = AssetIcon::SearchX;
+        let found = browse.found.clone();
+        let fresh = browse.at.elapsed() < FRESH;
+        self.results.update(cx, |table, cx| {
+            let results = table.delegate_mut();
+            results.set(found);
+            results.searching = false;
+            if !results.found().is_empty() {
+                table.set_selected_row(0, cx);
+            }
+            cx.notify();
+        });
+        cx.notify();
+        fresh
+    }
+
+    /// Searches category's sites without search terms in the background, to
+    /// cache what they find.
+    fn prefetch(&mut self, category: Category, cx: &mut Context<Self>) {
+        let providers = category.providers(&self.endpoints, "", false);
+        let client = cx.global::<Runtime>().client.clone();
+        let sites = providers.len();
+        let searched = runtime::spawn(cx, async move {
+            let mut found = Vec::new();
+            let failed = search::search(&client, &providers, &Query::new(""), |site, torrents| {
+                found.extend(torrents.into_iter().map(|t| Found::new(site, t)));
+            })
+            .await;
+            (found, failed)
+        });
+        cx.spawn(async move |this, cx| {
+            let (found, failed) = searched.await;
+            let _ = this.update(cx, |this, _| {
+                this.cache_browse(category, found, &failed, sites);
+            });
+        })
+        .detach();
+    }
+
+    /// Caches found as category's results without search terms, unless one
+    /// of its sites, sites in all, failed, since a later search may not.
+    fn cache_browse(
+        &mut self,
+        category: Category,
+        found: Vec<Found>,
+        failed: &Failed,
+        sites: usize,
+    ) {
+        if failed.count() > 0 {
+            return;
+        }
+        let note = search::summary(category, "", found.len(), failed, sites).into();
+        self.browse[category.index()] = Some(Browse {
+            found,
+            note,
+            at: Instant::now(),
+        });
     }
 
     /// Adds a site's results, in place of the last search's for the first
@@ -188,40 +299,52 @@ impl Peerflix {
         cx: &mut Context<Self>,
     ) {
         self.results.update(cx, |table, cx| {
-            let results = table.delegate_mut();
             if first {
-                results.found.clear();
-            }
-            results
-                .found
-                .extend(torrents.into_iter().map(|t| Found::new(site, t)));
-            if first && !results.found.is_empty() {
-                table.set_selected_row(0, cx);
+                let results = table.delegate_mut();
+                results.clear();
+                results.add(site, torrents);
+                if !results.found().is_empty() {
+                    table.set_selected_row(0, cx);
+                }
+            } else {
+                Results::keeping_selection(table, cx, |results| results.add(site, torrents));
             }
             cx.notify();
         });
     }
 
     /// Ends the search for query, with failed holding the sites whose search
-    /// failed, and none having answered with results unless answered.
+    /// failed, and none having answered with results unless answered. Sites
+    /// that failed beside results are told in a notification.
     fn end_search(
         &mut self,
         query: &Query,
         failed: &Failed,
         answered: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let found = self.results.update(cx, |table, cx| {
             let results = table.delegate_mut();
             results.searching = false;
             if !answered {
-                results.found.clear();
+                results.clear();
             }
             cx.notify();
-            results.found.len()
+            results.found().len()
         });
         let sites = self.providers.len();
-        self.note = search::summary(self.category, &query.text, found, failed, sites).into();
+        let summary = search::summary(self.category, &query.text, found, failed, sites);
+        self.nothing_icon = nothing_icon(failed, sites);
+        if found == 0 {
+            self.note = summary.into();
+        } else if !summary.is_empty() {
+            window.push_notification(Notification::warning(summary).id::<SitesFailed>(), cx);
+        }
+        if is_browse(query) {
+            let found = self.results.read(cx).delegate().in_order();
+            self.cache_browse(self.category, found, failed, sites);
+        }
         cx.notify();
     }
 
@@ -247,7 +370,7 @@ impl Peerflix {
     /// Moves the selected result by delta rows.
     fn select(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.results.update(cx, |table, cx| {
-            let rows = table.delegate().found.len();
+            let rows = table.delegate().found().len();
             if rows == 0 {
                 return;
             }
@@ -264,7 +387,7 @@ impl Peerflix {
         let table = self.results.read(cx);
         let Some(found) = table
             .selected_row()
-            .and_then(|row| table.delegate().found.get(row))
+            .and_then(|row| table.delegate().found().get(row))
         else {
             return;
         };
@@ -295,7 +418,6 @@ impl Peerflix {
             _listing: listing,
             _slow: slow,
         };
-        self.note = SharedString::default();
         cx.notify();
     }
 
@@ -311,20 +433,20 @@ impl Peerflix {
         let listing = match listing {
             Ok(listing) => listing,
             Err(e) => {
-                self.note = format!("Couldn't open {title}: {e:#}").into();
+                couldnt_open(&e, window, cx);
                 return self.back(window, cx);
             }
         };
         if listing.episodes.len() < 2 {
             match pick_file(&listing.files, None) {
                 Ok(id) => self.play(title, Arc::new(listing), id, cx),
-                Err(e) => self.note = format!("Couldn't open {title}: {e:#}").into(),
+                Err(e) => couldnt_open(&e, window, cx),
             }
             return self.back(window, cx);
         }
         let episodes = Episodes::new(&listing.files, &listing.episodes, self.width);
         let table = cx.new(|cx| {
-            let mut table = TableState::new(episodes, window, cx);
+            let mut table = TableState::new(episodes, window, cx).col_selectable(false);
             table.set_selected_row(0, cx);
             table
         });
@@ -387,6 +509,7 @@ impl Peerflix {
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.category.index();
+        let searching = self.results.read(cx).delegate().searching;
         h_flex()
             .gap_3()
             .p_3()
@@ -402,15 +525,49 @@ impl Peerflix {
             .child(
                 div()
                     .flex_1()
-                    .child(Input::new(&self.query).cleanable(true)),
+                    // A filled pill, as ChatGPT's composer.
+                    .child(
+                        Input::new(&self.query)
+                            .rounded_full()
+                            .bg(cx.theme().secondary)
+                            .when(searching, |input| {
+                                input.suffix(Spinner::new().color(cx.theme().muted_foreground))
+                            }),
+                    ),
             )
+    }
+
+    /// Whether the last search found nothing, which shows in place of the
+    /// results.
+    fn found_nothing(&self, cx: &App) -> bool {
+        let results = self.results.read(cx).delegate();
+        matches!(self.page, Page::Results) && results.found().is_empty() && !results.searching
     }
 
     fn render_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         match &self.page {
+            Page::Results if self.found_nothing(cx) => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_4()
+                .px_8()
+                .child(
+                    div()
+                        .text_color(cx.theme().muted_foreground.opacity(0.6))
+                        .child(Icon::new(self.nothing_icon).size_12()),
+                )
+                .child(
+                    div()
+                        .max_w(px(560.))
+                        .text_center()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(self.note.clone()),
+                )
+                .into_any_element(),
             Page::Results => div()
                 .size_full()
-                .child(DataTable::new(&self.results).stripe(true))
+                .child(framed(DataTable::new(&self.results), cx))
                 .into_any_element(),
             Page::Opening { title, slow, .. } => v_flex()
                 .size_full()
@@ -467,7 +624,7 @@ impl Peerflix {
                                 .on_click(cx.listener(|this, _, _, cx| this.play_selected(cx))),
                         ),
                 )
-                .child(div().flex_1().child(DataTable::new(table).stripe(true)))
+                .child(div().flex_1().child(framed(DataTable::new(table), cx)))
                 .into_any_element(),
         }
     }
@@ -476,8 +633,7 @@ impl Peerflix {
 impl Render for Peerflix {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (background, foreground, muted) =
-            (theme.background, theme.foreground, theme.muted_foreground);
+        let (background, foreground) = (theme.background, theme.foreground);
         v_flex()
             .key_context("Peerflix")
             .size_full()
@@ -503,16 +659,6 @@ impl Render for Peerflix {
                 }
             }))
             .child(self.render_header(cx))
-            .when(!self.note.is_empty(), |el| {
-                el.child(
-                    div()
-                        .px_3()
-                        .pb_2()
-                        .text_sm()
-                        .text_color(muted)
-                        .child(self.note.clone()),
-                )
-            })
             .child(div().flex_1().min_h_0().child(self.render_page(cx)))
             .child(self.streams.clone())
     }
@@ -522,6 +668,43 @@ impl gpui_kit::Focusable for Peerflix {
     fn focus_handle(&self, cx: &gpui_kit::App) -> FocusHandle {
         self.query.read(cx).focus_handle(cx)
     }
+}
+
+/// Frames table as DataTable does when bordered, but square at the top,
+/// where it meets what's above it.
+fn framed<D: TableDelegate>(table: DataTable<D>, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .size_full()
+        .border_1()
+        .border_color(theme.border)
+        .rounded_b(theme.radius)
+        .child(table.bordered(false))
+}
+
+/// Tells in a notification that the torrent picked couldn't be opened, and
+/// why.
+fn couldnt_open(e: &anyhow::Error, window: &mut Window, cx: &mut App) {
+    let note = Notification::error(format!("{e:#}")).title("Couldn't open the torrent");
+    window.push_notification(note, cx);
+}
+
+/// The icon for a search that found nothing, with failed holding the sites,
+/// out of sites, whose search failed: no connection when none answered, an
+/// alert when they answered with errors, else no results.
+fn nothing_icon(failed: &Failed, sites: usize) -> AssetIcon {
+    if sites == 0 || failed.count() < sites {
+        AssetIcon::SearchX
+    } else if failed.errors.is_empty() {
+        AssetIcon::WifiOff
+    } else {
+        AssetIcon::CircleAlert
+    }
+}
+
+/// Whether query has no search terms, which lists what's new or popular.
+fn is_browse(query: &Query) -> bool {
+    query.text.trim().is_empty()
 }
 
 fn capitalized(s: &str) -> String {
@@ -534,6 +717,25 @@ fn capitalized(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pictures_why_nothing_was_found() {
+        let failed = |unanswered: &[&'static str], errors: &[&str]| Failed {
+            unanswered: unanswered.to_vec(),
+            errors: errors.iter().map(ToString::to_string).collect(),
+        };
+        for (failed, want) in [
+            (failed(&[], &[]), AssetIcon::SearchX),
+            (failed(&["yts"], &[]), AssetIcon::SearchX),
+            (failed(&["yts", "tpb"], &[]), AssetIcon::WifiOff),
+            (
+                failed(&["yts"], &["searching tpb: 429"]),
+                AssetIcon::CircleAlert,
+            ),
+        ] {
+            assert_eq!(nothing_icon(&failed, 2), want, "{failed:?}");
+        }
+    }
 
     #[test]
     fn capitalizes() {

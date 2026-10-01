@@ -15,5 +15,6 @@ peerflix-core.workspace = true
 anyhow.workspace = true
 gpui-kit = "0.7"
 librqbit.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

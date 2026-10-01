@@ -5825,6 +5825,7 @@ dependencies = [
  "gpui-kit",
  "librqbit",
  "peerflix-core",
+ "serde_json",
  "tokio",
  "tokio-util",
 ]

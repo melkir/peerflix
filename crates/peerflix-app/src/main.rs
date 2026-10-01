@@ -4,14 +4,15 @@
 mod runtime;
 mod streams;
 mod tables;
+mod theme;
 mod view;
 
 use std::time::Duration;
 
 use anyhow::Context as _;
 use gpui_kit::{
-    AppContext as _, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBounds,
-    WindowOptions, px, size,
+    AppContext as _, AssetSource, Bounds, KeyBinding, Menu, MenuItem, SharedString,
+    TitlebarOptions, WindowBounds, WindowOptions, px, size,
 };
 use peerflix_core::{search, torrent, util};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -38,6 +39,29 @@ gpui_kit::actions!(
     ]
 );
 
+// The icons the window uses beyond gpui-component's own.
+gpui_kit::assets::icon_assets!(ExtraIcons, [SearchX, WifiOff]);
+
+/// gpui-component's icons, and ExtraIcons.
+struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui_kit::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        match ExtraIcons.load(path)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => gpui_kit::assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> gpui_kit::Result<Vec<SharedString>> {
+        let mut paths = gpui_kit::assets::Assets.list(path)?;
+        paths.extend(ExtraIcons.list(path)?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+}
+
 fn main() {
     util::raise_open_file_limit();
     let (rt, runtime) = match start() {
@@ -49,9 +73,10 @@ fn main() {
     };
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            theme::init(cx);
             cx.set_global(runtime);
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
