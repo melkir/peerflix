@@ -183,18 +183,18 @@ impl Status {
     }
 
     /// The status in a line, as the command line, the app and the IINA plugin
-    /// show it.
+    /// show it, its numbers in columns of their own width so a line rewritten
+    /// in place stays put.
     pub fn describe(&self) -> String {
-        let (percent, size) = (self.percent(), human_bytes(self.size));
+        let percent = self.percent();
         match self.state {
-            State::Checking => "Checking downloaded data…".into(),
-            State::Done => format!("Downloaded {size}"),
-            State::Paused => format!("Paused · {percent:.1}% of {size}"),
+            State::Checking => "Checking existing data...".into(),
+            State::Done => format!("{percent:5.1}%  downloaded"),
+            State::Paused => format!("{percent:5.1}%  paused"),
             State::Downloading => format!(
-                "{percent:.1}% of {size} · {}/s · {} {}, {} seen",
+                "{percent:5.1}%  {:>10}/s  {} peers, {} seen",
                 human_bytes(self.download_speed),
                 self.peers,
-                if self.peers == 1 { "peer" } else { "peers" },
                 self.seen,
             ),
         }
@@ -292,20 +292,16 @@ mod tests {
             peers: 12,
             seen: 40,
         };
-        assert_eq!(status.describe(), "Checking downloaded data…");
+        assert_eq!(status.describe(), "Checking existing data...");
         assert!(!status.pausable());
         status.state = State::Downloading;
-        assert_eq!(
-            status.describe(),
-            "25.0% of 200.0 MiB · 3.0 MiB/s · 12 peers, 40 seen"
-        );
-        status.peers = 1;
-        assert!(status.describe().contains("· 1 peer, 40 seen"));
+        assert_eq!(status.describe(), " 25.0%     3.0 MiB/s  12 peers, 40 seen");
         status.state = State::Paused;
-        assert_eq!(status.describe(), "Paused · 25.0% of 200.0 MiB");
+        assert_eq!(status.describe(), " 25.0%  paused");
         assert!(status.pausable());
         status.state = State::Done;
-        assert_eq!(status.describe(), "Downloaded 200.0 MiB");
+        status.downloaded = status.size;
+        assert_eq!(status.describe(), "100.0%  downloaded");
         assert!(!status.pausable());
     }
 

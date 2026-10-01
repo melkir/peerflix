@@ -81,7 +81,8 @@
     footer:empty { display: none; }
     footer div { display: flex; align-items: center; gap: 12px; padding: 5px 12px; font-variant-numeric: tabular-nums; }
     footer .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    footer .text { color: var(--muted); white-space: nowrap; }
+    /* The status keeps peerflix's columns. */
+    footer .text { color: var(--muted); white-space: pre; }
     footer button {
       padding: 0 4px;
       border: none;

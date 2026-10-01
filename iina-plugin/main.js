@@ -118,5 +118,7 @@ const STYLE = `
     color: #fff;
     font: 12px -apple-system, BlinkMacSystemFont, sans-serif;
     font-variant-numeric: tabular-nums;
+    /* The status keeps peerflix's columns. */
+    white-space: pre;
   }
 `;

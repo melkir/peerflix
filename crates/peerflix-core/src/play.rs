@@ -311,7 +311,7 @@ mod tests {
             .unwrap();
         assert_eq!(status["state"], "done");
         assert_eq!(status["downloaded"], data.len());
-        assert_eq!(status["text"], "Downloaded 48.8 KiB");
+        assert_eq!(status["text"], "100.0%  downloaded");
 
         // It plays once at a time.
         let again = list(&session, source).await.unwrap();
