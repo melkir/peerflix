@@ -1,4 +1,5 @@
-//! Formatting and building helpers the sites and the streamer share.
+//! Helpers the rest share: formatting sizes and dates, building magnets, and
+//! raising the open file limit.
 
 pub fn human_bytes(n: u64) -> String {
     const UNIT: u64 = 1024;
@@ -17,6 +18,36 @@ pub fn human_bytes(n: u64) -> String {
         n as f64 / div as f64,
         "KMGTPE".as_bytes()[exp] as char
     )
+}
+
+/// Raises the soft limit on open files as far as the system allows. Peer
+/// connections alone can come close to macOS's default of 256: streaming one
+/// episode of a big season pack held 151 open.
+pub fn raise_open_file_limit() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit only read and write lim.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        // macOS refuses more than kern.maxfilesperproc even when the hard
+        // limit is unlimited, so fall back to OPEN_MAX, which it always takes.
+        for want in [lim.rlim_max, 10240] {
+            if want <= lim.rlim_cur {
+                return;
+            }
+            let new = libc::rlimit {
+                rlim_cur: want,
+                rlim_max: lim.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &new) == 0 {
+                return;
+            }
+        }
+    }
 }
 
 /// The trackers put in magnets built from a bare info hash.

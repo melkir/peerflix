@@ -1,0 +1,6 @@
+# The IINA plugin ships in the same release, so it takes the same version,
+# and checks peerflix is of it too.
+pre-release-replacements = [
+  { file = "../../iina-plugin/Info.json", search = '"version": "[^"]*"', replace = '"version": "{{version}}"', exactly = 1 },
+  { file = "../../iina-plugin/global.js", search = 'const VERSION = "[^"]*";', replace = 'const VERSION = "{{version}}";', exactly = 1 },
+]

@@ -1,0 +1,18 @@
+[package]
+name = "peerflix"
+description = "Search for anime, movies and series, and stream the torrent into IINA"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+peerflix-core = { workspace = true, features = ["clap"] }
+anyhow.workspace = true
+clap.workspace = true
+librqbit.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

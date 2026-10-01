@@ -6,13 +6,17 @@ cargo-release = "1.1.6"
 description = "Build target/release/peerflix"
 run = "cargo build --release --locked"
 
+[tasks.app]
+description = "Build target/app/peerflix.app"
+run = "crates/peerflix-app/bundle.sh"
+
 [tasks.lint]
 description = "Check formatting and run clippy"
-run = ["cargo fmt --check", "cargo clippy --all-targets --locked -- -D warnings"]
+run = ["cargo fmt --check", "cargo clippy --workspace --all-targets --locked -- -D warnings"]
 
 [tasks.test]
 description = "Run tests"
-run = "cargo test --locked"
+run = "cargo test --workspace --locked"
 
 [tasks.ci]
 description = "Everything CI checks"

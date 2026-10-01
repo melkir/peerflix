@@ -17,9 +17,19 @@ use librqbit::{
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::stream::{self, Reader, Server};
+use crate::{
+    http::{self, Download, Reader, Server},
+    util::human_bytes,
+};
 use files::TorrentFile;
 use storage::PartStorage;
+
+/// Where downloads are kept unless told otherwise, reused across runs so
+/// playing a torrent again resumes it. macOS clears $TMPDIR of files that go
+/// unused for a few days.
+pub fn default_dir() -> PathBuf {
+    std::env::temp_dir().join("peerflix")
+}
 
 /// Starts a torrent session that keeps its data in dir until cancel is
 /// cancelled, asking the router to forward its port if upnp.
@@ -50,7 +60,7 @@ pub async fn session(
 
 /// Resolves the torrent's metadata without adding it, so nothing is
 /// downloaded until a file is picked.
-pub async fn fetch_metadata(
+pub(crate) async fn fetch_metadata(
     session: &Arc<Session>,
     add: AddTorrent<'_>,
 ) -> anyhow::Result<ListOnlyResponse> {
@@ -67,7 +77,7 @@ pub async fn fetch_metadata(
 /// Adds the torrent to download just the wanted files, as .part files until
 /// they're complete; streams still take priority. Data already in the
 /// session's directory is checked and reused.
-pub async fn add_torrent(
+pub(crate) async fn add_torrent(
     session: &Arc<Session>,
     meta: ListOnlyResponse,
     storage: &PartStorage,
@@ -97,28 +107,43 @@ pub async fn add_torrent(
         .context("torrent was not added")
 }
 
-/// The file being streamed and its subtitles.
-pub struct Stream {
-    /// The name file id is served under.
+/// A file served, under its name at its URL.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Served {
     pub name: String,
     pub url: String,
-    /// The names and URLs of the subtitles served alongside.
-    pub sub_names: Vec<String>,
-    pub sub_urls: Vec<String>,
+}
+
+/// The file being streamed and the subtitles served alongside, as JSON the
+/// video's name and url, and its subtitles.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Stream {
+    #[serde(flatten)]
+    pub video: Served,
+    pub subtitles: Vec<Served>,
+}
+
+/// Where the streamed file's download is at.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum State {
+    /// The data already on disk is being checked, which comes first.
+    Checking,
+    Downloading,
+    Paused,
+    /// The file is all there.
+    Done,
 }
 
 /// How the streamed file's download is going.
-#[derive(Serialize, Debug, PartialEq)]
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
 pub struct Status {
-    /// Whether the data already on disk is still being checked, which comes
-    /// before downloading.
-    pub checking: bool,
+    pub state: State,
     /// Bytes of the file downloaded, of its size.
     pub downloaded: u64,
     pub size: u64,
     /// Bytes per second, for the whole torrent.
     pub download_speed: u64,
-    pub upload_speed: u64,
     /// Peers connected, and seen in all.
     pub peers: u32,
     pub seen: u32,
@@ -129,26 +154,62 @@ impl Status {
     pub fn new(stats: &TorrentStats, id: usize, size: u64) -> Status {
         let live = stats.live.as_ref();
         let peers = live.map(|l| &l.snapshot.peer_stats);
+        let downloaded = stats.file_progress.get(id).copied().unwrap_or(0);
+        let state = match stats.state {
+            TorrentStatsState::Initializing { .. } => State::Checking,
+            _ if downloaded >= size => State::Done,
+            TorrentStatsState::Paused => State::Paused,
+            _ => State::Downloading,
+        };
         Status {
-            checking: matches!(stats.state, TorrentStatsState::Initializing { .. }),
-            downloaded: stats.file_progress.get(id).copied().unwrap_or(0),
+            state,
+            downloaded,
             size,
             download_speed: live.map_or(0, |l| l.download_speed.as_bytes()),
-            upload_speed: live.map_or(0, |l| l.upload_speed.as_bytes()),
             peers: peers.map_or(0, |p| p.live),
             seen: peers.map_or(0, |p| p.seen),
+        }
+    }
+
+    /// How much of the file is downloaded, in percent.
+    pub fn percent(&self) -> f64 {
+        100.0 * self.downloaded as f64 / self.size.max(1) as f64
+    }
+
+    /// Whether the download can be paused or resumed: not while the data is
+    /// checked, nor once it's all there.
+    pub fn pausable(&self) -> bool {
+        matches!(self.state, State::Downloading | State::Paused)
+    }
+
+    /// The status in a line, as the command line, the app and the IINA plugin
+    /// show it.
+    pub fn describe(&self) -> String {
+        let (percent, size) = (self.percent(), human_bytes(self.size));
+        match self.state {
+            State::Checking => "Checking downloaded data…".into(),
+            State::Done => format!("Downloaded {size}"),
+            State::Paused => format!("Paused · {percent:.1}% of {size}"),
+            State::Downloading => format!(
+                "{percent:.1}% of {size} · {}/s · {} {}, {} seen",
+                human_bytes(self.download_speed),
+                self.peers,
+                if self.peers == 1 { "peer" } else { "peers" },
+                self.seen,
+            ),
         }
     }
 }
 
 /// Starts streaming file id of torrent and its subtitles subs on server,
-/// with the file's Status for its control.
-pub fn serve_files(
+/// with download for its control.
+pub(crate) fn serve_files(
     server: &Server,
     torrent: &Arc<ManagedTorrent>,
     files: &[TorrentFile],
     id: usize,
     subs: &[usize],
+    download: Arc<dyn Download>,
 ) -> Stream {
     let name = served_name(&files[id].path, &[]);
     let mut served = vec![torrent_file(
@@ -161,31 +222,21 @@ pub fn serve_files(
         let sub_name = served_name(&files[i].path, &served);
         served.push(torrent_file(torrent.clone(), i, sub_name, files[i].len));
     }
-    let stream = Stream {
-        url: server.url(&name),
-        sub_urls: served[1..].iter().map(|f| server.url(&f.name)).collect(),
-        sub_names: served[1..].iter().map(|f| f.name.clone()).collect(),
-        name,
+    let at = |name: &str| Served {
+        name: name.to_owned(),
+        url: server.url(name),
     };
-    server.stream(served, status(torrent.clone(), id, files[id].len));
+    let stream = Stream {
+        video: at(&name),
+        subtitles: served[1..].iter().map(|f| at(&f.name)).collect(),
+    };
+    server.stream(served, download);
     stream
-}
-
-/// Tells the Status of file id of torrent, of size bytes, as JSON.
-fn status(
-    torrent: Arc<ManagedTorrent>,
-    id: usize,
-    size: u64,
-) -> impl Fn() -> String + Send + Sync + 'static {
-    move || {
-        let status = Status::new(&torrent.stats(), id, size);
-        serde_json::to_string(&status).expect("Status serializes")
-    }
 }
 
 /// Drops their .part suffix from the downloading files that have finished,
 /// and removes them from downloading.
-pub fn complete_files(
+pub(crate) fn complete_files(
     storage: &PartStorage,
     stats: &TorrentStats,
     files: &[TorrentFile],
@@ -200,8 +251,8 @@ pub fn complete_files(
 
 /// Serves file id of torrent. Existing data is checked first; the player
 /// starts meanwhile and librqbit holds its first request until the check ends.
-fn torrent_file(torrent: Arc<ManagedTorrent>, id: usize, name: String, len: u64) -> stream::File {
-    stream::File {
+fn torrent_file(torrent: Arc<ManagedTorrent>, id: usize, name: String, len: u64) -> http::File {
+    http::File {
         name,
         len,
         open: Box::new(move || {
@@ -213,7 +264,7 @@ fn torrent_file(torrent: Arc<ManagedTorrent>, id: usize, name: String, len: u64)
 
 /// Returns the file name to serve path under, prefixed with a number if one
 /// of served already has it.
-fn served_name(path: &str, served: &[stream::File]) -> String {
+fn served_name(path: &str, served: &[http::File]) -> String {
     let name = Path::new(path)
         .file_name()
         .map_or_else(|| path.to_owned(), |n| n.to_string_lossy().into_owned());
@@ -230,95 +281,54 @@ fn served_name(path: &str, served: &[stream::File]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::torrent::files::{pick_file, torrent_files};
-    use tokio::net::TcpListener;
 
-    /// Seeds a torrent from local files with networking disabled and streams
-    /// one of them through the HTTP server.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn streams_local_torrent() {
-        let dir = tempfile::tempdir().unwrap();
-        let content = dir.path().join("content");
-        std::fs::create_dir(&content).unwrap();
-        let data = "0123456789".repeat(5000); // spans several pieces
-        std::fs::write(content.join("video.mkv"), &data).unwrap();
-        std::fs::write(content.join("other.txt"), "x").unwrap();
-
-        let spawner = librqbit::spawn_utils::BlockingSpawner::new(1);
-        let opts = librqbit::CreateTorrentOptions {
-            piece_length: Some(16 << 10),
-            ..Default::default()
+    #[test]
+    fn describes_statuses() {
+        let mut status = Status {
+            state: State::Checking,
+            downloaded: 50 << 20,
+            size: 200 << 20,
+            download_speed: 3 << 20,
+            peers: 12,
+            seen: 40,
         };
-        let created = librqbit::create_torrent(&content, opts, &spawner)
-            .await
-            .unwrap();
+        assert_eq!(status.describe(), "Checking downloaded data…");
+        assert!(!status.pausable());
+        status.state = State::Downloading;
+        assert_eq!(
+            status.describe(),
+            "25.0% of 200.0 MiB · 3.0 MiB/s · 12 peers, 40 seen"
+        );
+        status.peers = 1;
+        assert!(status.describe().contains("· 1 peer, 40 seen"));
+        status.state = State::Paused;
+        assert_eq!(status.describe(), "Paused · 25.0% of 200.0 MiB");
+        assert!(status.pausable());
+        status.state = State::Done;
+        assert_eq!(status.describe(), "Downloaded 200.0 MiB");
+        assert!(!status.pausable());
+    }
 
-        let session = Session::new_with_opts(
-            dir.path().to_owned(),
-            SessionOptions {
-                dht: None,
-                listen: None,
-                disable_trackers: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let add = AddTorrent::from_bytes(created.as_bytes().unwrap());
-        let meta = fetch_metadata(&session, add).await.unwrap();
-        let files = torrent_files(&meta);
-        let id = pick_file(&files, None).unwrap();
-        assert_eq!(files[id].path, "video.mkv");
-
-        let storage = PartStorage::new(meta.output_folder.clone());
-        let opts = AddTorrentOptions {
-            only_files: Some(vec![id]),
-            overwrite: true,
-            output_folder: Some(meta.output_folder.to_string_lossy().into_owned()),
-            storage_factory: Some(storage.boxed()),
-            ..Default::default()
+    #[test]
+    fn status_json() {
+        let status = Status {
+            state: State::Paused,
+            downloaded: 1,
+            size: 2,
+            download_speed: 0,
+            peers: 0,
+            seen: 3,
         };
-        let torrent = session
-            .add_torrent(AddTorrent::from_bytes(meta.torrent_bytes), Some(opts))
-            .await
-            .unwrap()
-            .into_handle()
-            .unwrap();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let stop = CancellationToken::new();
-        let (server, _) = Server::start(listener, stop.clone()).unwrap();
-        // librqbit's stream() waits for the initial check, which is too quick
-        // here to overlap with the requests.
-        let url = serve_files(&server, &torrent, &files, id, &[]).url;
-
-        let client = reqwest::Client::new();
-        let resp = client.get(&url).send().await.unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(resp.text().await.unwrap(), data);
-        let resp = client
-            .get(&url)
-            .header("Range", "bytes=20000-20009")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 206);
-        assert_eq!(resp.text().await.unwrap(), data[20000..20010]);
-
-        let control = server.control_url();
-        let status: serde_json::Value = client
-            .get(&control)
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(status["checking"], false);
-        assert_eq!(status["downloaded"], data.len());
-        assert_eq!(status["size"], data.len());
-        client.delete(&control).send().await.unwrap();
-        assert!(stop.is_cancelled());
-        session.stop().await;
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!({
+                "state": "paused",
+                "downloaded": 1,
+                "size": 2,
+                "download_speed": 0,
+                "peers": 0,
+                "seen": 3,
+            })
+        );
     }
 }

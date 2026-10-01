@@ -1,5 +1,6 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
+pub use reqwest::Client;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -12,7 +13,8 @@ use crate::providers::{
 };
 
 /// What to search for, each from the sites that have it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum Category {
     /// nyaa.si's anime
     Anime,
@@ -23,6 +25,9 @@ pub enum Category {
 }
 
 impl Category {
+    /// Every category, in Tab order.
+    pub const ALL: [Category; 3] = [Category::Anime, Category::Movies, Category::Series];
+
     pub fn name(self) -> &'static str {
         match self {
             Category::Anime => "anime",
@@ -31,13 +36,24 @@ impl Category {
         }
     }
 
-    /// The other two categories, in Tab order.
+    /// The other two categories, in Tab order from this one.
     pub fn others(self) -> [Category; 2] {
-        match self {
-            Category::Anime => [Category::Movies, Category::Series],
-            Category::Movies => [Category::Series, Category::Anime],
-            Category::Series => [Category::Anime, Category::Movies],
-        }
+        let i = self.index();
+        [1, 2].map(|k| Self::ALL[(i + k) % Self::ALL.len()])
+    }
+
+    /// The category k tabs after this one, or before when negative.
+    pub fn shifted(self, k: isize) -> Category {
+        let len = Self::ALL.len() as isize;
+        Self::ALL[(self.index() as isize + k).rem_euclid(len) as usize]
+    }
+
+    /// Where the category is in ALL.
+    pub fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|&c| c == self)
+            .expect("ALL has every category")
     }
 
     /// The sites to search, at endpoints, with nyaa restricted to user's
@@ -124,6 +140,52 @@ impl Failed {
     }
 }
 
+/// What to say about a search of category's sites for query that found
+/// found results, with failed holding the sites, out of sites, whose search
+/// failed: which sites didn't answer, or where else to look when nothing was
+/// found, or nothing when all went well. Tab switches category in both the
+/// command line's search and the app's.
+pub fn summary(
+    category: Category,
+    query: &str,
+    found: usize,
+    failed: &Failed,
+    sites: usize,
+) -> String {
+    let unanswered = failed.unanswered.join(" and ");
+    if sites > 0 && failed.unanswered.len() == sites {
+        return format!("{unanswered} didn't answer. Check your connection and try again.");
+    }
+    let mut notes: Vec<String> = failed.errors.iter().map(|e| format!("{e}.")).collect();
+    if !unanswered.is_empty() {
+        notes.insert(0, format!("{unanswered} didn't answer."));
+    }
+    let missing = notes.join(" ");
+    // No results says nothing when no site could search.
+    if found > 0 || failed.count() == sites {
+        return missing;
+    }
+    let missing = if missing.is_empty() {
+        missing
+    } else {
+        missing + " "
+    };
+    let [a, b] = category.others().map(Category::name);
+    let query = query.trim();
+    let none = if query.is_empty() {
+        format!("No {} to show.", category.name())
+    } else {
+        format!("No {} results for \"{query}\".", category.name())
+    };
+    format!("{missing}{none} Tab searches {a} and {b}.")
+}
+
+/// A client for searching, which gives each request TIMEOUT. Searches can
+/// share one to reuse its connections.
+pub fn client() -> reqwest::Result<Client> {
+    reqwest::Client::builder().timeout(TIMEOUT).build()
+}
+
 /// Searches providers for query in parallel, and as each one answers, passes
 /// its name and results to found. Dead torrents, with no seeders, are left
 /// out, and so is a torrent another site already listed, going by info hash.
@@ -131,15 +193,12 @@ impl Failed {
 /// Returns the sites whose search failed, such as by being unavailable or
 /// rate limiting; they pass nothing to found.
 pub async fn search(
+    client: &Client,
     providers: &[Arc<dyn Provider>],
     query: &Query,
     mut found: impl FnMut(&'static str, Vec<Torrent>),
 ) -> Failed {
     let mut failed = Failed::default();
-    let Ok(client) = reqwest::Client::builder().timeout(TIMEOUT).build() else {
-        failed.unanswered = providers.iter().map(|p| p.name()).collect();
-        return failed;
-    };
     let mut tasks = JoinSet::new();
     for (i, provider) in providers.iter().enumerate() {
         let (provider, client, query) = (provider.clone(), client.clone(), query.clone());
@@ -274,11 +333,85 @@ mod tests {
     /// order they answered, and the sites that failed.
     async fn titles(providers: &[Arc<dyn Provider>]) -> (Vec<(&'static str, Vec<String>)>, Failed) {
         let mut found = Vec::new();
-        let failed = search(providers, &Query::new("x"), |site, items| {
+        let client = client().unwrap();
+        let failed = search(&client, providers, &Query::new("x"), |site, items| {
             found.push((site, items.into_iter().map(|it| it.title).collect()));
         })
         .await;
         (found, failed)
+    }
+
+    #[test]
+    fn categories_in_tab_order() {
+        use Category::*;
+        assert_eq!(Anime.others(), [Movies, Series]);
+        assert_eq!(Series.others(), [Anime, Movies]);
+        assert_eq!(Anime.shifted(1), Movies);
+        assert_eq!(Anime.shifted(-1), Series);
+        assert_eq!(Series.shifted(1), Anime);
+        assert_eq!(Movies.index(), 1);
+    }
+
+    #[test]
+    fn summaries() {
+        use Category::*;
+        let failed = |unanswered: &[&'static str], errors: &[&str]| Failed {
+            unanswered: unanswered.to_vec(),
+            errors: errors.iter().map(|e| e.to_string()).collect(),
+        };
+        let none = failed(&[], &[]);
+        assert_eq!(summary(Movies, "x", 5, &none, 2), "");
+        assert_eq!(
+            summary(Movies, "x", 5, &failed(&["tpb"], &[]), 2),
+            "tpb didn't answer."
+        );
+        assert_eq!(
+            summary(Movies, "x", 0, &failed(&["yts", "tpb"], &[]), 2),
+            "yts and tpb didn't answer. Check your connection and try again."
+        );
+        assert_eq!(
+            summary(Anime, "sintel ", 0, &none, 1),
+            "No anime results for \"sintel\". Tab searches movies and series."
+        );
+        assert_eq!(
+            summary(Series, "x", 0, &failed(&["tpb"], &[]), 2),
+            "tpb didn't answer. No series results for \"x\". Tab searches anime and movies."
+        );
+        assert_eq!(
+            summary(Movies, "", 0, &none, 2),
+            "No movies to show. Tab searches series and anime."
+        );
+        // A site's own error is shown as is, without blaming the connection.
+        assert_eq!(
+            summary(
+                Anime,
+                "x",
+                0,
+                &failed(&[], &["nyaa user \"typo\" not found"]),
+                1
+            ),
+            "nyaa user \"typo\" not found."
+        );
+        assert_eq!(
+            summary(
+                Movies,
+                "x",
+                3,
+                &failed(&["yts"], &["searching tpb: 429 Too Many Requests"]),
+                2
+            ),
+            "yts didn't answer. searching tpb: 429 Too Many Requests."
+        );
+        assert_eq!(
+            summary(
+                Movies,
+                "x",
+                0,
+                &failed(&["yts"], &["parsing tpb results"]),
+                2
+            ),
+            "yts didn't answer. parsing tpb results."
+        );
     }
 
     #[tokio::test]

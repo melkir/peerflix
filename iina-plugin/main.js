@@ -1,10 +1,11 @@
 // Runs in each player. In the ones the search window opened on a stream, it
 // loads the stream's subtitles once the video loads, shows the download's
-// status the search window sends until it's done, and tells the search window
-// when the player closes, to end the stream.
+// status the search window sends until it's done, lets the download be paused
+// from the Plugin menu, and tells the search window when the player closes,
+// to end the stream; it closes when the search window stops the stream.
 
-const { event, global, menu, mpv, overlay } = iina;
-const { describe, done } = require("./status.js");
+const { core, event, global, menu, mpv, overlay } = iina;
+const { done, pausable } = require("./status.js");
 
 // How long the status stays once the download is done, in milliseconds.
 const DONE_FOR = 5000;
@@ -35,8 +36,11 @@ if (global.getLabel() === "peerflix") {
 
   global.onMessage("status", (s) => {
     status = s;
+    updatePauseItem();
     render();
   });
+
+  global.onMessage("stop", () => core.stop());
 
   event.on("iina.window-loaded", () => {
     windowLoaded = true;
@@ -47,6 +51,21 @@ if (global.getLabel() === "peerflix") {
 
   const item = menu.item("Show Download Status", toggle, { selected: shown });
   menu.addItem(item);
+  const pauseItem = menu.item("Pause Download", () => global.postMessage("pause", null), {
+    enabled: false,
+  });
+  menu.addItem(pauseItem);
+
+  // Titles the pause item for the download's state, refreshing the menu only
+  // when that changes.
+  function updatePauseItem() {
+    const title = status.state === "paused" ? "Resume Download" : "Pause Download";
+    const enabled = pausable(status);
+    if (title === pauseItem.title && enabled === pauseItem.enabled) return;
+    pauseItem.title = title;
+    pauseItem.enabled = enabled;
+    menu.forceUpdate();
+  }
 
   function toggle() {
     shown = !shown;
@@ -76,7 +95,7 @@ if (global.getLabel() === "peerflix") {
       overlay.hide();
       return;
     }
-    overlay.setContent(`<div class="status">${describe(status)}</div>`);
+    overlay.setContent(`<div class="status">${status.text}</div>`);
     overlay.show();
     if (done(status) && !expiring) {
       expiring = setTimeout(() => {

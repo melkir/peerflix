@@ -1,5 +1,6 @@
-//! Serves files over HTTP with range support, which is what players need to
-//! start playback early and to seek.
+//! Serving files over HTTP with range support, which is what players need to
+//! start playback early and to seek, and a control to start, follow, pause
+//! and stop the stream.
 
 use std::{
     convert::Infallible,
@@ -13,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{TryStreamExt, future::BoxFuture};
 use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::UnsyncBoxBody};
@@ -61,11 +63,38 @@ pub struct Pick {
 /// Where to send a pick's answer: the stream's JSON, or why it didn't start.
 pub type Reply = oneshot::Sender<Result<String, String>>;
 
+/// The download behind a stream, which its control reports on and pauses.
+pub trait Download: Send + Sync {
+    /// How it's going, as JSON.
+    fn status_json(&self) -> String;
+
+    /// Pauses it, with paused, or resumes it.
+    fn set_paused(&self, paused: bool) -> BoxFuture<'static, anyhow::Result<()>>;
+}
+
+/// The port streams are served on unless another is asked for.
+pub const DEFAULT_PORT: u16 = 8888;
+
+/// Binds a stream's port on localhost. Without an explicit port, that's
+/// DEFAULT_PORT, or a random one when it's taken.
+pub async fn bind_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
+    let want = port.unwrap_or(DEFAULT_PORT);
+    match TcpListener::bind(("127.0.0.1", want)).await {
+        Ok(l) => Ok(l),
+        Err(e) if port.is_none() && e.kind() == std::io::ErrorKind::AddrInUse => {
+            Ok(TcpListener::bind(("127.0.0.1", 0)).await?)
+        }
+        Err(e) => Err(e).with_context(|| format!("listening on port {want}")),
+    }
+}
+
 /// An HTTP server on localhost for a stream, until dropped.
 ///
 /// At CONTROL_PATH, it answers for the stream itself: a PUT asks to start
-/// streaming, with `?index=N` for a given file, a GET returns the stream's
-/// status once it has started, and a DELETE cancels the server's stop token.
+/// streaming, with `?index=N` for a given file, and once it has started,
+/// `?pause` and `?resume` pause and resume its download; a GET returns the
+/// stream's status once it has started, and a DELETE cancels the server's
+/// stop token.
 /// Once streaming, it serves each file at `/<escaped name>`, and the first on
 /// every other path.
 pub struct Server {
@@ -82,12 +111,12 @@ struct Shared {
     connections: Connections,
 }
 
-/// The files a server streams, and how to tell their download's status.
+/// The files a server streams, and their download.
 struct Streaming {
     files: Vec<File>,
     /// The escaped names of files, in the same order.
     paths: Vec<String>,
-    status: Box<dyn Fn() -> String + Send + Sync>,
+    download: Arc<dyn Download>,
 }
 
 impl Server {
@@ -129,14 +158,14 @@ impl Server {
         &self.shared.connections
     }
 
-    /// Starts streaming files, with status for the control's GET. A server
-    /// streams once.
-    pub fn stream(&self, files: Vec<File>, status: impl Fn() -> String + Send + Sync + 'static) {
+    /// Starts streaming files, which the control reports on and pauses as
+    /// download. A server streams once.
+    pub fn stream(&self, files: Vec<File>, download: Arc<dyn Download>) {
         let paths = files.iter().map(|f| path_escape(&f.name)).collect();
         let streaming = Streaming {
             files,
             paths,
-            status: Box::new(status),
+            download,
         };
         let first = self.shared.streaming.set(streaming).is_ok();
         assert!(first, "a server streams once");
@@ -149,13 +178,14 @@ impl Shared {
             // Without CORS headers, a web page can send this but can't read
             // the answer.
             Method::GET => match self.streaming.get() {
-                Some(streaming) => json((streaming.status)()),
+                Some(streaming) => json(streaming.download.status_json()),
                 None => text(StatusCode::CONFLICT, "not streaming yet"),
             },
             // A web page can't send PUT or DELETE to another site without
             // asking first in a CORS preflight, which gets a 405 below.
-            Method::PUT => match query_index(query) {
-                Ok(index) => self.pick(index).await,
+            Method::PUT => match put_query(query) {
+                Ok(Put::Pick(index)) => self.pick(index).await,
+                Ok(Put::Pause(paused)) => self.pause(paused).await,
                 Err(()) => text(StatusCode::BAD_REQUEST, "index isn't a number"),
             },
             Method::DELETE => {
@@ -166,6 +196,21 @@ impl Shared {
                     .unwrap()
             }
             _ => not_allowed("GET, PUT, DELETE"),
+        }
+    }
+
+    /// Pauses the download, or resumes it, once streaming.
+    async fn pause(&self, paused: bool) -> Response<Body> {
+        let Some(streaming) = self.streaming.get() else {
+            return text(StatusCode::CONFLICT, "not streaming yet");
+        };
+        match streaming.download.set_paused(paused).await {
+            Ok(()) => Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(empty())
+                .unwrap(),
+            // Such as pausing it twice.
+            Err(e) => text(StatusCode::CONFLICT, format!("{e:#}")),
         }
     }
 
@@ -186,13 +231,25 @@ impl Shared {
     }
 }
 
-/// Parses the index in a query such as `index=3`, if there's one.
-fn query_index(query: Option<&str>) -> Result<Option<usize>, ()> {
-    let value = query
-        .unwrap_or("")
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("index="));
-    value.map(|v| v.parse().map_err(|_| ())).transpose()
+/// What a PUT to the control asks for.
+#[derive(Debug, PartialEq)]
+enum Put {
+    /// To start streaming the file at the index, if there's one.
+    Pick(Option<usize>),
+    /// To pause the download, with true, or resume it.
+    Pause(bool),
+}
+
+/// Parses a PUT's query: `pause` or `resume`, or the file to pick, as in
+/// `index=3`, if there's one.
+fn put_query(query: Option<&str>) -> Result<Put, ()> {
+    let mut pairs = query.unwrap_or("").split('&');
+    if let Some(pair) = pairs.clone().find(|&p| p == "pause" || p == "resume") {
+        return Ok(Put::Pause(pair == "pause"));
+    }
+    let value = pairs.find_map(|pair| pair.strip_prefix("index="));
+    let index = value.map(|v| v.parse().map_err(|_| ())).transpose()?;
+    Ok(Put::Pick(index))
 }
 
 /// Counts the connections players have open to a server, to tell whether
@@ -204,6 +261,21 @@ pub struct Connections(Arc<AtomicUsize>);
 impl Connections {
     pub fn count(&self) -> usize {
         self.0.load(Ordering::Relaxed)
+    }
+
+    /// Returns once no player has been connected for idle, with the time
+    /// before the first one connects counting too.
+    pub async fn idle(&self, idle: Duration) {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        let mut since = tokio::time::Instant::now();
+        loop {
+            ticker.tick().await;
+            if self.count() > 0 {
+                since = tokio::time::Instant::now();
+            } else if since.elapsed() >= idle {
+                return;
+            }
+        }
     }
 
     /// Counts one more connection until the returned guard is dropped.
@@ -539,10 +611,43 @@ mod tests {
         Server::start(listener, stop).unwrap()
     }
 
+    /// A download with a fixed status, which records its pauses, failing a
+    /// second one in a row as librqbit does.
+    #[derive(Default)]
+    struct FakeDownload {
+        status: &'static str,
+        paused: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    impl Download for FakeDownload {
+        fn status_json(&self) -> String {
+            self.status.into()
+        }
+
+        fn set_paused(&self, p: bool) -> BoxFuture<'static, anyhow::Result<()>> {
+            let paused = self.paused.clone();
+            Box::pin(async move {
+                let mut paused = paused.lock().unwrap();
+                if paused.last() == Some(&p) {
+                    anyhow::bail!("already {}", if p { "paused" } else { "running" });
+                }
+                paused.push(p);
+                Ok(())
+            })
+        }
+    }
+
+    fn download(status: &'static str) -> Arc<FakeDownload> {
+        Arc::new(FakeDownload {
+            status,
+            ..Default::default()
+        })
+    }
+
     /// Starts a server streaming files, with status for its control.
     async fn streaming(files: Vec<File>, status: &'static str) -> Server {
         let (server, _) = start(CancellationToken::new()).await;
-        server.stream(files, || status.into());
+        server.stream(files, download(status));
         server
     }
 
@@ -586,7 +691,7 @@ mod tests {
         let starting = put("");
         let pick = picks.recv().await.unwrap();
         assert_eq!(pick.index, None);
-        server.stream(vec![bytes_file("video.mkv", b"video")], || "{}".into());
+        server.stream(vec![bytes_file("video.mkv", b"video")], download("{}"));
         pick.reply
             .send(Ok(r#"{"name":"video.mkv"}"#.into()))
             .unwrap();
@@ -603,11 +708,27 @@ mod tests {
     async fn controls_the_stream() {
         let stop = CancellationToken::new();
         let (server, _) = start(stop.clone()).await;
-        server.stream(vec![bytes_file("video.mkv", b"video")], || {
-            r#"{"downloaded":5}"#.into()
-        });
+        assert_eq!(
+            reqwest::Client::new()
+                .put(format!("{}?pause", server.control_url()))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            409,
+            "pausing before streaming"
+        );
+        let fake = download(r#"{"downloaded":5}"#);
+        let paused = fake.paused.clone();
+        server.stream(vec![bytes_file("video.mkv", b"video")], fake);
         let url = server.control_url();
         let client = reqwest::Client::new();
+
+        for (query, want) in [("pause", 204), ("pause", 409), ("resume", 204)] {
+            let resp = client.put(format!("{url}?{query}")).send().await.unwrap();
+            assert_eq!(resp.status(), want, "{query}");
+        }
+        assert_eq!(*paused.lock().unwrap(), [true, false]);
 
         let resp = client.get(&url).send().await.unwrap();
         assert_eq!(resp.status(), 200);
@@ -633,16 +754,18 @@ mod tests {
     }
 
     #[test]
-    fn query_indexes() {
+    fn put_queries() {
         for (query, want) in [
-            (None, Ok(None)),
-            (Some(""), Ok(None)),
-            (Some("index=3"), Ok(Some(3))),
-            (Some("x=1&index=12"), Ok(Some(12))),
+            (None, Ok(Put::Pick(None))),
+            (Some(""), Ok(Put::Pick(None))),
+            (Some("index=3"), Ok(Put::Pick(Some(3)))),
+            (Some("x=1&index=12"), Ok(Put::Pick(Some(12)))),
             (Some("index="), Err(())),
             (Some("index=-1"), Err(())),
+            (Some("pause"), Ok(Put::Pause(true))),
+            (Some("x=1&resume"), Ok(Put::Pause(false))),
         ] {
-            assert_eq!(query_index(query), want, "{query:?}");
+            assert_eq!(put_query(query), want, "{query:?}");
         }
     }
 

@@ -1,17 +1,20 @@
 //! Picking from lists in fzf: the live search and the episode picker.
 
 use std::{
-    io::Write,
+    io::{IsTerminal, Write},
     process::{Command, Stdio},
     sync::Arc,
 };
 
 use anyhow::Context;
-use peerflix::{
+use peerflix_core::{
     providers::{Provider, Query, Torrent},
-    search::{self, Category, Failed},
+    search::{self, Category},
+    torrent::files::{TorrentFile, pick_file},
+    util::human_bytes,
 };
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 
 /// Options both lists share. Lines are tab separated: the value to return,
 /// which is hidden, then columns shown with ANSI colors, of which the second
@@ -128,12 +131,13 @@ pub fn search_interactive(
 /// well.
 pub async fn print_results(
     w: &mut impl Write,
+    client: &search::Client,
     category: Category,
     providers: &[Arc<dyn Provider>],
     query: &str,
 ) -> String {
     let mut printed = 0;
-    let failed = search::search(providers, &Query::new(query), |site, items| {
+    let failed = search::search(client, providers, &Query::new(query), |site, items| {
         // The site column is only worth its space when there are several.
         let site = (providers.len() > 1).then_some(site);
         for it in items {
@@ -144,7 +148,7 @@ pub async fn print_results(
         let _ = w.flush();
     })
     .await;
-    status(category, query, printed, &failed, providers.len())
+    search::summary(category, query, printed, &failed, providers.len())
 }
 
 /// The live search's line for it: the torrent URL, a tab, the date, size,
@@ -162,43 +166,6 @@ fn line(it: &Torrent, site: Option<&str>) -> String {
     )
 }
 
-/// The header line for a search that printed printed results, with failed
-/// holding the sites, out of sites, whose search failed.
-fn status(
-    category: Category,
-    query: &str,
-    printed: usize,
-    failed: &Failed,
-    sites: usize,
-) -> String {
-    let unanswered = failed.unanswered.join(" and ");
-    if failed.unanswered.len() == sites {
-        return format!("{unanswered} didn't answer. Check your connection and try again.");
-    }
-    let mut notes: Vec<String> = failed.errors.iter().map(|e| format!("{e}.")).collect();
-    if !unanswered.is_empty() {
-        notes.insert(0, format!("{unanswered} didn't answer."));
-    }
-    let missing = notes.join(" ");
-    // No results says nothing when no site could search.
-    if printed > 0 || failed.count() == sites {
-        return missing;
-    }
-    let missing = if missing.is_empty() {
-        missing
-    } else {
-        missing + " "
-    };
-    let [a, b] = category.others().map(Category::name);
-    let query = query.trim();
-    let none = if query.is_empty() {
-        format!("No {} to show.", category.name())
-    } else {
-        format!("No {} results for \"{query}\".", category.name())
-    };
-    format!("{missing}{none} Tab searches {a} and {b}.")
-}
-
 /// Rates a live torrent by its seeders relative to its leechers, as the
 /// color to print its seeder count in.
 fn health(it: &Torrent) -> &'static str {
@@ -208,6 +175,36 @@ fn health(it: &Torrent) -> &'static str {
         Equal => "\x1b[33m",
         Less => "\x1b[38;5;208m",
     }
+}
+
+/// Returns the file to stream: the one at index if given, else one the user
+/// picks in fzf among eps, the torrent's episodes, when there are several and
+/// stdin is a terminal, else the one pick_file chooses. None means peerflix
+/// was cancelled meanwhile.
+pub async fn select_file(
+    cancel: &CancellationToken,
+    files: &[TorrentFile],
+    eps: &[usize],
+    index: Option<usize>,
+) -> anyhow::Result<Option<usize>> {
+    if index.is_some() || eps.len() < 2 || !std::io::stdin().is_terminal() {
+        return pick_file(files, index).map(Some);
+    }
+    let lines: String = eps
+        .iter()
+        .map(|&i| {
+            let f = &files[i];
+            format!(
+                "{i}\t\x1b[90m{:>9}\x1b[0m  \t{}\n",
+                human_bytes(f.len),
+                f.path
+            )
+        })
+        .collect();
+    let Some(choice) = cancel.run_until_cancelled(choose("episode> ", lines)).await else {
+        return Ok(None);
+    };
+    Ok(Some(choice?.parse().context("reading fzf's choice")?))
 }
 
 /// Runs fzf over lines, each the value to return, a tab, a detail column, a
@@ -295,68 +292,6 @@ mod tests {
 
         let l = line(&it, Some("yts"));
         assert!(l.contains("   42\x1b[90m  yts \x1b[0m \t"), "{l:?}");
-    }
-
-    #[test]
-    fn statuses() {
-        use Category::*;
-        let failed = |unanswered: &[&'static str], errors: &[&str]| Failed {
-            unanswered: unanswered.to_vec(),
-            errors: errors.iter().map(|e| e.to_string()).collect(),
-        };
-        let none = failed(&[], &[]);
-        assert_eq!(status(Movies, "x", 5, &none, 2), "");
-        assert_eq!(
-            status(Movies, "x", 5, &failed(&["tpb"], &[]), 2),
-            "tpb didn't answer."
-        );
-        assert_eq!(
-            status(Movies, "x", 0, &failed(&["yts", "tpb"], &[]), 2),
-            "yts and tpb didn't answer. Check your connection and try again."
-        );
-        assert_eq!(
-            status(Anime, "sintel ", 0, &none, 1),
-            "No anime results for \"sintel\". Tab searches movies and series."
-        );
-        assert_eq!(
-            status(Series, "x", 0, &failed(&["tpb"], &[]), 2),
-            "tpb didn't answer. No series results for \"x\". Tab searches anime and movies."
-        );
-        assert_eq!(
-            status(Movies, "", 0, &none, 2),
-            "No movies to show. Tab searches series and anime."
-        );
-        // A site's own error is shown as is, without blaming the connection.
-        assert_eq!(
-            status(
-                Anime,
-                "x",
-                0,
-                &failed(&[], &["nyaa user \"typo\" not found"]),
-                1
-            ),
-            "nyaa user \"typo\" not found."
-        );
-        assert_eq!(
-            status(
-                Movies,
-                "x",
-                3,
-                &failed(&["yts"], &["searching tpb: 429 Too Many Requests"]),
-                2
-            ),
-            "yts didn't answer. searching tpb: 429 Too Many Requests."
-        );
-        assert_eq!(
-            status(
-                Movies,
-                "x",
-                0,
-                &failed(&["yts"], &["parsing tpb results"]),
-                2
-            ),
-            "yts didn't answer. parsing tpb results."
-        );
     }
 
     #[test]

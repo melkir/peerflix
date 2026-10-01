@@ -6,7 +6,7 @@ use std::{cmp::Ordering, path::Path};
 use anyhow::{Context, bail};
 use librqbit::ListOnlyResponse;
 
-use crate::stream::content_type;
+use crate::http::content_type;
 
 pub struct TorrentFile {
     pub path: String,

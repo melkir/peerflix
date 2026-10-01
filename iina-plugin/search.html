@@ -51,6 +51,7 @@
     ul { list-style: none; margin: 0; padding: 0; }
     li { padding: 8px 12px; border-bottom: 1px solid var(--line); cursor: default; }
     li:hover { background: var(--hover); }
+    li.selected { background: color-mix(in srgb, AccentColor 18%, transparent); }
     .title { overflow-wrap: anywhere; }
     .meta, .state, .note { margin-top: 2px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
     .state:empty { display: none; }
@@ -78,14 +79,26 @@
     .bad { color: var(--bad); }
     footer { border-top: 1px solid var(--line); background: var(--bar); font-size: 11px; }
     footer:empty { display: none; }
-    footer div { display: flex; gap: 12px; padding: 5px 12px; font-variant-numeric: tabular-nums; }
+    footer div { display: flex; align-items: center; gap: 12px; padding: 5px 12px; font-variant-numeric: tabular-nums; }
     footer .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     footer .text { color: var(--muted); white-space: nowrap; }
+    footer button {
+      padding: 0 4px;
+      border: none;
+      background: none;
+      color: var(--muted);
+      font: inherit;
+      font-size: 12px;
+      line-height: 16px;
+    }
+    footer button:hover { color: CanvasText; }
   </style>
 </head>
 <body>
   <header>
-    <input type="search" id="query" placeholder="Title, IMDb ID (tt1254207), or a magnet link" autofocus />
+    <input type="search" id="query" placeholder="Title, IMDb ID (tt1254207), or a magnet link" autofocus
+      aria-describedby="keys" />
+    <span id="keys" hidden>Up and Down select a result, Enter opens it, Tab switches category.</span>
     <div class="tabs" role="group" aria-label="Category">
       <button data-category="anime">Anime</button>
       <button data-category="movies">Movies</button>
@@ -111,8 +124,9 @@
       category: "anime",
       // Whether a search is waiting for its results.
       searching: false,
-      // The latest results, with the category and query they're for and a
-      // note on the sites that failed. They're kept while episodes are shown.
+      // The latest results, with the category and query they're for and
+      // peerflix's summary of the search: the sites that failed, or where else
+      // to look when nothing was found. They're kept while episodes are shown.
       results: null,
       // Why the latest search failed, if it did.
       error: "",
@@ -123,11 +137,20 @@
       // pick the plugin's answers carry, and how it goes: text, and kind,
       // "pending" or "failed".
       picking: null,
-      // The streams being played, each a name and how its download is going.
+      // The row the arrows move through and Enter opens, by its place in the
+      // list.
+      selected: 0,
+      // The streams being played, each a player id, name, how its download is
+      // going, and whether it's paused and can be.
       streams: [],
     };
     let timer = null;
     let picks = 0;
+
+    const CATEGORIES = ["anime", "movies", "series"];
+    // How long fetching a torrent's files goes before its row says it can
+    // take a while, in milliseconds.
+    const SLOW = 15000;
 
     function isSource(query) {
       return /^(magnet:|https?:\/\/)/.test(query.trim());
@@ -138,7 +161,8 @@
     function rows() {
       if (state.torrent) {
         const { source, episodes } = state.torrent;
-        return episodes.map((e) => ({ source, index: e.index, title: e.path, meta: [e.size] }));
+        const names = episodeNames(episodes);
+        return episodes.map((e, i) => ({ source, index: e.index, title: names[i], meta: [e.size] }));
       }
       return (state.results?.results ?? []).map((r) => ({
         source: r.url,
@@ -149,6 +173,14 @@
       }));
     }
 
+    // Each episode's file name, or its path when another has the same name.
+    function episodeNames(episodes) {
+      const name = (e) => e.path.split("/").pop();
+      const counts = new Map();
+      for (const e of episodes) counts.set(name(e), (counts.get(name(e)) ?? 0) + 1);
+      return episodes.map((e) => (counts.get(name(e)) > 1 ? e.path : name(e)));
+    }
+
     function isPicked(row) {
       const p = state.picking;
       return p != null && p.source === row.source && p.index === row.index;
@@ -157,10 +189,13 @@
     // Changes what the list shows, from its top. The episodes it stops
     // showing, and a pick whose row it stops showing, are given up.
     function setList(changes) {
-      const hadEpisodes = state.torrent != null;
+      const left = state.torrent?.source;
+      const hadEpisodes = left != null;
       Object.assign(state, changes);
       const lost = state.picking != null && !rows().some(isPicked);
       if (lost) state.picking = null;
+      // Back from the episodes, the torrent they're from stays selected.
+      state.selected = Math.max(0, state.torrent ? 0 : rows().findIndex((r) => r.source === left));
       if (lost || (hadEpisodes && !state.torrent)) iina.postMessage("cancel", null);
       render();
       $("main").scrollTop = 0;
@@ -180,8 +215,28 @@
         kind: "pending",
       };
       const title = state.torrent?.title ?? row.title;
-      iina.postMessage(episode ? "play" : "choose", { pick: id, source: row.source, title, index: row.index });
+      iina.postMessage(episode ? "playEpisode" : "open", { pick: id, source: row.source, title, index: row.index });
+      if (!episode) {
+        setTimeout(() => {
+          if (state.picking?.pick !== id || state.picking.text !== "Fetching files…") return;
+          updatePick(id, { text: "Fetching files… A torrent with few seeders can take minutes." });
+        }, SLOW);
+      }
       render();
+    }
+
+    // Moves the selection by delta rows, keeping it in view.
+    function select(delta) {
+      const count = rows().length;
+      if (!count) return;
+      state.selected = Math.min(Math.max(state.selected + delta, 0), count - 1);
+      render();
+      $("list").children[state.selected]?.scrollIntoView({ block: "nearest" });
+    }
+
+    function setCategory(category) {
+      state.category = category;
+      search();
     }
 
     // Applies changes to the row being started, if it's still pick's.
@@ -193,11 +248,12 @@
 
     function search() {
       clearTimeout(timer);
+      timer = null;
       const query = $("query").value;
       // A pasted magnet link or URL plays straight away.
       if (isSource(query)) {
         const source = query.trim();
-        const results = { results: [{ title: source, url: source }], note: "" };
+        const results = { results: [{ title: source, url: source }], summary: "" };
         setList({ results, error: "", torrent: null, searching: false });
         pick(rows()[0]);
         return;
@@ -214,8 +270,8 @@
       $("crumb").hidden = !state.torrent;
       $("crumb-title").textContent = state.torrent?.title ?? "";
       $("main").classList.toggle("searching", state.searching);
-      const items = rows().map(rowElement);
-      const note = state.torrent ? "" : state.results?.note;
+      const items = rows().map((row, i) => rowElement(row, i === state.selected));
+      const note = state.torrent ? "" : state.results?.summary;
       if (items.length && note) items.push(noteElement(note));
       $("list").replaceChildren(...items);
       const [text, error] = items.length ? ["", false] : emptyText();
@@ -228,15 +284,12 @@
     function emptyText() {
       if (state.searching) return ["Searching…", false];
       if (state.error) return [state.error, true];
-      if (!state.results) return ["", false];
-      const { category, query, note } = state.results;
-      const q = query.trim();
-      const none = q ? `No ${category} results for “${q}”.` : `No ${category} to show.`;
-      return [[none, note].filter(Boolean).join(" "), false];
+      return [state.results?.summary ?? "", false];
     }
 
-    function rowElement(row) {
+    function rowElement(row, selected) {
       const li = document.createElement("li");
+      li.classList.toggle("selected", selected);
       const t = document.createElement("div");
       t.className = "title";
       t.textContent = row.title;
@@ -268,10 +321,11 @@
       return span;
     }
 
-    // Each stream being played, with how its download is going.
+    // Each stream being played, with how its download is going and buttons
+    // to pause it and to stop it.
     function renderStreams() {
       $("streams").replaceChildren(
-        ...state.streams.map(({ name, text }) => {
+        ...state.streams.map(({ id, name, text, paused, pausable }) => {
           const div = document.createElement("div");
           const n = document.createElement("span");
           n.className = "name";
@@ -280,9 +334,27 @@
           t.className = "text";
           t.textContent = text;
           div.append(n, t);
+          if (pausable) {
+            const label = paused ? "Resume download" : "Pause download";
+            div.append(button(paused ? "▶" : "❙❙", label, () => iina.postMessage("pause", { id })));
+          }
+          div.append(button("✕", "Stop and close the player", () => iina.postMessage("stop", { id })));
           return div;
         })
       );
+    }
+
+    function button(text, label, onClick) {
+      const b = document.createElement("button");
+      b.textContent = text;
+      b.title = label;
+      b.setAttribute("aria-label", label);
+      b.addEventListener("click", () => {
+        onClick();
+        // Typing, the arrows and Tab keep working.
+        $("query").focus();
+      });
+      return b;
     }
 
     iina.onMessage("results", (data) => {
@@ -317,14 +389,27 @@
       timer = setTimeout(search, 400);
     });
     $("query").addEventListener("keydown", (e) => {
-      if (e.key === "Enter") search();
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        select(e.key === "ArrowDown" ? 1 : -1);
+      } else if (e.key === "Enter") {
+        // What's typed is searched first, then Enter opens the selection.
+        const row = rows()[state.selected];
+        if (timer != null || state.searching || !row) search();
+        else pick(row);
+      } else if (e.key === "Tab") {
+        // As in peerflix's search on the command line.
+        e.preventDefault();
+        const i = CATEGORIES.indexOf(state.category) + (e.shiftKey ? -1 : 1);
+        setCategory(CATEGORIES[(i + CATEGORIES.length) % CATEGORIES.length]);
+      } else if (e.key === "Escape" && state.torrent) {
+        e.preventDefault();
+        setList({ torrent: null });
+      }
     });
 
     for (const b of document.querySelectorAll(".tabs button")) {
-      b.addEventListener("click", () => {
-        state.category = b.dataset.category;
-        search();
-      });
+      b.addEventListener("click", () => setCategory(b.dataset.category));
     }
 
     search();
