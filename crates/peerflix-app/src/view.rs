@@ -531,7 +531,7 @@ impl Peerflix {
                             .rounded_full()
                             .bg(cx.theme().secondary)
                             .when(searching, |input| {
-                                input.suffix(Spinner::new().color(cx.theme().muted_foreground))
+                                input.suffix(loader().color(cx.theme().muted_foreground))
                             }),
                     ),
             )
@@ -574,7 +574,7 @@ impl Peerflix {
                 .items_center()
                 .justify_center()
                 .gap_3()
-                .child(Spinner::new().large())
+                .child(loader().large())
                 .child("Fetching the torrent's files…")
                 .child(
                     div()
@@ -680,6 +680,11 @@ fn framed<D: TableDelegate>(table: DataTable<D>, cx: &App) -> impl IntoElement {
         .border_color(theme.border)
         .rounded_b(theme.radius)
         .child(table.bordered(false))
+}
+
+/// A spinner turning a loader-circle.
+fn loader() -> Spinner {
+    Spinner::new().icon(Icon::new(AssetIcon::LoaderCircle))
 }
 
 /// Tells in a notification that the torrent picked couldn't be opened, and
