@@ -1,5 +1,5 @@
 // The search window, and the players it opens on peerflix's streams.
-// peerflix does the searching and streaming; see --json in its README.
+// peerflix does the searching and streaming; see its docs/json.md.
 
 const { global, http, menu, preferences, standaloneWindow: win, utils } = iina;
 const { pausable } = require("./status.js");

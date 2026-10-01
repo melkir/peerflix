@@ -74,7 +74,7 @@ struct Cli {
     #[arg(long, help_heading = "Stream")]
     no_upnp: bool,
 
-    /// Print JSON for programs, such as the IINA plugin (see the README)
+    /// Print JSON for programs, such as the IINA plugin (see docs/json.md)
     #[arg(long, conflicts_with = "print")]
     json: bool,
 
