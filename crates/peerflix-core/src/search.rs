@@ -1,8 +1,8 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 pub use reqwest::Client;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::providers::{
     Provider, Query, Torrent,
@@ -62,27 +62,28 @@ impl Category {
         user: &str,
         trusted: bool,
     ) -> Vec<Arc<dyn Provider>> {
-        let ep = endpoints.clone();
         match self {
             Category::Anime => vec![Arc::new(Nyaa {
-                base: ep.nyaa,
+                base: endpoints.nyaa.clone(),
                 user: user.to_owned(),
                 trusted,
             })],
             Category::Movies => vec![
-                Arc::new(Yts { base: ep.yts }),
+                Arc::new(Yts {
+                    base: endpoints.yts.clone(),
+                }),
                 Arc::new(Tpb {
-                    base: ep.tpb,
+                    base: endpoints.tpb.clone(),
                     kind: tpb::Kind::Movies,
                 }),
             ],
             Category::Series => vec![
                 Arc::new(Eztv {
-                    base: ep.eztv,
-                    imdb: ep.imdb,
+                    base: endpoints.eztv.clone(),
+                    imdb: endpoints.imdb.clone(),
                 }),
                 Arc::new(Tpb {
-                    base: ep.tpb,
+                    base: endpoints.tpb.clone(),
                     kind: tpb::Kind::Tv,
                 }),
             ],
@@ -197,25 +198,22 @@ pub async fn search(
     mut found: impl FnMut(&'static str, Vec<Torrent>),
 ) -> Failed {
     let mut failed = Failed::default();
-    let mut tasks = JoinSet::new();
-    for (i, provider) in providers.iter().enumerate() {
-        let (provider, client, query) = (provider.clone(), client.clone(), query.clone());
-        tasks.spawn(async move {
+    // Polled together rather than spawned: the sites are waited on, not
+    // worked, and a panic aborts the release builds either way.
+    let mut searches: FuturesUnordered<_> = providers
+        .iter()
+        .map(|provider| async move {
             // The client's timeout bounds each request, and a site can make
             // several rounds of them, as EZTV does.
             // None if it timed out.
-            let items = tokio::time::timeout(TIMEOUT, provider.search(&client, &query))
+            let items = tokio::time::timeout(TIMEOUT, provider.search(client, query))
                 .await
                 .ok();
-            (i, items)
-        });
-    }
+            (provider.name(), items)
+        })
+        .collect();
     let mut seen = HashSet::new();
-    let mut answered = Vec::new();
-    while let Some(res) = tasks.join_next().await {
-        let Ok((i, items)) = res else { continue };
-        answered.push(i);
-        let name = providers[i].name();
+    while let Some((name, items)) = searches.next().await {
         let items = match items {
             Some(Ok(items)) => items,
             Some(Err(e)) if !unreachable(&e) => {
@@ -233,12 +231,6 @@ pub async fn search(
             .filter(|it| it.info_hash.is_empty() || seen.insert(it.info_hash.clone()))
             .collect();
         found(name, live);
-    }
-    // A task that panicked never reported its site.
-    for (i, p) in providers.iter().enumerate() {
-        if !answered.contains(&i) {
-            failed.unanswered.push(p.name());
-        }
     }
     failed
 }

@@ -94,16 +94,14 @@ pub fn subtitles(files: &[TorrentFile], id: usize, single: bool) -> Vec<usize> {
         .filter(|(_, f)| !f.padding && is_subtitle(f))
         .filter(|(_, f)| {
             let path = f.path.to_lowercase();
-            let named = lower_stem(&path)
+            let sub_stem = lower_stem(&path);
+            let named = sub_stem
                 .strip_prefix(&stem)
                 .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()));
             let in_dir = Path::new(&path)
                 .parent()
                 .is_some_and(|d| d.iter().any(|c| c.to_string_lossy() == stem));
-            single
-                || named
-                || in_dir
-                || tag.is_some_and(|t| episode_tag(&lower_stem(&path)) == Some(t))
+            single || named || in_dir || tag.is_some_and(|t| episode_tag(&sub_stem) == Some(t))
         })
         .map(|(i, _)| i)
         .collect()

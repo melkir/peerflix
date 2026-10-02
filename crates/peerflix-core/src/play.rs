@@ -6,7 +6,9 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use futures_util::future::BoxFuture;
-use librqbit::{AddTorrent, ListOnlyResponse, ManagedTorrent, Session, api::TorrentIdOrHash};
+use librqbit::{
+    AddTorrent, ListOnlyResponse, ManagedTorrent, Session, TorrentStats, api::TorrentIdOrHash,
+};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
@@ -78,9 +80,9 @@ impl Listing {
             bail!("the torrent is already playing");
         }
         let subs = subtitles(files, id, episodes.len() <= 1);
-        let downloading: Vec<usize> = std::iter::once(id).chain(subs.iter().copied()).collect();
+        let wanted: Vec<usize> = std::iter::once(id).chain(subs.iter().copied()).collect();
         let storage = PartStorage::new(meta.output_folder.clone());
-        let torrent = add_torrent(session, meta, &storage, &downloading).await?;
+        let torrent = add_torrent(session, meta, &storage, &wanted).await?;
         let control = Control {
             session: session.clone(),
             torrent,
@@ -99,8 +101,7 @@ impl Listing {
             stream,
             control,
             storage,
-            files: files.clone(),
-            downloading,
+            downloading: wanted.iter().map(|&i| (i, files[i].len)).collect(),
         })
     }
 }
@@ -110,9 +111,9 @@ pub struct Playing {
     pub stream: Stream,
     control: Control,
     storage: PartStorage,
-    files: Vec<TorrentFile>,
-    /// The files still downloading, the one streamed among them.
-    downloading: Vec<usize>,
+    /// The files still downloading, by id and size, the one streamed among
+    /// them.
+    downloading: Vec<(usize, u64)>,
 }
 
 impl Playing {
@@ -156,8 +157,8 @@ impl Playing {
                     initialized = true;
                 }
                 _ = ticker.tick() => {
-                    self.complete_files();
-                    on_status(&self.control.status());
+                    let stats = self.complete_files();
+                    on_status(&Status::new(&stats, self.control.id, self.control.size));
                 }
             }
         };
@@ -170,10 +171,12 @@ impl Playing {
         result.and(removed.context("removing the torrent"))
     }
 
-    /// Drops their .part suffix from the files that have finished.
-    fn complete_files(&mut self) {
+    /// Drops their .part suffix from the files that have finished, and
+    /// returns the torrent's stats they were told by.
+    fn complete_files(&mut self) -> TorrentStats {
         let stats = self.control.torrent.stats();
-        complete_files(&self.storage, &stats, &self.files, &mut self.downloading);
+        complete_files(&self.storage, &stats, &mut self.downloading);
+        stats
     }
 }
 

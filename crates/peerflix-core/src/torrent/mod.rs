@@ -237,16 +237,15 @@ pub(crate) fn serve_files(
     stream
 }
 
-/// Drops their .part suffix from the downloading files that have finished,
-/// and removes them from downloading.
+/// Drops their .part suffix from the downloading files, by id and size, that
+/// have finished, and removes them from downloading.
 pub(crate) fn complete_files(
     storage: &PartStorage,
     stats: &TorrentStats,
-    files: &[TorrentFile],
-    downloading: &mut Vec<usize>,
+    downloading: &mut Vec<(usize, u64)>,
 ) {
-    downloading.retain(|&i| {
-        let done = stats.file_progress.get(i) == Some(&files[i].len);
+    downloading.retain(|&(i, len)| {
+        let done = stats.file_progress.get(i) == Some(&len);
         // A failed rename is retried on the next tick.
         !(done && storage.complete(i).is_ok())
     });

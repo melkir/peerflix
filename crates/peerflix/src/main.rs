@@ -113,26 +113,16 @@ fn run_on_tokio(cli: Cli) -> anyhow::Result<()> {
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let user = nyaa_user(cli.user.as_deref().unwrap_or(""));
     let mut source = cli.source.join(" ");
-    if cli.json && !is_torrent_source(&source) {
+    if cli.print || (cli.json && !is_torrent_source(&source)) {
         let providers = cli
             .category
             .providers(&Endpoints::from_env(), user, cli.trusted);
         let client = search::client()?;
         let out = &mut std::io::stdout().lock();
-        return json::print_results(out, &client, cli.category, &providers, &source).await;
-    }
-    if cli.print {
-        let providers = cli
-            .category
-            .providers(&Endpoints::from_env(), user, cli.trusted);
-        let status = fzf::print_results(
-            &mut std::io::stdout().lock(),
-            &search::client()?,
-            cli.category,
-            &providers,
-            &source,
-        )
-        .await;
+        if cli.json {
+            return json::print_results(out, &client, cli.category, &providers, &source).await;
+        }
+        let status = fzf::print_results(out, &client, cli.category, &providers, &source).await;
         // The interactive search shows it as its header.
         if let Some(path) = std::env::var_os("PEERFLIX_STATUS") {
             let _ = std::fs::write(path, status);

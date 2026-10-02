@@ -1,7 +1,6 @@
 use anyhow::{Context, anyhow};
-use futures_util::future::BoxFuture;
+use futures_util::future::{BoxFuture, join_all};
 use serde::Deserialize;
-use tokio::task::JoinSet;
 
 use crate::{
     providers::{Episode, Provider, Query, Torrent, get_json},
@@ -113,7 +112,7 @@ async fn show_id(
 }
 
 /// Fetches up to max_pages pages of the show's torrents, newest first; pages
-/// after the first are fetched in parallel.
+/// after the first are fetched concurrently.
 async fn torrents(
     client: &reqwest::Client,
     base: &str,
@@ -123,18 +122,10 @@ async fn torrents(
     let first = page(client, base, id, 1).await?;
     let pages = first.torrents_count.div_ceil(PAGE_SIZE).min(max_pages);
     let mut items = first.torrents;
-    let mut rest = JoinSet::new();
-    for n in 2..=pages {
-        let (client, base, id) = (client.clone(), base.to_owned(), id.to_owned());
-        rest.spawn(async move { (n, page(&client, &base, &id, n).await) });
-    }
-    let mut later: Vec<_> = rest.join_all().await;
-    later.sort_by_key(|(n, _)| *n);
-    for (_, p) in later {
-        // Later pages are a bonus; keep what arrived.
-        if let Ok(p) = p {
-            items.extend(p.torrents);
-        }
+    let later = join_all((2..=pages).map(|n| page(client, base, id, n))).await;
+    // Later pages are a bonus; keep what arrived.
+    for p in later.into_iter().flatten() {
+        items.extend(p.torrents);
     }
     Ok(items)
 }

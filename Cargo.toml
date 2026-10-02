@@ -36,7 +36,7 @@ peerflix-core = { path = "crates/peerflix-core" }
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
-futures-util = { version = "0.3", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

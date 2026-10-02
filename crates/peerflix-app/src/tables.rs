@@ -26,11 +26,12 @@ fn remaining(width: Pixels, rest: Pixels) -> Pixels {
     (width - rest - CHROME).max(MIN_WIDTH)
 }
 
-/// A search result as the table shows it, made once when it arrives.
+/// A search result as the table shows it, made once when it arrives. Its
+/// text is shared, so copies of cached results are cheap.
 #[derive(Clone)]
 pub struct Found {
     /// The magnet or .torrent URL.
-    pub url: String,
+    pub url: SharedString,
     pub title: SharedString,
     size: SharedString,
     seeders: SharedString,
@@ -52,7 +53,7 @@ impl Found {
             health: t.seeders.cmp(&t.leechers),
             bytes: size_bytes(&t.size),
             seeder_count: t.seeders,
-            url: t.url,
+            url: t.url.into(),
             title: t.title.into(),
             size: t.size.into(),
             date: t.date.into(),
