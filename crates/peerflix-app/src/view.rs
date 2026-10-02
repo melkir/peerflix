@@ -7,7 +7,7 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Theme, WindowExt as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -19,8 +19,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Render, SharedString, Styled as _, Subscription, Task,
-    Window, div, prelude::FluentBuilder as _, px,
+    IntoElement, MouseButton, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _,
+    Subscription, Task, Window, div, point, prelude::FluentBuilder as _, px,
 };
 // The full Lucide catalog's names, beside gpui-component's IconName.
 use gpui_kit::assets::IconName as AssetIcon;
@@ -49,6 +49,20 @@ const SLOW: Duration = Duration::from_secs(15);
 /// How long a category's results without search terms are shown again
 /// without searching anew. Older ones still show at once while they refresh.
 const FRESH: Duration = Duration::from_secs(5 * 60);
+
+/// The title bar's height, a toolbar's, as Transmission's.
+const TITLE_BAR_HEIGHT: f32 = 52.;
+
+/// The traffic lights' height, to center them in the title bar.
+const TRAFFIC_LIGHT_SIZE: f32 = 14.;
+
+/// Where the traffic lights go, centered in the title bar.
+pub const TRAFFIC_LIGHTS: Point<Pixels> =
+    point(px(18.), px((TITLE_BAR_HEIGHT - TRAFFIC_LIGHT_SIZE) / 2.));
+
+/// How far the title bar's controls stay from its left edge, clear of the
+/// traffic lights.
+const TRAFFIC_LIGHTS_WIDTH: Pixels = px(88.);
 
 pub struct Peerflix {
     category: Category,
@@ -507,32 +521,58 @@ impl Peerflix {
             .update(cx, |streams, cx| streams.play(title, listing, id, cx));
     }
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The title bar, a toolbar as Transmission's: the categories and the
+    /// search box.
+    fn render_title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.category.index();
         let searching = self.results.read(cx).delegate().searching;
-        h_flex()
-            .gap_3()
-            .p_3()
+        let theme = cx.theme();
+        TitleBar::new()
+            .h(px(TITLE_BAR_HEIGHT))
+            // Of a piece with the window below it.
+            .bg(theme.background)
+            .border_b_0()
+            // Fullscreen hides the traffic lights.
+            .pl(if window.is_fullscreen() {
+                px(0.)
+            } else {
+                TRAFFIC_LIGHTS_WIDTH
+            })
+            .pr_3()
             .child(
-                TabBar::new("categories")
-                    .segmented()
-                    .selected_index(selected)
-                    .on_click(cx.listener(|this, ix: &usize, window, cx| {
-                        this.set_category(Category::ALL[*ix], window, cx);
-                    }))
-                    .children(Category::ALL.map(|c| Tab::new().label(capitalized(c.name())))),
-            )
-            .child(
-                div()
+                h_flex()
                     .flex_1()
-                    // A filled pill, as ChatGPT's composer.
+                    .gap_3()
                     .child(
-                        Input::new(&self.query)
-                            .rounded_full()
-                            .bg(cx.theme().secondary)
-                            .when(searching, |input| {
-                                input.suffix(loader().color(cx.theme().muted_foreground))
-                            }),
+                        // The tabs don't keep their clicks to themselves, and a
+                        // click on one that moves would drag the window.
+                        div()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                TabBar::new("categories")
+                                    .segmented()
+                                    .selected_index(selected)
+                                    .on_click(cx.listener(|this, ix: &usize, window, cx| {
+                                        this.set_category(Category::ALL[*ix], window, cx);
+                                    }))
+                                    .children(
+                                        Category::ALL
+                                            .map(|c| Tab::new().label(capitalized(c.name()))),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            // A filled pill, as ChatGPT's composer.
+                            .child(
+                                Input::new(&self.query)
+                                    .rounded_full()
+                                    .bg(theme.secondary)
+                                    .when(searching, |input| {
+                                        input.suffix(loader().color(theme.muted_foreground))
+                                    }),
+                            ),
                     ),
             )
     }
@@ -631,7 +671,7 @@ impl Peerflix {
 }
 
 impl Render for Peerflix {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (background, foreground) = (theme.background, theme.foreground);
         v_flex()
@@ -658,7 +698,7 @@ impl Render for Peerflix {
                     this.back(window, cx);
                 }
             }))
-            .child(self.render_header(cx))
+            .child(self.render_title_bar(window, cx))
             .child(div().flex_1().min_h_0().child(self.render_page(cx)))
             .child(self.streams.clone())
     }

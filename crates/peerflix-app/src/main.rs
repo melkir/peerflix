@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use gpui_kit::{
     AppContext as _, AssetSource, Bounds, KeyBinding, Menu, MenuItem, SharedString,
-    TitlebarOptions, WindowBounds, WindowOptions, px, size,
+    TitlebarOptions, WindowBounds, WindowOptions, component::TitleBar, px, size,
 };
 use peerflix_core::{search, torrent, util};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -114,13 +114,17 @@ fn main() {
             cx.on_window_closed(|cx, _| cx.quit()).detach();
 
             let bounds = Bounds::centered(None, size(px(1040.), px(680.)), cx);
+            // The window draws its own title bar, a toolbar as Transmission's,
+            // with the traffic lights centered in it.
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
+                    // Hidden, but named in the Dock's menu and Mission Control.
                     title: Some("Peerflix".into()),
-                    ..Default::default()
+                    traffic_light_position: Some(view::TRAFFIC_LIGHTS),
+                    ..TitleBar::title_bar_options()
                 }),
-                ..Default::default()
+                ..TitleBar::window_options()
             };
             let opened = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| Peerflix::new(window, cx))
