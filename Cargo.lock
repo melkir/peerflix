@@ -5805,7 +5805,7 @@ dependencies = [
 
 [[package]]
 name = "peerflix"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5819,7 +5819,7 @@ dependencies = [
 
 [[package]]
 name = "peerflix-app"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -5832,7 +5832,7 @@ dependencies = [
 
 [[package]]
 name = "peerflix-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "bytes",
