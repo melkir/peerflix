@@ -2,7 +2,10 @@ use anyhow::{Context, bail};
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
 
-use crate::providers::{Provider, Query, Torrent};
+use crate::{
+    providers::{Provider, Query, Torrent},
+    util::parse_bytes,
+};
 
 pub const NYAA_URL: &str = "https://nyaa.si";
 
@@ -129,7 +132,7 @@ impl From<Item> for Torrent {
             date: it.date(),
             url: it.torrent,
             title: it.title,
-            size: it.size,
+            size: parse_bytes(&it.size).unwrap_or(0),
             seeders: it.seeders,
             leechers: it.leechers,
             info_hash: it.info_hash.to_ascii_lowercase(),
@@ -196,7 +199,7 @@ pub(crate) mod tests {
         assert_eq!(it.title, "[Group] Big Buck Bunny - 01 [1080p].mkv");
         assert_eq!(it.url, "https://nyaa.si/download/1.torrent");
         assert_eq!((it.seeders, it.leechers), (42, 3));
-        assert_eq!(it.size, "1.2 GiB");
+        assert_eq!(it.size, 1_288_490_188);
         assert_eq!(it.date, "2026-09-26");
         assert_eq!(it.info_hash, "0123456789abcdef0123456789abcdef01234567");
         assert_eq!((items[1].seeders, items[1].leechers), (0, 0));

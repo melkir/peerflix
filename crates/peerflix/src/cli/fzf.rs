@@ -160,11 +160,17 @@ fn line(it: &Torrent, site: Option<&str>) -> String {
         "{}\t\x1b[90m{}  {:>10}\x1b[0m  {}{:>5}\x1b[90m{site}\x1b[0m \t{}",
         it.url,
         it.date,
-        it.size,
+        human_bytes(it.size),
         health(it),
         it.seeders,
-        it.title
+        one_line(&it.title)
     )
+}
+
+/// Text from a site or a torrent, with its tabs, newlines and other control
+/// characters made spaces, so it keeps to its column of one line.
+fn one_line(s: &str) -> String {
+    s.replace(char::is_control, " ")
 }
 
 /// Rates a live torrent by its seeders relative to its leechers, as the
@@ -198,7 +204,7 @@ pub async fn select_file(
             format!(
                 "{i}\t\x1b[90m{:>9}\x1b[0m  \t{}\n",
                 human_bytes(f.len),
-                f.path
+                one_line(&f.path)
             )
         })
         .collect();
@@ -272,7 +278,7 @@ mod tests {
             url: "https://nyaa.si/download/1.torrent".into(),
             title: "[Group] Big Buck Bunny - 01 [1080p].mkv".into(),
             date: "2026-09-26".into(),
-            size: "1.2 GiB".into(),
+            size: 1_288_490_188,
             seeders: 42,
             leechers: 3,
             ..Torrent::default()
@@ -290,6 +296,15 @@ mod tests {
             fields[1]
         );
         assert_eq!(fields[2], "[Group] Big Buck Bunny - 01 [1080p].mkv");
+
+        // A title's tabs and newlines would make columns and lines of their own.
+        let odd = Torrent {
+            title: "Big\tBuck\nBunny".into(),
+            ..Torrent::default()
+        };
+        let l = line(&odd, None);
+        assert_eq!(l.split('\t').count(), 3, "{l:?}");
+        assert!(l.ends_with("\tBig Buck Bunny"), "{l:?}");
 
         let l = line(&it, Some("yts"));
         assert!(l.contains("   42\x1b[90m  yts \x1b[0m \t"), "{l:?}");

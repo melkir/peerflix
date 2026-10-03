@@ -23,7 +23,8 @@ waits for the program there:
   stream's `name`, `url` and `subtitles` (each a `name` and `url`).
 - `GET control` answers with the stream's status, as in
   `{"state":"downloading","downloaded":314572800,"size":1395864371,"download_speed":4718592,"peers":14,"seen":52,"text":" 22.5%     4.5 MiB/s  14 peers, 52 seen"}`:
-  its `state` (`checking` data from an earlier run, `downloading`, `paused` or `done`), the video's
+  its `state` (`checking` data from an earlier run, `downloading`, `paused`, `done`, or
+  `failed`, as when the disk is full, which ends the stream), the video's
   bytes, the torrent's bytes per second and peers, and the line peerflix shows for it.
 - `PUT control?pause` and `PUT control?resume` pause and resume the download once streaming; the
   player waits meanwhile.

@@ -202,7 +202,7 @@ async fn stream_torrent(
         return Ok(());
     };
     let playing = playing?;
-    let stream = &playing.stream;
+    let stream = playing.stream.clone();
     eprintln!(
         "Streaming {} ({})\n{}",
         stream.video.name,
@@ -214,13 +214,11 @@ async fn stream_torrent(
         eprintln!("Subtitles: {}", names.join(", "));
     }
 
-    let url = stream.video.url.clone();
-    let subs: Vec<_> = stream.subtitles.iter().map(|s| s.url.clone()).collect();
     let player = async {
         if cli.no_play {
             std::future::pending().await
         } else {
-            Iina::open(&url, &subs)?.wait().await
+            Iina::open(&stream)?.wait().await
         }
     };
     // Progress rewrites one line, which only suits a terminal.

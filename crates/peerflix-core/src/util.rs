@@ -1,5 +1,5 @@
-//! Helpers the rest share: formatting sizes and dates, building magnets, and
-//! raising the open file limit.
+//! Helpers the rest share: formatting and reading sizes, formatting dates,
+//! building magnets, and raising the open file limit.
 
 pub fn human_bytes(n: u64) -> String {
     const UNIT: u64 = 1024;
@@ -18,6 +18,19 @@ pub fn human_bytes(n: u64) -> String {
         n as f64 / div as f64,
         char::from(b"KMGTPE"[exp])
     )
+}
+
+/// Reads a size as human_bytes writes it, or as nyaa does, such as 1.2 GiB
+/// or 940 Bytes, into bytes. None if it isn't one.
+pub fn parse_bytes(s: &str) -> Option<u64> {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let (n, unit) = s.trim().split_once(' ')?;
+    let n: f64 = n.parse().ok()?;
+    let exp = match unit {
+        "Byte" | "Bytes" => 0,
+        unit => UNITS.iter().position(|&u| u == unit)?,
+    };
+    (n >= 0.).then(|| (n * 1024f64.powi(exp as i32)) as u64)
 }
 
 /// Raises the soft limit on open files as far as the system allows. Peer
@@ -103,6 +116,26 @@ mod tests {
             (3 << 40, "3.0 TiB"),
         ] {
             assert_eq!(human_bytes(n), want);
+        }
+    }
+
+    #[test]
+    fn parses_sizes() {
+        for (s, want) in [
+            ("1023 B", Some(1023)),
+            ("940 Bytes", Some(940)),
+            ("1 Byte", Some(1)),
+            ("1.5 KiB", Some(1536)),
+            (" 2.0 GiB ", Some(2 << 30)),
+            ("", None),
+            ("big", None),
+            ("3 parsecs", None),
+            ("-1 KiB", None),
+        ] {
+            assert_eq!(parse_bytes(s), want, "{s:?}");
+        }
+        for n in [0, 1023, 1536, 5 << 30] {
+            assert_eq!(parse_bytes(&human_bytes(n)), Some(n));
         }
     }
 

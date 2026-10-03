@@ -246,6 +246,11 @@ fn put_query(query: Option<&str>) -> Result<Put, ()> {
     Ok(Put::Pick(index))
 }
 
+/// How long a stream goes without a player connected before it ends: the
+/// player may have gone away, or lingers without its window. IINA keeps its
+/// connection while the video is open, paused or not.
+pub const IDLE: Duration = Duration::from_secs(30);
+
 /// Counts the connections players have open to a server, to tell whether
 /// one is still watching. A connection counts once it asks for a file, so one
 /// that only asks for the control, such as a plugin showing the status, doesn't.
@@ -257,16 +262,16 @@ impl Connections {
         self.0.load(Ordering::Relaxed)
     }
 
-    /// Returns once no player has been connected for idle, with the time
+    /// Returns once no player has been connected for IDLE, with the time
     /// before the first one connects counting too.
-    pub async fn idle(&self, idle: Duration) {
+    pub async fn idle(&self) {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         let mut since = tokio::time::Instant::now();
         loop {
             ticker.tick().await;
             if self.count() > 0 {
                 since = tokio::time::Instant::now();
-            } else if since.elapsed() >= idle {
+            } else if since.elapsed() >= IDLE {
                 return;
             }
         }
@@ -410,8 +415,11 @@ fn content_range(range: std::fmt::Arguments<'_>) -> HeaderValue {
 /// Whether a Host header names the loopback address the server listens on,
 /// or is absent, as with HTTP/1.0 clients.
 fn local_host(host: Option<&HeaderValue>) -> bool {
-    let Some(host) = host.and_then(|h| h.to_str().ok().or(Some("?"))) else {
+    let Some(host) = host else {
         return true;
+    };
+    let Ok(host) = host.to_str() else {
+        return false;
     };
     let name = match host.strip_prefix('[') {
         Some(v6) => v6.split_once(']').map_or(v6, |(a, _)| a),

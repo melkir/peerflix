@@ -136,6 +136,9 @@ pub enum State {
     Paused,
     /// The file is all there.
     Done,
+    /// The download hit an error it doesn't recover from, such as a full
+    /// disk.
+    Failed,
 }
 
 /// How the streamed file's download is going.
@@ -160,9 +163,10 @@ impl Status {
         let downloaded = stats.file_progress.get(id).copied().unwrap_or(0);
         let state = match stats.state {
             TorrentStatsState::Initializing { .. } => State::Checking,
+            TorrentStatsState::Error => State::Failed,
             _ if downloaded >= size => State::Done,
             TorrentStatsState::Paused => State::Paused,
-            _ => State::Downloading,
+            TorrentStatsState::Live => State::Downloading,
         };
         Status {
             state,
@@ -192,6 +196,7 @@ impl Status {
         let percent = self.percent();
         match self.state {
             State::Checking => "Checking existing data...".into(),
+            State::Failed => "Download failed".into(),
             State::Done => format!("{percent:5.1}%  downloaded"),
             State::Paused => format!("{percent:5.1}%  paused"),
             State::Downloading => format!(
@@ -305,6 +310,35 @@ mod tests {
         status.downloaded = status.size;
         assert_eq!(status.describe(), "100.0%  downloaded");
         assert!(!status.pausable());
+    }
+
+    #[test]
+    fn states_from_stats() {
+        let status = |state, downloaded| {
+            let stats = TorrentStats {
+                state,
+                file_progress: vec![downloaded],
+                error: None,
+                progress_bytes: 0,
+                uploaded_bytes: 0,
+                total_bytes: 0,
+                finished: false,
+                live: None,
+            };
+            Status::new(&stats, 0, 10).state
+        };
+        let initializing = TorrentStatsState::Initializing { paused: false };
+        for (state, downloaded, want) in [
+            (initializing, 10, State::Checking),
+            (TorrentStatsState::Live, 5, State::Downloading),
+            (TorrentStatsState::Live, 10, State::Done),
+            (TorrentStatsState::Paused, 5, State::Paused),
+            (TorrentStatsState::Paused, 10, State::Done),
+            // Even with the file all there, as the stream ends.
+            (TorrentStatsState::Error, 10, State::Failed),
+        ] {
+            assert_eq!(status(state, downloaded), want, "{downloaded}");
+        }
     }
 
     #[test]

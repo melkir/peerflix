@@ -19,6 +19,9 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{runtime::Runtime, view::Peerflix};
 
+/// How long quitting waits for the streams and the session to stop.
+const QUIT_WAIT: Duration = Duration::from_secs(2);
+
 gpui_kit::actions!(
     peerflix,
     [
@@ -64,7 +67,11 @@ impl AssetSource for AppAssets {
 
 fn main() {
     util::raise_open_file_limit();
-    let (rt, runtime) = match start() {
+    // Kept for as long as the app runs. Quitting exits the process from
+    // within run once on_app_quit's handler returns, so tokio is never shut
+    // down: librqbit's blocking disk tasks aren't waited on, and the next
+    // run's data check catches any piece they didn't finish writing.
+    let (_rt, runtime) = match start() {
         Ok(started) => started,
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -99,16 +106,27 @@ fn main() {
                 disabled: false,
             }]);
             // Stop the streams, which closes their players and names their
-            // finished files, then the session, before quitting.
+            // finished files, then the session, before quitting. GPUI only
+            // gives the future returned 200 ms before the process exits, so
+            // this waits here instead, for up to QUIT_WAIT. GPUI's thread
+            // isn't one of tokio's, so it can block on it.
             cx.on_app_quit(|cx| {
                 let rt = cx.global::<Runtime>();
                 rt.shutdown.cancel();
                 rt.streams.close();
                 let (streams, session) = (rt.streams.clone(), rt.session.clone());
-                runtime::spawn(cx, async move {
+                let stopping = async move {
                     streams.wait().await;
                     session.stop().await;
-                })
+                };
+                // The timeout is made in tokio, which its timer needs.
+                let stopped = rt
+                    .tokio
+                    .block_on(async { tokio::time::timeout(QUIT_WAIT, stopping).await });
+                if stopped.is_err() {
+                    eprintln!("Quitting without waiting further for the streams to stop");
+                }
+                std::future::ready(())
             })
             .detach();
             cx.on_window_closed(|cx, _| cx.quit()).detach();
@@ -135,10 +153,6 @@ fn main() {
             }
             cx.activate(true);
         });
-
-    // Don't wait on librqbit's blocking disk tasks; the next run's data check
-    // catches any piece they didn't finish writing.
-    rt.shutdown_timeout(Duration::from_secs(1));
 }
 
 /// Starts tokio, and on it the torrent session and the search client.

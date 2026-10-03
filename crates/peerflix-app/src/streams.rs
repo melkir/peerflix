@@ -2,7 +2,7 @@
 //! progress and buttons to pause and stop it, and streaming each into an IINA
 //! of its own, on tokio.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _,
@@ -29,11 +29,6 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::{self, Runtime};
-
-/// How long a stream goes without a player connected before it ends, for a
-/// player that lingers without its window: IINA keeps its connection while
-/// the video is open, paused or not.
-const IDLE: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub struct Streams {
@@ -317,8 +312,9 @@ impl Render for Streams {
 }
 
 /// Streams file id of listing into an IINA of its own until stop is
-/// cancelled, the player quits, or no player has been connected for IDLE,
-/// sending how it's going to events. The player closes as the stream ends.
+/// cancelled, the player quits, or no player has been connected for
+/// http::IDLE, sending how it's going to events. The player closes as the
+/// stream ends.
 async fn stream(
     session: &Arc<Session>,
     listing: &Listing,
@@ -335,21 +331,19 @@ async fn stream(
         return Ok(());
     };
     let playing = playing?;
-    let stream = &playing.stream;
+    let stream = playing.stream.clone();
     let _ = events.send(Event::Playing {
         name: stream.video.name.clone(),
         control: playing.control(),
     });
-    let url = stream.video.url.clone();
-    let subs: Vec<_> = stream.subtitles.iter().map(|s| s.url.clone()).collect();
     let connections = server.connections();
     // Opened in here, so it's closed when watching stops, and failing to open
     // it still removes the torrent.
     let player = async {
-        let mut iina = Iina::open(&url, &subs)?;
+        let mut iina = Iina::open(&stream)?;
         tokio::select! {
             quit = iina.wait() => quit,
-            () = connections.idle(IDLE) => Ok(()),
+            () = connections.idle() => Ok(()),
         }
     };
     playing

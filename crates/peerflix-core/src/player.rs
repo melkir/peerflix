@@ -4,9 +4,11 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 
+use crate::torrent::Stream;
+
 /// Joins paths into an mpv path list: colon separated, with a backslash
 /// escaping a colon or backslash within a path.
-fn mpv_path_list(paths: &[String]) -> String {
+fn mpv_path_list(paths: &[&str]) -> String {
     let escaped: Vec<_> = paths
         .iter()
         .map(|p| p.replace('\\', "\\\\").replace(':', "\\:"))
@@ -24,8 +26,8 @@ pub struct Iina {
 }
 
 impl Iina {
-    /// Opens the stream in a new IINA with the subtitle URLs.
-    pub fn open(url: &str, subs: &[String]) -> anyhow::Result<Iina> {
+    /// Opens the stream's video in a new IINA, with its subtitles.
+    pub fn open(stream: &Stream) -> anyhow::Result<Iina> {
         let bin = std::env::var_os("PATH")
             .and_then(|path| {
                 std::env::split_paths(&path)
@@ -39,10 +41,11 @@ impl Iina {
             .context("IINA not found; install it with `brew install --cask iina`")?;
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(["--no-stdin", "--keep-running"]);
+        let subs: Vec<_> = stream.subtitles.iter().map(|s| s.url.as_str()).collect();
         if !subs.is_empty() {
-            cmd.arg(format!("--mpv-sub-files={}", mpv_path_list(subs)));
+            cmd.arg(format!("--mpv-sub-files={}", mpv_path_list(&subs)));
         }
-        let cli = cmd.arg(url).spawn().context("running IINA")?;
+        let cli = cmd.arg(&stream.video.url).spawn().context("running IINA")?;
         Ok(Iina { cli })
     }
 
@@ -75,7 +78,7 @@ mod tests {
 
     #[test]
     fn mpv_path_lists() {
-        let urls = ["http://127.0.0.1:8888/a.srt".to_owned(), r"b\c".to_owned()];
+        let urls = ["http://127.0.0.1:8888/a.srt", r"b\c"];
         assert_eq!(mpv_path_list(&urls), r"http\://127.0.0.1\:8888/a.srt:b\\c");
     }
 }

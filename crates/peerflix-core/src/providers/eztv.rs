@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::{
     providers::{Episode, Provider, Query, Torrent, get_json},
-    util::{human_bytes, unix_date},
+    util::unix_date,
 };
 
 pub const EZTV_URL: &str = "https://eztvx.to";
@@ -156,7 +156,7 @@ impl From<Item> for Torrent {
             title: title.to_owned(),
             url: it.magnet_url,
             date: unix_date(it.date_released_unix),
-            size: human_bytes(it.size_bytes.parse().unwrap_or(0)),
+            size: it.size_bytes.parse().unwrap_or(0),
             seeders: it.seeds,
             leechers: it.peers,
             info_hash: it.hash.to_ascii_lowercase(),
@@ -188,7 +188,7 @@ mod tests {
             "magnet:?xt=urn:btih:a017ac9bf02de9e36f1f9177bdb60612186b0b0d"
         );
         assert_eq!((it.seeders, it.leechers), (7, 2));
-        assert_eq!(it.size, "1.6 GiB");
+        assert_eq!(it.size, 1_726_335_609);
         assert_eq!(it.date, "2026-09-28");
         assert_eq!(it.info_hash, "a017ac9bf02de9e36f1f9177bdb60612186b0b0d");
 

@@ -2,6 +2,7 @@
 //! from, and the streams playing.
 
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -82,6 +83,9 @@ pub struct Peerflix {
     /// at once when its tab is picked again or the search box is cleared.
     browse: [Option<Browse>; Category::ALL.len()],
     page: Page,
+    /// The torrents opened so far, by URL, to show their episodes again at
+    /// once rather than fetching their files anew.
+    listings: HashMap<SharedString, Arc<Listing>>,
     streams: Entity<Streams>,
     /// The window's width, which the tables' first columns fill.
     width: Pixels,
@@ -129,8 +133,14 @@ impl Peerflix {
             cx.new(|cx| TableState::new(Results::new(), window, cx).col_selectable(false));
         let subscriptions = vec![
             cx.subscribe_in(&query, window, |this, _, event, window, cx| match event {
-                InputEvent::Change => this.search(true, window, cx),
-                InputEvent::PressEnter { .. } => this.open_selected(window, cx),
+                InputEvent::Change => {
+                    // Typing searches anew, whose results should show.
+                    if !matches!(this.page, Page::Results) {
+                        this.back(window, cx);
+                    }
+                    this.search(true, window, cx);
+                }
+                InputEvent::PressEnter { .. } => this.confirm(window, cx),
                 _ => {}
             }),
             cx.subscribe_in(&results, window, |this, _, event, window, cx| {
@@ -160,6 +170,7 @@ impl Peerflix {
             search: None,
             browse: Default::default(),
             page: Page::Results,
+            listings: HashMap::new(),
             streams: cx.new(|_| Streams::default()),
             width: window.viewport_size().width,
             _subscriptions: subscriptions,
@@ -381,19 +392,24 @@ impl Peerflix {
         }
     }
 
-    /// Moves the selected result by delta rows.
+    /// Moves the selection in the table showing, the results or the
+    /// episodes, by delta rows.
     fn select(&mut self, delta: isize, cx: &mut Context<Self>) {
-        self.results.update(cx, |table, cx| {
-            let rows = table.delegate().found().len();
-            if rows == 0 {
-                return;
-            }
-            let row = match table.selected_row() {
-                Some(row) => row.saturating_add_signed(delta).min(rows - 1),
-                None => 0,
-            };
-            table.set_selected_row(row, cx);
-        });
+        match &self.page {
+            Page::Results => move_selection(&self.results, delta, cx),
+            Page::Episodes { table, .. } => move_selection(table, delta, cx),
+            Page::Opening { .. } => {}
+        }
+    }
+
+    /// Plays the selected episode, or opens the selected result, whichever
+    /// shows.
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.page {
+            Page::Results => self.open_selected(window, cx),
+            Page::Episodes { .. } => self.play_selected(cx),
+            Page::Opening { .. } => {}
+        }
     }
 
     /// Opens the selected result.
@@ -406,14 +422,20 @@ impl Peerflix {
             return;
         };
         let (url, title) = (found.url.clone(), found.title.clone());
+        if let Some(listing) = self.listings.get(&url) {
+            return self.show_listing(title, listing.clone(), window, cx);
+        }
         let session = cx.global::<Runtime>().session.clone();
-        let fetch = runtime::spawn(cx, async move { play::list(&session, &url).await });
+        let fetch = runtime::spawn(cx, {
+            let url = url.clone();
+            async move { play::list(&session, &url).await }
+        });
         let listing = cx.spawn_in(window, {
             let title = title.clone();
             async move |this, cx| {
                 let listed = fetch.await;
                 let _ = this.update_in(cx, |this, window, cx| {
-                    this.listed(title, listed, window, cx);
+                    this.listed(title, url, listed, window, cx);
                 });
             }
         });
@@ -435,25 +457,41 @@ impl Peerflix {
         cx.notify();
     }
 
-    /// Picks the episode to stream from listing, the files of the torrent
-    /// titled title, or streams its only video.
+    /// Keeps listing, the files of the torrent at url titled title, and
+    /// shows them, or why they couldn't be fetched.
     fn listed(
         &mut self,
         title: SharedString,
+        url: SharedString,
         listing: anyhow::Result<Listing>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let listing = match listing {
-            Ok(listing) => listing,
+        match listing {
+            Ok(listing) => {
+                let listing = Arc::new(listing);
+                self.listings.insert(url, listing.clone());
+                self.show_listing(title, listing, window, cx);
+            }
             Err(e) => {
                 couldnt_open(&e, window, cx);
-                return self.back(window, cx);
+                self.back(window, cx);
             }
-        };
+        }
+    }
+
+    /// Picks the episode to stream from listing, the files of the torrent
+    /// titled title, or streams its only video.
+    fn show_listing(
+        &mut self,
+        title: SharedString,
+        listing: Arc<Listing>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if listing.episodes.len() < 2 {
             match pick_file(&listing.files, None) {
-                Ok(id) => self.play(title, Arc::new(listing), id, cx),
+                Ok(id) => self.play(title, listing, id, cx),
                 Err(e) => couldnt_open(&e, window, cx),
             }
             return self.back(window, cx);
@@ -472,7 +510,7 @@ impl Peerflix {
         table.read(cx).focus_handle(cx).focus(window, cx);
         self.page = Page::Episodes {
             title,
-            listing: Arc::new(listing),
+            listing,
             table,
             _subscription: subscription,
         };
@@ -681,12 +719,7 @@ impl Render for Peerflix {
             .text_color(foreground)
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.select(-1, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.select(1, cx)))
-            .on_action(
-                cx.listener(|this, _: &Confirm, window, cx| match this.page {
-                    Page::Episodes { .. } => this.play_selected(cx),
-                    _ => this.open_selected(window, cx),
-                }),
-            )
+            .on_action(cx.listener(|this, _: &Confirm, window, cx| this.confirm(window, cx)))
             .on_action(cx.listener(|this, _: &NextCategory, window, cx| {
                 this.set_category(this.category.shifted(1), window, cx);
             }))
@@ -720,6 +753,21 @@ fn framed<D: TableDelegate>(table: DataTable<D>, cx: &App) -> impl IntoElement {
         .border_color(theme.border)
         .rounded_b(theme.radius)
         .child(table.bordered(false))
+}
+
+/// Moves table's selected row by delta rows, staying within its rows.
+fn move_selection<D: TableDelegate>(table: &Entity<TableState<D>>, delta: isize, cx: &mut App) {
+    table.update(cx, |table, cx| {
+        let rows = table.delegate().rows_count(cx);
+        if rows == 0 {
+            return;
+        }
+        let row = match table.selected_row() {
+            Some(row) => row.saturating_add_signed(delta).min(rows - 1),
+            None => 0,
+        };
+        table.set_selected_row(row, cx);
+    });
 }
 
 /// A spinner turning a loader-circle.

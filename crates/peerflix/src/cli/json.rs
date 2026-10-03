@@ -16,9 +16,6 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// How long a stream goes without a player connected before peerflix exits.
-const IDLE: Duration = Duration::from_secs(30);
-
 /// How long peerflix waits for a program to pick a file to stream, in case
 /// the program went away.
 const PICK_WAIT: Duration = Duration::from_secs(10 * 60);
@@ -114,7 +111,7 @@ pub fn print_files(
 /// control URL of server, waits for the program to pick one there, from
 /// picks, the file at default when it names none, and answers with the
 /// stream's JSON once it's served, until no player has been connected for
-/// IDLE.
+/// http::IDLE.
 pub async fn stream(
     cancel: &CancellationToken,
     session: &Arc<Session>,
@@ -148,7 +145,7 @@ pub async fn stream(
     // The program that picked plays it; when it's done, no one is.
     let connections = server.connections();
     let player = async {
-        connections.idle(IDLE).await;
+        connections.idle().await;
         Ok(())
     };
     playing.watch(cancel, player, |_| {}).await
@@ -239,7 +236,7 @@ mod tests {
                     url: "magnet:?xt=urn:btih:aa".into(),
                     title: "Sintel (2010) [1080p]".into(),
                     date: "2015-11-01".into(),
-                    size: "1.8 GiB".into(),
+                    size: 1_932_735_283,
                     seeders: 12,
                     leechers: 3,
                     info_hash: "aa".into(),

@@ -42,7 +42,7 @@ pub struct Found {
     /// Where it came among the results, for undoing a sort.
     order: usize,
     /// The size in bytes, and seeders, to sort by.
-    bytes: f64,
+    bytes: u64,
     seeder_count: u32,
 }
 
@@ -51,28 +51,16 @@ impl Found {
         Found {
             seeders: t.seeders.to_string().into(),
             health: t.seeders.cmp(&t.leechers),
-            bytes: size_bytes(&t.size),
+            bytes: t.size,
             seeder_count: t.seeders,
             url: t.url.into(),
             title: t.title.into(),
-            size: t.size.into(),
+            size: human_bytes(t.size).into(),
             date: t.date.into(),
             site,
             order: 0,
         }
     }
-}
-
-/// The bytes a size such as 1.4 GiB stands for, or 0 if it isn't one.
-fn size_bytes(size: &str) -> f64 {
-    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-    let Some((n, unit)) = size.trim().split_once(' ') else {
-        return 0.;
-    };
-    let (Ok(n), Some(exp)) = (n.parse::<f64>(), UNITS.iter().position(|&u| u == unit)) else {
-        return 0.;
-    };
-    n * 1024f64.powi(exp as i32)
 }
 
 /// The search results, in the order the sites answered, each site's in its
@@ -125,7 +113,7 @@ impl Col {
                 .chars()
                 .flat_map(char::to_lowercase)
                 .cmp(b.title.chars().flat_map(char::to_lowercase)),
-            Col::Size => a.bytes.total_cmp(&b.bytes),
+            Col::Size => a.bytes.cmp(&b.bytes),
             Col::Seeders => a.seeder_count.cmp(&b.seeder_count),
             Col::Date => a.date.cmp(&b.date),
             Col::Site => a.site.cmp(b.site),
@@ -455,10 +443,10 @@ mod tests {
         );
     }
 
-    fn torrent(title: &str, size: &str, seeders: u32) -> Torrent {
+    fn torrent(title: &str, size: u64, seeders: u32) -> Torrent {
         Torrent {
             title: title.into(),
-            size: size.into(),
+            size,
             seeders,
             ..Torrent::default()
         }
@@ -474,9 +462,9 @@ mod tests {
         results.add(
             "yts",
             vec![
-                torrent("b", "700.0 MiB", 5),
-                torrent("C", "1.4 GiB", 50),
-                torrent("a", "2.0 GiB", 0),
+                torrent("b", 700 << 20, 5),
+                torrent("C", 1400 << 20, 50),
+                torrent("a", 2 << 30, 0),
             ],
         );
         // Seeders sort most first, then fewest, then as they came.
@@ -489,7 +477,7 @@ mod tests {
         // Titles sort A to Z first, ignoring case.
         results.sort_by(Col::Title);
         assert_eq!(titles(&results), ["a", "b", "C"]);
-        // Sizes sort by bytes, not by their text.
+        // Sizes sort by bytes, not by their text: 700.0 MiB is the smallest.
         results.sort_by(Col::Size);
         assert_eq!(titles(&results), ["a", "C", "b"]);
     }
@@ -498,28 +486,14 @@ mod tests {
     fn sorts_results_as_they_arrive() {
         let mut results = Results::new();
         results.sort_by(Col::Seeders);
-        results.add("yts", vec![torrent("few", "1 B", 1)]);
-        results.add("tpb", vec![torrent("many", "1 B", 9)]);
+        results.add("yts", vec![torrent("few", 1, 1)]);
+        results.add("tpb", vec![torrent("many", 1, 9)]);
         assert_eq!(titles(&results), ["many", "few"]);
         // Back to the order they came.
         results.sort_by(Col::Seeders);
         results.sort_by(Col::Seeders);
         assert_eq!(titles(&results), ["few", "many"]);
         assert_eq!(results.in_order()[0].title.as_ref(), "few");
-    }
-
-    #[test]
-    fn reads_sizes() {
-        for (size, want) in [
-            ("1023 B", 1023.),
-            ("1.5 KiB", 1536.),
-            ("2.0 GiB", 2. * f64::from(1 << 30)),
-            ("", 0.),
-            ("big", 0.),
-            ("3 parsecs", 0.),
-        ] {
-            assert_eq!(size_bytes(size), want, "{size:?}");
-        }
     }
 
     #[test]

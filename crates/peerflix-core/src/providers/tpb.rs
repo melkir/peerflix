@@ -3,7 +3,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::{
     providers::{Episode, Provider, Query, Torrent, get_json},
-    util::{human_bytes, magnet, unix_date},
+    util::{magnet, unix_date},
 };
 
 /// The Pirate Bay's JSON API.
@@ -102,7 +102,7 @@ impl Provider for Tpb {
                 .map(|it| Torrent {
                     url: magnet(&it.info_hash, &it.name),
                     date: unix_date(it.added),
-                    size: human_bytes(it.size),
+                    size: it.size,
                     seeders: it.seeders.try_into().unwrap_or(u32::MAX),
                     leechers: it.leechers.try_into().unwrap_or(u32::MAX),
                     info_hash: it.info_hash.to_ascii_lowercase(),
@@ -196,14 +196,11 @@ mod tests {
             it.url
         );
         assert_eq!((it.seeders, it.leechers), (892, 94));
-        assert_eq!(it.size, "1.9 GiB");
+        assert_eq!(it.size, 1_991_613_584);
         assert_eq!(it.date, "2012-06-13");
         assert_eq!(it.info_hash, "224bf45881252643dfc2e71abc7b2660a21c68c4");
         let bad = &items[1];
-        assert_eq!(
-            (bad.seeders, bad.leechers, bad.size.as_str()),
-            (0, 0, "0 B")
-        );
+        assert_eq!((bad.seeders, bad.leechers, bad.size), (0, 0, 0));
 
         let q = srv.queries().remove(0);
         for (k, want) in [("q", "big buck bunny"), ("cat", "201,207,211")] {
@@ -234,7 +231,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         let it = &items[0];
         assert_eq!((it.seeders, it.leechers), (6824, 7648));
-        assert_eq!(it.size, "3.5 GiB");
+        assert_eq!(it.size, 3_808_117_223);
         assert_eq!(it.date, "2026-07-31");
         search(&srv.url, "", Kind::Tv).await.unwrap();
         assert_eq!(

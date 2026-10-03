@@ -8,7 +8,9 @@ pub mod yts;
 
 use anyhow::{Context, bail};
 use futures_util::future::BoxFuture;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Serialize, Serializer, de::DeserializeOwned};
+
+use crate::util::human_bytes;
 
 /// A site that can be searched for torrents.
 pub trait Provider: Send + Sync {
@@ -130,12 +132,19 @@ pub struct Torrent {
     pub title: String,
     /// YYYY-MM-DD
     pub date: String,
-    pub size: String,
+    /// In bytes, or 0 if the site doesn't say. JSON tells it as human_bytes
+    /// does, such as 1.2 GiB.
+    #[serde(serialize_with = "human_size")]
+    pub size: u64,
     pub seeders: u32,
     pub leechers: u32,
     /// The info hash in lowercase hex, or empty if the site doesn't give
     /// one.
     pub info_hash: String,
+}
+
+fn human_size<S: Serializer>(bytes: &u64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&human_bytes(*bytes))
 }
 
 /// Sends req to site and parses its JSON answer, failing unless the site

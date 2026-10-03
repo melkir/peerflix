@@ -4,10 +4,11 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use futures_util::future::BoxFuture;
 use librqbit::{
-    AddTorrent, ListOnlyResponse, ManagedTorrent, Session, TorrentStats, api::TorrentIdOrHash,
+    AddTorrent, ListOnlyResponse, ManagedTorrent, Session, TorrentStats, TorrentStatsState,
+    api::TorrentIdOrHash,
 };
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -128,8 +129,9 @@ impl Playing {
     }
 
     /// Keeps downloading, passing the status to on_status every second and
-    /// renaming the files that finish, until cancelled or player returns,
-    /// and returns the player's result. The torrent is then removed from the
+    /// renaming the files that finish, until cancelled, player returns or the
+    /// download fails, and returns the player's result or the download's
+    /// error. The player is then dropped, and the torrent removed from the
     /// session, keeping its files, so it stops downloading and can play
     /// again.
     pub async fn watch(
@@ -138,7 +140,6 @@ impl Playing {
         player: impl Future<Output = anyhow::Result<()>>,
         mut on_status: impl FnMut(&Status),
     ) -> anyhow::Result<()> {
-        tokio::pin!(player);
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
@@ -146,19 +147,29 @@ impl Playing {
         let torrent = self.control.torrent.clone();
         let mut init = torrent.wait_until_initialized();
         let mut initialized = false;
-        let result = loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break Ok(()),
-                result = &mut player => break result,
-                result = &mut init, if !initialized => {
-                    if let Err(e) = result {
-                        break Err(e.context("checking existing data"));
+        // The player is pinned in here, so it's dropped, closing it, as soon
+        // as watching stops rather than once the torrent is removed, which
+        // can outlast the time an app gets to quit.
+        let result = {
+            tokio::pin!(player);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break Ok(()),
+                    result = &mut player => break result,
+                    result = &mut init, if !initialized => {
+                        if let Err(e) = result {
+                            break Err(e.context("checking existing data"));
+                        }
+                        initialized = true;
                     }
-                    initialized = true;
-                }
-                _ = ticker.tick() => {
-                    let stats = self.complete_files();
-                    on_status(&Status::new(&stats, self.control.id, self.control.size));
+                    _ = ticker.tick() => {
+                        let stats = self.complete_files();
+                        if let TorrentStatsState::Error = stats.state {
+                            let error = stats.error.as_deref().unwrap_or("unknown error");
+                            break Err(anyhow!("downloading: {error}"));
+                        }
+                        on_status(&Status::new(&stats, self.control.id, self.control.size));
+                    }
                 }
             }
         };
