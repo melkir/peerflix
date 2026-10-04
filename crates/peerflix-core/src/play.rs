@@ -2,7 +2,12 @@
 //! one picked with its subtitles while serving them, and naming the files
 //! that finish. The command line and the app both stream through it.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    fs::{File, TryLockError},
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, anyhow, bail};
 use futures_util::future::BoxFuture;
@@ -80,6 +85,7 @@ impl Listing {
         if session.get(TorrentIdOrHash::Hash(meta.info_hash)).is_some() {
             bail!("the torrent is already playing");
         }
+        let lock = lock_torrent(&lock_path(&self.info_hash()), LOCK_WAIT).await?;
         let subs = subtitles(files, id, episodes.len() <= 1);
         let wanted: Vec<usize> = std::iter::once(id).chain(subs.iter().copied()).collect();
         let storage = PartStorage::new(meta.output_folder.clone());
@@ -102,8 +108,46 @@ impl Listing {
             stream,
             control,
             storage,
+            _lock: lock,
             downloading: wanted.iter().map(|&i| (i, files[i].len)).collect(),
         })
+    }
+}
+
+/// How long playing a torrent waits for another peerflix to stop playing
+/// it, as one that was just told to stop does once it has let go of the
+/// files.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// The file a peerflix playing the torrent with info_hash holds locked, so
+/// that two never download the same files, racing each other. It's kept
+/// regardless of where the files are, which only matters to two peerflix
+/// playing the same torrent into different directories.
+fn lock_path(info_hash: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("peerflix-{info_hash}.lock"))
+}
+
+/// Locks path, waiting up to wait for whoever holds it, and returns the file
+/// that holds the lock until it's dropped, or closed as its process exits.
+async fn lock_torrent(path: &Path, wait: Duration) -> anyhow::Result<File> {
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(TryLockError::WouldBlock) => bail!("the torrent is playing in another peerflix"),
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", path.display()));
+            }
+        }
     }
 }
 
@@ -112,6 +156,8 @@ pub struct Playing {
     pub stream: Stream,
     control: Control,
     storage: PartStorage,
+    /// Held until the torrent is out of the session, done downloading.
+    _lock: File,
     /// The files still downloading, by id and size, the one streamed among
     /// them.
     downloading: Vec<(usize, u64)>,
@@ -219,17 +265,25 @@ impl Control {
 }
 
 impl Download for Control {
-    /// The status, with the line describing it as text.
+    /// The status, with whether it can be paused and the line describing it
+    /// as text, so that programs needn't work them out.
     fn status_json(&self) -> String {
         #[derive(Serialize)]
         struct Json {
             #[serde(flatten)]
             status: Status,
+            pausable: bool,
             text: String,
         }
         let status = self.status();
+        let pausable = status.pausable();
         let text = status.describe();
-        serde_json::to_string(&Json { status, text }).expect("the status serializes")
+        serde_json::to_string(&Json {
+            status,
+            pausable,
+            text,
+        })
+        .expect("the status serializes")
     }
 
     fn set_paused(&self, paused: bool) -> BoxFuture<'static, anyhow::Result<()>> {
@@ -325,6 +379,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status["state"], "done");
+        assert_eq!(status["pausable"], false);
         assert_eq!(status["downloaded"], data.len());
         assert_eq!(status["text"], "100.0%  downloaded");
 
@@ -368,6 +423,22 @@ mod tests {
         client.delete(server.control_url()).send().await.unwrap();
         assert!(stop.is_cancelled());
         session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn locks_a_torrent_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hash.lock");
+        let wait = Duration::from_millis(300);
+        let held = lock_torrent(&path, wait).await.unwrap();
+        let err = lock_torrent(&path, wait).await.unwrap_err();
+        assert!(err.to_string().contains("another peerflix"), "{err:#}");
+
+        // Let go of while waiting, as by a peerflix told to stop.
+        let waiting = tokio::spawn(async move { lock_torrent(&path, wait).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(held);
+        waiting.await.unwrap().unwrap();
     }
 
     #[test]

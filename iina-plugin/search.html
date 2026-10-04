@@ -159,8 +159,10 @@
     // take a while, in milliseconds.
     const SLOW = 15000;
 
+    // A magnet link, a URL or a .torrent file, which peerflix plays rather
+    // than searches for.
     function isSource(query) {
-      return /^(magnet:|https?:\/\/)/.test(query.trim());
+      return /^(magnet:|https?:\/\/)|\.torrent$/.test(query.trim());
     }
 
     // The rows the list shows, each a torrent's source, the index of the
@@ -257,7 +259,7 @@
       clearTimeout(timer);
       timer = null;
       const query = $("query").value;
-      // A pasted magnet link or URL plays straight away.
+      // A pasted magnet link, URL or .torrent file's path plays straight away.
       if (isSource(query)) {
         const source = query.trim();
         const results = { results: [{ title: source, url: source }], summary: "" };

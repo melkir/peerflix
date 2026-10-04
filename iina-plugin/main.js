@@ -5,7 +5,6 @@
 // to end the stream; it closes when the search window stops the stream.
 
 const { core, event, global, menu, mpv, overlay } = iina;
-const { done, pausable } = require("./status.js");
 
 // How long the status stays once the download is done, in milliseconds.
 const DONE_FOR = 5000;
@@ -60,7 +59,7 @@ if (global.getLabel() === "peerflix") {
   // when that changes.
   function updatePauseItem() {
     const title = status.state === "paused" ? "Resume Download" : "Pause Download";
-    const enabled = pausable(status);
+    const enabled = status.pausable;
     if (title === pauseItem.title && enabled === pauseItem.enabled) return;
     pauseItem.title = title;
     pauseItem.enabled = enabled;
@@ -97,7 +96,7 @@ if (global.getLabel() === "peerflix") {
     }
     overlay.setContent(`<div class="status">${status.text}</div>`);
     overlay.show();
-    if (done(status) && !expiring) {
+    if (status.state === "done" && !expiring) {
       expiring = setTimeout(() => {
         expired = true;
         expiring = null;

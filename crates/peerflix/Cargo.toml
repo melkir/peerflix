@@ -14,6 +14,7 @@ workspace = true
 peerflix-core = { workspace = true, features = ["clap"] }
 anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
 librqbit.workspace = true
 serde.workspace = true
 serde_json.workspace = true

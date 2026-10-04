@@ -95,8 +95,8 @@ pub async fn bind_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
 /// `?pause` and `?resume` pause and resume its download; a GET returns the
 /// stream's status once it has started, and a DELETE cancels the server's
 /// stop token.
-/// Once streaming, it serves each file at `/<escaped name>`, and the first on
-/// every other path.
+/// Once streaming, it serves each file at `/<escaped name>`, however its
+/// escapes are written, and the first at `/`.
 pub struct Server {
     base: String,
     shared: Arc<Shared>,
@@ -114,9 +114,18 @@ struct Shared {
 /// The files a server streams, and their download.
 struct Streaming {
     files: Vec<File>,
-    /// The escaped names of files, in the same order.
-    paths: Vec<String>,
     download: Arc<dyn Download>,
+}
+
+impl Streaming {
+    /// The file at path, the escaped name of one, or the first at the root.
+    fn file(&self, path: &str) -> Option<&File> {
+        if path.is_empty() {
+            return self.files.first();
+        }
+        let name = path_unescape(path)?;
+        self.files.iter().find(|f| f.name.as_bytes() == name)
+    }
 }
 
 impl Server {
@@ -161,12 +170,7 @@ impl Server {
     /// Starts streaming files, which the control reports on and pauses as
     /// download. A server streams once.
     pub fn stream(&self, files: Vec<File>, download: Arc<dyn Download>) {
-        let paths = files.iter().map(|f| path_escape(&f.name)).collect();
-        let streaming = Streaming {
-            files,
-            paths,
-            download,
-        };
+        let streaming = Streaming { files, download };
         let first = self.shared.streaming.set(streaming).is_ok();
         assert!(first, "a server streams once");
     }
@@ -314,9 +318,11 @@ impl Connection {
         let Some(streaming) = shared.streaming.get() else {
             return text(StatusCode::NOT_FOUND, "not streaming yet");
         };
+        let Some(file) = streaming.file(path) else {
+            return text(StatusCode::NOT_FOUND, "no such file");
+        };
         self.player.get_or_init(|| shared.connections.open());
-        let i = streaming.paths.iter().position(|p| p == path).unwrap_or(0);
-        handle(&streaming.files[i], &req).await
+        handle(file, &req).await
     }
 }
 
@@ -580,6 +586,23 @@ pub fn path_escape(name: &str) -> String {
     out
 }
 
+/// Undoes path_escape, or any other percent-encoding of a path segment,
+/// returning the bytes escaped; None if an escape is malformed.
+fn path_unescape(path: &str) -> Option<Vec<u8>> {
+    let hex = |b: u8| char::from(b).to_digit(16);
+    let mut out = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let (hi, lo) = (hex(bytes.next()?)?, hex(bytes.next()?)?);
+            out.push(u8::try_from(hi << 4 | lo).ok()?);
+        } else {
+            out.push(b);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +657,17 @@ mod tests {
             "%5BGrp%5D%20Show%20-%2001%20%281080p%29.mkv"
         );
         assert_eq!(path_escape("a/b?é"), "a%2Fb%3F%C3%A9");
+        for name in ["[Grp] Show - 01 (1080p).mkv", "a/b?é", ""] {
+            assert_eq!(path_unescape(&path_escape(name)).unwrap(), name.as_bytes());
+        }
+        // However a client writes the escapes.
+        assert_eq!(
+            path_unescape("%5bGrp%5d (1080p)").unwrap(),
+            b"[Grp] (1080p)"
+        );
+        for bad in ["%", "%5", "%zz"] {
+            assert_eq!(path_unescape(bad), None, "{bad}");
+        }
     }
 
     fn bytes_file(name: &str, data: &'static [u8]) -> File {
@@ -698,13 +732,21 @@ mod tests {
             bytes_file("Show E01.en.srt", b"subs"),
         ];
         let server = streaming(files, "{}").await;
-        for (name, want) in [
+        let base = server.url("");
+        for (path, want) in [
             ("video.mkv", "video"),
+            ("Show%20E01.en.srt", "subs"),
             ("Show E01.en.srt", "subs"),
-            ("anything", "video"),
+            ("", "video"),
         ] {
-            let body = reqwest::get(server.url(name)).await.unwrap();
-            assert_eq!(body.text().await.unwrap(), want, "{name}");
+            let body = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(body.text().await.unwrap(), want, "{path}");
+        }
+        // Rather than the video, which a player asking for subtitles would
+        // take for them.
+        for path in ["anything", "Show%2"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 404, "{path}");
         }
     }
 

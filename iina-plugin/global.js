@@ -2,7 +2,6 @@
 // peerflix does the searching and streaming; see its docs/json.md.
 
 const { global, http, menu, preferences, standaloneWindow: win, utils } = iina;
-const { pausable } = require("./status.js");
 
 // The peerflix this plugin works with, of the same release; cargo release
 // bumps it with the plugin's version.
@@ -11,9 +10,13 @@ const VERSION = "0.10.0";
 // How often the streams' status is shown anew, in milliseconds.
 const POLL = 1000;
 
-// How long a stopped peerflix gets to exit before another streams its
-// torrent anyway, in milliseconds.
-const EXIT_WAIT = 10000;
+// How many polls in a row a stream's peerflix can miss before it's taken to
+// be gone, as when its download failed.
+const MISSES = 3;
+
+// How long peerflix waits for an episode to be picked, in milliseconds, less
+// a margin for the time a pick takes to reach it.
+const PICK_WAIT = 10 * 60 * 1000 - 30 * 1000;
 
 // Where peerflix is looked for when its preference is empty. Apps started
 // from the Dock don't get the shell's PATH. mise's shim comes last, as it
@@ -29,8 +32,9 @@ const CANDIDATES = [
 // Runs a command, "$@", in the background and prints the first line it
 // writes, as soon as it's written, so that a stream peerflix keeps serving
 // doesn't hold up exec, which runs one command at a time. If the command
-// exits first, prints its errors and exits with its status; if it writes
-// nothing for two minutes, such as a magnet no one seeds, stops it.
+// exits without writing a line, prints its errors and exits with its status;
+// if it writes nothing for two minutes, such as a magnet no one seeds, stops
+// it.
 const FIRST_LINE = `
 out=$(/usr/bin/mktemp) err=$(/usr/bin/mktemp)
 "$@" >"$out" 2>"$err" &
@@ -40,6 +44,8 @@ while [ $(/usr/bin/wc -l <"$out") -eq 0 ]; do
   if ! kill -0 $pid 2>/dev/null; then
     wait $pid
     status=$?
+    # It may have written its line since it was looked for.
+    [ $(/usr/bin/wc -l <"$out") -gt 0 ] && break
     /bin/cat "$err" >&2
     /bin/rm -f "$out" "$err"
     exit $(( status == 0 ? 1 : status ))
@@ -58,7 +64,7 @@ done
 `;
 
 // The peerflix that listed a torrent's episodes and waits for one to be
-// picked, with the torrent's source, info hash and control URL.
+// picked, with the torrent's source, control URL and when it stops waiting.
 let pending = null;
 // The id of the search window's pick being started, if any. A newer pick, or
 // the window giving it up, replaces it, and a peerflix started for a pick
@@ -68,8 +74,9 @@ let current = null;
 // of a torrent that's playing.
 const hashes = new Map();
 // The streams players were opened on, each a name, the torrent's info hash,
-// a control URL and the latest status, by player ID, until the player closes
-// or the stream is stopped.
+// a control URL, the latest status and how many polls in a row its peerflix
+// didn't answer, by player ID, until the player closes, the stream is
+// stopped or its peerflix is gone.
 const streams = new Map();
 // Whether the streams' status is being sent to their players and the search
 // window.
@@ -174,15 +181,18 @@ async function open({ pick, source, title, index = null }) {
   cancelPending();
   current = pick;
   try {
-    const out = JSON.parse(await run(["--json", "--", source]));
+    const path = source.startsWith("~") ? utils.resolvePath(source) : source;
+    const out = JSON.parse(await run(["--json", "--", path]));
     const { files, episodes, control, info_hash: infoHash } = out;
+    // peerflix searched for a .torrent file that isn't there.
+    if (!control) throw new Error(`There's no torrent file at ${source}.`);
     hashes.set(source, infoHash);
     if (pick !== current) return stopPeerflix(control);
     if (index != null || episodes.length < 2) {
       progress(pick, "Starting…");
-      return streamFile(pick, control, index, infoHash);
+      return await streamFile(pick, control, index, infoHash);
     }
-    pending = { source, control, infoHash };
+    pending = { source, control, until: Date.now() + PICK_WAIT };
     current = null;
     const byIndex = Object.fromEntries(files.map((f) => [f.index, f]));
     post("episodes", { pick, source, title, episodes: episodes.map((i) => byIndex[i]) });
@@ -192,22 +202,20 @@ async function open({ pick, source, title, index = null }) {
 }
 
 // Plays the episode at index of source, picked from the list the waiting
-// peerflix sent, or with a new peerflix once that one has started one. The
-// stream of the torrent playing, if any, stops first, so the new peerflix
-// has its peers. The search window shows "Starting…" meanwhile.
+// peerflix sent, or with a new peerflix once that one has started one or
+// stopped waiting. The stream of the torrent playing, if any, stops first,
+// so the new peerflix has its peers. The search window shows "Starting…"
+// meanwhile.
 async function playEpisode({ pick, source, title, index }) {
   current = pick;
   const infoHash = hashes.get(source);
-  if (playing(infoHash)) {
-    progress(pick, "Stopping the stream of this torrent…");
-    await replace(infoHash);
-    if (pick !== current) return;
-    progress(pick, "Starting…");
+  stopTorrent(infoHash);
+  if (pending?.source !== source || Date.now() > pending.until) {
+    return open({ pick, source, title, index });
   }
-  if (pending?.source !== source) return open({ pick, source, title, index });
   const { control } = pending;
   pending = null;
-  streamFile(pick, control, index, infoHash);
+  return streamFile(pick, control, index, infoHash);
 }
 
 // Gives up the pick being started, and the episodes being picked from.
@@ -245,15 +253,10 @@ function stopPeerflix(control) {
 // Asks peerflix at control to stream the file at index, or its largest
 // video, of the torrent with infoHash, and plays the stream in a new player,
 // unless pick was given up meanwhile. A stream of the same torrent still
-// playing, as when it's picked from the results again, is stopped first, as
-// two peerflix downloading the same files would race each other.
+// playing, as when it's picked from the results again, is stopped first;
+// peerflix waits for the one stopped to let go of the torrent's files.
 async function streamFile(pick, control, index, infoHash) {
-  if (playing(infoHash)) {
-    progress(pick, "Stopping the stream of this torrent…");
-    await replace(infoHash);
-    if (pick !== current) return stopPeerflix(control);
-    progress(pick, "Starting…");
-  }
+  stopTorrent(infoHash);
   let served;
   try {
     const res = await onMain(http.put(index == null ? control : `${control}?index=${index}`, {}));
@@ -264,36 +267,26 @@ async function streamFile(pick, control, index, infoHash) {
     return failed(pick, res.text?.trim() || "peerflix didn't answer.");
   }
   if (pick !== current) return stopPeerflix(control);
+  let id;
+  try {
+    id = global.createPlayerInstance({ url: served.url, label: "peerflix", enablePlugins: true });
+    // The player's main.js has run by now, though its video may not have
+    // loaded.
+    global.postMessage(id, "subtitles", served.subtitles.map((s) => s.url));
+  } catch (e) {
+    stopPeerflix(control);
+    return failed(pick, e.message);
+  }
   current = null;
-  const id = global.createPlayerInstance({ url: served.url, label: "peerflix", enablePlugins: true });
-  // The player's main.js has run by now, though its video may not have loaded.
-  global.postMessage(id, "subtitles", served.subtitles.map((s) => s.url));
   post("started", { pick });
-  streams.set(id, { name: served.name, infoHash, control, status: null });
+  streams.set(id, { name: served.name, infoHash, control, status: null, misses: 0 });
   watch();
 }
 
-// Whether a stream of the torrent with infoHash is playing.
-function playing(infoHash) {
-  return [...streams.values()].some((s) => s.infoHash === infoHash);
-}
-
-// Stops the streams of the torrent with infoHash, closing their players, and
-// waits for their peerflix to exit, as its control stops answering then.
-async function replace(infoHash) {
-  const old = [...streams].filter(([, s]) => s.infoHash === infoHash);
-  for (const [id] of old) stopStream(id);
-  const deadline = Date.now() + EXIT_WAIT;
-  for (const [, { control }] of old) {
-    while (Date.now() < deadline) {
-      try {
-        await onMain(http.get(control, {}));
-      } catch {
-        break;
-      }
-      await sleep(200);
-    }
-  }
+// Stops the streams of the torrent with infoHash, if any, closing their
+// players.
+function stopTorrent(infoHash) {
+  for (const [id, s] of streams) if (s.infoHash === infoHash) stopStream(id);
 }
 
 // Sends each stream's status to its player, and all of them to the search
@@ -310,14 +303,17 @@ async function watch() {
   watching = false;
 }
 
-// Asks peerflix for stream's status, and sends it to its player, id.
+// Asks peerflix for stream's status, and sends it to its player, id. A
+// peerflix that's gone, as once its download failed, takes its stream with
+// it; the player keeps showing the last status it got.
 async function refresh(id, stream) {
   try {
     stream.status = body(await onMain(http.get(stream.control, {})));
+    stream.misses = 0;
     global.postMessage(id, "status", stream.status);
   } catch {
-    // peerflix is gone; there's nothing to show.
     stream.status = null;
+    if (++stream.misses >= MISSES) streams.delete(id);
   }
 }
 
@@ -328,7 +324,7 @@ function showStreams() {
   for (const [id, { name, status }] of streams) {
     if (!status) continue;
     const paused = status.state === "paused";
-    shown.push({ id, name, text: status.text, paused, pausable: pausable(status) });
+    shown.push({ id, name, text: status.text, paused, pausable: status.pausable });
   }
   post("streams", shown);
 }
@@ -337,7 +333,7 @@ function showStreams() {
 // the player's menu or the search window, and shows it straight away.
 async function togglePause(id) {
   const stream = streams.get(id);
-  if (!stream?.status || !pausable(stream.status)) return;
+  if (!stream?.status?.pausable) return;
   const action = stream.status.state === "paused" ? "resume" : "pause";
   try {
     await onMain(http.put(`${stream.control}?${action}`, {}));

@@ -4,6 +4,7 @@ use std::{
     io::{IsTerminal, Write},
     process::Stdio,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -209,16 +210,20 @@ pub async fn select_file(
             )
         })
         .collect();
-    let Some(choice) = cancel.run_until_cancelled(choose("episode> ", lines)).await else {
+    let Some(choice) = choose(cancel, "episode> ", lines).await? else {
         return Ok(None);
     };
-    Ok(Some(choice?.parse().context("reading fzf's choice")?))
+    Ok(Some(choice.parse().context("reading fzf's choice")?))
 }
 
 /// Runs fzf over lines, each the value to return, a tab, a detail column, a
-/// tab and the text to match, and returns the chosen value, or NoSelection if
-/// the user quits.
-pub async fn choose(prompt: &str, lines: String) -> anyhow::Result<String> {
+/// tab and the text to match, and returns the chosen value, NoSelection if
+/// the user quits, or None if cancel is cancelled first.
+pub async fn choose(
+    cancel: &CancellationToken,
+    prompt: &str,
+    lines: String,
+) -> anyhow::Result<Option<String>> {
     let mut child = tokio::process::Command::new("fzf")
         .args(LIST)
         .args(["--prompt", prompt])
@@ -232,7 +237,26 @@ pub async fn choose(prompt: &str, lines: String) -> anyhow::Result<String> {
     // fzf may quit before reading everything.
     let _ = stdin.write_all(lines.as_bytes()).await;
     drop(stdin);
-    fzf_choice(&child.wait_with_output().await.context(FZF)?)
+    // None once it has exited, and checked, as a negative pid would signal a
+    // whole process group.
+    let pid = child.id().and_then(|p| libc::pid_t::try_from(p).ok());
+    let out = child.wait_with_output();
+    tokio::pin!(out);
+    tokio::select! {
+        out = &mut out => fzf_choice(&out.context(FZF)?).map(Some),
+        () = cancel.cancelled() => {
+            // A SIGTERM lets fzf restore the terminal, which kill_on_drop's
+            // SIGKILL doesn't; that's left for an fzf that doesn't exit.
+            if let Some(pid) = pid {
+                // SAFETY: kill only sends a signal.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(1), out).await;
+            Ok(None)
+        }
+    }
 }
 
 const FZF: &str = "running fzf (0.60 or later is required)";
