@@ -5,7 +5,7 @@ const { global, http, menu, preferences, standaloneWindow: win, utils } = iina;
 
 // The peerflix this plugin works with, of the same release; cargo release
 // bumps it with the plugin's version.
-const VERSION = "0.10.0";
+const VERSION = "0.11.0";
 
 // How often the streams' status is shown anew, in milliseconds.
 const POLL = 1000;
