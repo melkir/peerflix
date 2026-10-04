@@ -190,8 +190,8 @@ async fn stream_torrent(
         return json::stream(cancel, session, listing, &server, picks, cli.index).await;
     }
 
-    // A season goes back to its episodes once one is watched, with the next
-    // one picked, until Esc.
+    // A season goes back to its episodes once one is watched, with it
+    // selected, until Esc.
     let (files, eps) = (&listing.files, &listing.episodes);
     let mut played = None;
     loop {

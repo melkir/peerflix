@@ -194,8 +194,8 @@ pub fn picks_episode(eps: &[usize], index: Option<usize>) -> bool {
 
 /// Returns the file to stream: the one at index if given, else one the user
 /// picks in fzf among eps, the torrent's episodes, when picks_episode, with
-/// the cursor on the one after played, else the one pick_file chooses. None
-/// means peerflix was cancelled meanwhile.
+/// the cursor on played, else the one pick_file chooses. None means peerflix
+/// was cancelled meanwhile.
 pub async fn select_file(
     cancel: &CancellationToken,
     files: &[TorrentFile],
@@ -217,19 +217,11 @@ pub async fn select_file(
             )
         })
         .collect();
-    let pos = next_episode(eps, played);
-    let Some(choice) = choose(cancel, "episode> ", lines, pos).await? else {
+    let pos = played.and_then(|id| eps.iter().position(|&e| e == id));
+    let Some(choice) = choose(cancel, "episode> ", lines, pos.unwrap_or(0)).await? else {
         return Ok(None);
     };
     Ok(Some(choice.parse().context("reading fzf's choice")?))
-}
-
-/// The position in eps of the episode after played, or of the last if played
-/// is the last, or the first if nothing was.
-fn next_episode(eps: &[usize], played: Option<usize>) -> usize {
-    played
-        .and_then(|id| eps.iter().position(|&e| e == id))
-        .map_or(0, |p| (p + 1).min(eps.len().saturating_sub(1)))
 }
 
 /// Runs fzf over lines, each the value to return, a tab, a detail column, a
@@ -353,21 +345,6 @@ mod tests {
 
         let l = line(&it, Some("yts"));
         assert!(l.contains("   42\x1b[90m  yts \x1b[0m \t"), "{l:?}");
-    }
-
-    #[test]
-    fn next_episodes() {
-        let eps = [3, 5, 8];
-        for (played, want) in [
-            (None, 0),
-            (Some(3), 1),
-            (Some(5), 2),
-            (Some(8), 2),
-            (Some(4), 0),
-        ] {
-            assert_eq!(next_episode(&eps, played), want, "{played:?}");
-        }
-        assert_eq!(next_episode(&[], Some(1)), 0);
     }
 
     #[test]

@@ -38,7 +38,7 @@ peerflix https://webtorrent.io/torrents/sintel.torrent  # stream a URL, .torrent
 ```
 
 **Tab** and **Shift-Tab** switch category, **Enter** streams the pick, **Esc** quits. Once an episode
-of a season is closed, its episodes come back with the next one selected. Downloads stay
+of a season is closed, its episodes come back with it selected. Downloads stay
 in `$TMPDIR/peerflix` (or `--dir`), so playing a torrent again reuses them. See
 `peerflix --help` for the options, and [docs/json.md](docs/json.md) for driving it from a program.
 
