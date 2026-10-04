@@ -186,17 +186,24 @@ fn health(it: &Torrent) -> &'static str {
     }
 }
 
+/// Reports whether the file to stream is picked in fzf: when no index is
+/// given, eps, the torrent's episodes, are several, and stdin is a terminal.
+pub fn picks_episode(eps: &[usize], index: Option<usize>) -> bool {
+    index.is_none() && eps.len() > 1 && std::io::stdin().is_terminal()
+}
+
 /// Returns the file to stream: the one at index if given, else one the user
-/// picks in fzf among eps, the torrent's episodes, when there are several and
-/// stdin is a terminal, else the one pick_file chooses. None means peerflix
-/// was cancelled meanwhile.
+/// picks in fzf among eps, the torrent's episodes, when picks_episode, with
+/// the cursor on the one after played, else the one pick_file chooses. None
+/// means peerflix was cancelled meanwhile.
 pub async fn select_file(
     cancel: &CancellationToken,
     files: &[TorrentFile],
     eps: &[usize],
     index: Option<usize>,
+    played: Option<usize>,
 ) -> anyhow::Result<Option<usize>> {
-    if index.is_some() || eps.len() < 2 || !std::io::stdin().is_terminal() {
+    if !picks_episode(eps, index) {
         return pick_file(files, index).map(Some);
     }
     let lines: String = eps
@@ -210,23 +217,36 @@ pub async fn select_file(
             )
         })
         .collect();
-    let Some(choice) = choose(cancel, "episode> ", lines).await? else {
+    let pos = next_episode(eps, played);
+    let Some(choice) = choose(cancel, "episode> ", lines, pos).await? else {
         return Ok(None);
     };
     Ok(Some(choice.parse().context("reading fzf's choice")?))
 }
 
+/// The position in eps of the episode after played, or of the last if played
+/// is the last, or the first if nothing was.
+fn next_episode(eps: &[usize], played: Option<usize>) -> usize {
+    played
+        .and_then(|id| eps.iter().position(|&e| e == id))
+        .map_or(0, |p| (p + 1).min(eps.len().saturating_sub(1)))
+}
+
 /// Runs fzf over lines, each the value to return, a tab, a detail column, a
-/// tab and the text to match, and returns the chosen value, NoSelection if
-/// the user quits, or None if cancel is cancelled first.
+/// tab and the text to match, with the cursor starting on the line at pos,
+/// and returns the chosen value, NoSelection if the user quits, or None if
+/// cancel is cancelled first.
 pub async fn choose(
     cancel: &CancellationToken,
     prompt: &str,
     lines: String,
+    pos: usize,
 ) -> anyhow::Result<Option<String>> {
     let mut child = tokio::process::Command::new("fzf")
         .args(LIST)
         .args(["--prompt", prompt])
+        // fzf counts from 1.
+        .args(["--bind", &format!("load:pos({})", pos + 1)])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -333,6 +353,21 @@ mod tests {
 
         let l = line(&it, Some("yts"));
         assert!(l.contains("   42\x1b[90m  yts \x1b[0m \t"), "{l:?}");
+    }
+
+    #[test]
+    fn next_episodes() {
+        let eps = [3, 5, 8];
+        for (played, want) in [
+            (None, 0),
+            (Some(3), 1),
+            (Some(5), 2),
+            (Some(8), 2),
+            (Some(4), 0),
+        ] {
+            assert_eq!(next_episode(&eps, played), want, "{played:?}");
+        }
+        assert_eq!(next_episode(&[], Some(1)), 0);
     }
 
     #[test]

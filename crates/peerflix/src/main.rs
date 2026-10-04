@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use peerflix_core::{
     http::{Server, bind_listener},
-    play::{self, is_torrent_source},
+    play::{self, Listing, is_torrent_source},
     player::Iina,
     search::{self, Category, Endpoints},
     torrent,
@@ -185,16 +185,38 @@ async fn stream_torrent(
         return Ok(());
     };
     let listing = listing?;
-    let (server, picks) = Server::start(bind_listener(cli.port).await?, cancel.clone())?;
     if cli.json {
+        let (server, picks) = Server::start(bind_listener(cli.port).await?, cancel.clone())?;
         return json::stream(cancel, session, listing, &server, picks, cli.index).await;
     }
-    drop(picks);
 
+    // A season goes back to its episodes once one is watched, with the next
+    // one picked, until Esc.
     let (files, eps) = (&listing.files, &listing.episodes);
-    let Some(id) = fzf::select_file(cancel, files, eps, cli.index).await? else {
-        return Ok(());
-    };
+    let mut played = None;
+    loop {
+        let Some(id) = fzf::select_file(cancel, files, eps, cli.index, played).await? else {
+            return Ok(());
+        };
+        play_file(cancel, session, &listing, id, cli).await?;
+        if cancel.is_cancelled() || !fzf::picks_episode(eps, cli.index) {
+            return Ok(());
+        }
+        played = Some(id);
+    }
+}
+
+/// Streams file id of listing into IINA until it quits or peerflix is
+/// cancelled.
+async fn play_file(
+    cancel: &CancellationToken,
+    session: &Arc<Session>,
+    listing: &Listing,
+    id: usize,
+    cli: &Cli,
+) -> anyhow::Result<()> {
+    // A server streams once, so each episode gets its own.
+    let (server, _) = Server::start(bind_listener(cli.port).await?, cancel.clone())?;
     let Some(playing) = cancel
         .run_until_cancelled(listing.play(session, &server, id))
         .await
