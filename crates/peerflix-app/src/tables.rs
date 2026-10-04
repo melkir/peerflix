@@ -271,13 +271,13 @@ impl TableDelegate for Results {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let col = Col::at(col_ix);
-        let arrow = self
-            .sort
-            .filter(|s| s.col == col)
-            .map(|s| match s.descending {
-                true => IconName::SortDescending,
-                false => IconName::SortAscending,
-            });
+        let arrow = self.sort.filter(|s| s.col == col).map(|s| {
+            if s.descending {
+                IconName::SortDescending
+            } else {
+                IconName::SortAscending
+            }
+        });
         h_flex()
             .id(("sort", col_ix))
             .size_full()

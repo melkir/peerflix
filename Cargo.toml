@@ -11,7 +11,8 @@ repository = "https://github.com/melkir/peerflix"
 license = "MIT"
 
 # Clippy's defaults, plus the pedantic lints that catch real waste or panics
-# here; the pedantic group whole is mostly noise for this code.
+# here, and a SAFETY comment on every unsafe block; the pedantic group whole is
+# mostly noise for this code.
 [workspace.lints.clippy]
 cloned_instead_of_copied = "warn"
 format_push_string = "warn"
@@ -26,6 +27,7 @@ redundant_clone = "warn"
 redundant_closure_for_method_calls = "warn"
 semicolon_if_nothing_returned = "warn"
 string_lit_as_bytes = "warn"
+undocumented_unsafe_blocks = "warn"
 unnecessary_wraps = "warn"
 unused_async = "warn"
 # Panics belong in tests; elsewhere, expect() says why one can't happen.

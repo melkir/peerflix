@@ -130,7 +130,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
     if !is_torrent_source(&source) {
-        source = fzf::search_interactive(&source, cli.category, user, cli.trusted)?;
+        source = fzf::search_interactive(&source, cli.category, user, cli.trusted).await?;
     } else if !user.is_empty() || cli.trusted {
         eprintln!("warning: --user and --trusted only apply to searching anime; ignoring them");
     }

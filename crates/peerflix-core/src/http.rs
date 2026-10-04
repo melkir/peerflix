@@ -184,9 +184,9 @@ impl Shared {
             // A web page can't send PUT or DELETE to another site without
             // asking first in a CORS preflight, which gets a 405 below.
             Method::PUT => match put_query(query) {
-                Ok(Put::Pick(index)) => self.pick(index).await,
-                Ok(Put::Pause(paused)) => self.pause(paused).await,
-                Err(()) => text(StatusCode::BAD_REQUEST, "index isn't a number"),
+                Some(Put::Pick(index)) => self.pick(index).await,
+                Some(Put::Pause(paused)) => self.pause(paused).await,
+                None => text(StatusCode::BAD_REQUEST, "index isn't a number"),
             },
             Method::DELETE => {
                 self.stop.cancel();
@@ -235,15 +235,15 @@ enum Put {
 }
 
 /// Parses a PUT's query: `pause` or `resume`, or the file to pick, as in
-/// `index=3`, if there's one.
-fn put_query(query: Option<&str>) -> Result<Put, ()> {
+/// `index=3`, if there's one. None if the index isn't a number.
+fn put_query(query: Option<&str>) -> Option<Put> {
     let mut pairs = query.unwrap_or("").split('&');
     if let Some(pair) = pairs.clone().find(|&p| p == "pause" || p == "resume") {
-        return Ok(Put::Pause(pair == "pause"));
+        return Some(Put::Pause(pair == "pause"));
     }
     let value = pairs.find_map(|pair| pair.strip_prefix("index="));
-    let index = value.map(|v| v.parse().map_err(|_| ())).transpose()?;
-    Ok(Put::Pick(index))
+    let index = value.map(str::parse).transpose().ok()?;
+    Some(Put::Pick(index))
 }
 
 /// How long a stream goes without a player connected before it ends: the
@@ -796,14 +796,14 @@ mod tests {
     #[test]
     fn put_queries() {
         for (query, want) in [
-            (None, Ok(Put::Pick(None))),
-            (Some(""), Ok(Put::Pick(None))),
-            (Some("index=3"), Ok(Put::Pick(Some(3)))),
-            (Some("x=1&index=12"), Ok(Put::Pick(Some(12)))),
-            (Some("index="), Err(())),
-            (Some("index=-1"), Err(())),
-            (Some("pause"), Ok(Put::Pause(true))),
-            (Some("x=1&resume"), Ok(Put::Pause(false))),
+            (None, Some(Put::Pick(None))),
+            (Some(""), Some(Put::Pick(None))),
+            (Some("index=3"), Some(Put::Pick(Some(3)))),
+            (Some("x=1&index=12"), Some(Put::Pick(Some(12)))),
+            (Some("index="), None),
+            (Some("index=-1"), None),
+            (Some("pause"), Some(Put::Pause(true))),
+            (Some("x=1&resume"), Some(Put::Pause(false))),
         ] {
             assert_eq!(put_query(query), want, "{query:?}");
         }

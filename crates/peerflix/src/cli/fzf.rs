@@ -2,7 +2,7 @@
 
 use std::{
     io::{IsTerminal, Write},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::Arc,
 };
 
@@ -55,7 +55,7 @@ impl std::error::Error for NoSelection {}
 /// restricted to one uploader or to trusted uploads, and returns the chosen
 /// torrent URL or magnet, or NoSelection if the user quits. Tab and
 /// Shift-Tab switch category, keeping the query.
-pub fn search_interactive(
+pub async fn search_interactive(
     initial: &str,
     category: Category,
     user: &str,
@@ -93,7 +93,7 @@ pub fn search_interactive(
         )
     };
     let status = std::env::temp_dir().join(format!("peerflix-{}.status", std::process::id()));
-    let out = Command::new("fzf")
+    let out = tokio::process::Command::new("fzf")
         .env("PEERFLIX_SEARCH", &search)
         .env("PEERFLIX_STATUS", &status)
         .args(LIST)
@@ -118,6 +118,7 @@ pub fn search_interactive(
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output()
+        .await
         .context(FZF);
     let _ = std::fs::remove_file(&status);
     fzf_choice(&out?)
