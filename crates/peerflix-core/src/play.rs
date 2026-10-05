@@ -12,18 +12,18 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use futures_util::future::BoxFuture;
 use librqbit::{
-    AddTorrent, ListOnlyResponse, ManagedTorrent, Session, TorrentStats, TorrentStatsState,
-    api::TorrentIdOrHash,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ListOnlyResponse, ManagedTorrent,
+    PeerConnectionOptions, Session, TorrentStats, TorrentStatsState, api::TorrentIdOrHash,
+    storage::StorageFactoryExt,
 };
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    http::{Download, Server},
+    http::{self, Download, Reader, Server},
     torrent::{
-        Status, Stream, add_torrent, complete_files, fetch_metadata,
+        Served, Status, Stream,
         files::{TorrentFile, episodes, subtitles, torrent_files},
-        serve_files,
         storage::PartStorage,
     },
 };
@@ -56,6 +56,22 @@ pub async fn list(session: &Arc<Session>, source: &str) -> anyhow::Result<Listin
         files,
         episodes,
     })
+}
+
+/// Resolves the torrent's metadata without adding it, so nothing is
+/// downloaded until a file is picked.
+async fn fetch_metadata(
+    session: &Arc<Session>,
+    add: AddTorrent<'_>,
+) -> anyhow::Result<ListOnlyResponse> {
+    let opts = AddTorrentOptions {
+        list_only: true,
+        ..Default::default()
+    };
+    match session.add_torrent(add, Some(opts)).await? {
+        AddTorrentResponse::ListOnly(meta) => Ok(meta),
+        _ => bail!("torrent was added instead of listed"),
+    }
 }
 
 impl Listing {
@@ -112,6 +128,104 @@ impl Listing {
             downloading: wanted.iter().map(|&i| (i, files[i].len)).collect(),
         })
     }
+}
+
+/// Adds the torrent to download just the wanted files, as .part files until
+/// they're complete; streams still take priority. Data already in the
+/// session's directory is checked and reused.
+async fn add_torrent(
+    session: &Arc<Session>,
+    meta: &ListOnlyResponse,
+    storage: &PartStorage,
+    wanted: &[usize],
+) -> anyhow::Result<Arc<ManagedTorrent>> {
+    let opts = AddTorrentOptions {
+        only_files: Some(wanted.to_vec()),
+        // Where librqbit would put it anyway, spelled out as storage uses it.
+        output_folder: Some(meta.output_folder.to_string_lossy().into_owned()),
+        storage_factory: Some(storage.clone().boxed()),
+        overwrite: true,
+        initial_peers: Some(meta.seen_peers.clone()),
+        peer_opts: Some(PeerConnectionOptions {
+            // The piece at the player's position after a seek is requested
+            // behind everything already queued to a peer. librqbit queues 128
+            // chunks (2 MiB); 32 cut long jumps in IINA from 2.6-8 s to
+            // 0.5-2.4 s without slowing the download.
+            max_request_window: Some(32),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    session
+        .add_torrent(
+            AddTorrent::from_bytes(meta.torrent_bytes.clone()),
+            Some(opts),
+        )
+        .await?
+        .into_handle()
+        .context("torrent was not added")
+}
+
+/// Starts streaming file id of torrent and its subtitles subs on server,
+/// with download for its control.
+fn serve_files(
+    server: &Server,
+    torrent: &Arc<ManagedTorrent>,
+    files: &[TorrentFile],
+    id: usize,
+    subs: &[usize],
+    download: Arc<dyn Download>,
+) -> Stream {
+    let name = served_name(&files[id].path, &[]);
+    let mut served = vec![torrent_file(
+        torrent.clone(),
+        id,
+        name.clone(),
+        files[id].len,
+    )];
+    for &i in subs {
+        let sub_name = served_name(&files[i].path, &served);
+        served.push(torrent_file(torrent.clone(), i, sub_name, files[i].len));
+    }
+    let at = |name: &str| Served {
+        name: name.to_owned(),
+        url: server.url(name),
+    };
+    let stream = Stream {
+        video: at(&name),
+        subtitles: served[1..].iter().map(|f| at(&f.name)).collect(),
+    };
+    server.stream(served, download);
+    stream
+}
+
+/// Serves file id of torrent. Existing data is checked first; the player
+/// starts meanwhile and librqbit holds its first request until the check ends.
+fn torrent_file(torrent: Arc<ManagedTorrent>, id: usize, name: String, len: u64) -> http::File {
+    http::File {
+        name,
+        len,
+        open: Box::new(move || {
+            let t = torrent.clone();
+            Box::pin(async move { Ok(Box::pin(t.stream(id).await?) as Reader) })
+        }),
+    }
+}
+
+/// Returns the file name to serve path under, prefixed with a number if one
+/// of served already has it.
+fn served_name(path: &str, served: &[http::File]) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_owned(), |n| n.to_string_lossy().into_owned());
+    let taken = |n: &str| served.iter().any(|f| f.name == n);
+    if !taken(&name) {
+        return name;
+    }
+    (2..)
+        .map(|k| format!("{k}-{name}"))
+        .find(|n| !taken(n))
+        .expect("an unused name")
 }
 
 /// How long playing a torrent waits for another peerflix to stop playing
@@ -228,11 +342,16 @@ impl Playing {
         result.and(removed.context("removing the torrent"))
     }
 
-    /// Drops their .part suffix from the files that have finished, and
-    /// returns the torrent's stats they were told by.
+    /// Drops their .part suffix from the files that have finished, removing
+    /// them from downloading, and returns the torrent's stats they were told
+    /// by.
     fn complete_files(&mut self) -> TorrentStats {
         let stats = self.control.torrent.stats();
-        complete_files(&self.storage, &stats, &mut self.downloading);
+        self.downloading.retain(|&(i, len)| {
+            let done = stats.file_progress.get(i) == Some(&len);
+            // A failed rename is retried on the next tick.
+            !(done && self.storage.complete(i).is_ok())
+        });
         stats
     }
 }
@@ -298,7 +417,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::torrent::{Served, State};
+    use crate::torrent::State;
 
     /// Lists a .torrent file whose data is already on disk, plays its video
     /// and watches the download, with networking disabled.
