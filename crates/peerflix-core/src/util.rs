@@ -1,5 +1,6 @@
 //! Helpers the rest share: formatting and reading sizes, formatting dates,
-//! building magnets, and raising the open file limit.
+//! building magnets, raising the open file limit, and stopping a child
+//! process.
 
 pub fn human_bytes(n: u64) -> String {
     const UNIT: u64 = 1024;
@@ -59,6 +60,20 @@ pub fn raise_open_file_limit() {
             if libc::setrlimit(libc::RLIMIT_NOFILE, &new) == 0 {
                 return;
             }
+        }
+    }
+}
+
+/// Sends SIGTERM to the child process with pid, as tokio's Child::id gives
+/// it: None once the child has exited, so a reused pid is never signalled.
+/// Unlike kill_on_drop's SIGKILL, it lets the child clean up, such as fzf
+/// restoring the terminal or iina-cli closing its IINA.
+pub fn terminate(pid: Option<u32>) {
+    // A negative pid would signal a whole process group, so it's checked.
+    if let Some(pid) = pid.and_then(|p| libc::pid_t::try_from(p).ok()) {
+        // SAFETY: kill only sends a signal.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
         }
     }
 }

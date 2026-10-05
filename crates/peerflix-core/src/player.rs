@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 
-use crate::torrent::Stream;
+use crate::{torrent::Stream, util::terminate};
 
 /// Joins paths into an mpv path list: colon separated, with a backslash
 /// escaping a colon or backslash within a path.
@@ -61,14 +61,7 @@ impl Iina {
 
 impl Drop for Iina {
     fn drop(&mut self) {
-        // None once it has exited, so a reused pid is never signalled. A
-        // negative pid would signal a whole process group, so it's checked.
-        if let Some(pid) = self.cli.id().and_then(|p| libc::pid_t::try_from(p).ok()) {
-            // SAFETY: kill only sends a signal.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-        }
+        terminate(self.cli.id());
     }
 }
 

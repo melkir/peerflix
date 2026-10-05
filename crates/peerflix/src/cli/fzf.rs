@@ -12,7 +12,7 @@ use peerflix_core::{
     providers::{Provider, Query, Torrent},
     search::{self, Category},
     torrent::files::{TorrentFile, pick_file},
-    util::human_bytes,
+    util::{human_bytes, terminate},
 };
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
@@ -249,22 +249,14 @@ pub async fn choose(
     // fzf may quit before reading everything.
     let _ = stdin.write_all(lines.as_bytes()).await;
     drop(stdin);
-    // None once it has exited, and checked, as a negative pid would signal a
-    // whole process group.
-    let pid = child.id().and_then(|p| libc::pid_t::try_from(p).ok());
+    let pid = child.id();
     let out = child.wait_with_output();
     tokio::pin!(out);
     tokio::select! {
         out = &mut out => fzf_choice(&out.context(FZF)?).map(Some),
         () = cancel.cancelled() => {
-            // A SIGTERM lets fzf restore the terminal, which kill_on_drop's
-            // SIGKILL doesn't; that's left for an fzf that doesn't exit.
-            if let Some(pid) = pid {
-                // SAFETY: kill only sends a signal.
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
-            }
+            // kill_on_drop is left for an fzf that doesn't exit.
+            terminate(pid);
             let _ = tokio::time::timeout(Duration::from_secs(1), out).await;
             Ok(None)
         }
