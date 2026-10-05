@@ -155,28 +155,21 @@ pub fn summary(
     if sites > 0 && failed.unanswered.len() == sites {
         return format!("{unanswered} didn't answer. Check your connection and try again.");
     }
-    let mut notes: Vec<String> = failed.errors.iter().map(|e| format!("{e}.")).collect();
+    let mut notes = Vec::new();
     if !unanswered.is_empty() {
-        notes.insert(0, format!("{unanswered} didn't answer."));
+        notes.push(format!("{unanswered} didn't answer."));
     }
-    let missing = notes.join(" ");
+    notes.extend(failed.errors.iter().map(|e| format!("{e}.")));
     // No results says nothing when no site could search.
-    if found > 0 || failed.count() == sites {
-        return missing;
+    if found == 0 && failed.count() < sites {
+        let [a, b] = category.others().map(Category::name);
+        let none = match query.trim() {
+            "" => format!("No {} to show.", category.name()),
+            query => format!("No {} results for \"{query}\".", category.name()),
+        };
+        notes.push(format!("{none} Tab searches {a} and {b}."));
     }
-    let missing = if missing.is_empty() {
-        missing
-    } else {
-        missing + " "
-    };
-    let [a, b] = category.others().map(Category::name);
-    let query = query.trim();
-    let none = if query.is_empty() {
-        format!("No {} to show.", category.name())
-    } else {
-        format!("No {} results for \"{query}\".", category.name())
-    };
-    format!("{missing}{none} Tab searches {a} and {b}.")
+    notes.join(" ")
 }
 
 /// A client for searching, which gives each request TIMEOUT. Searches can
