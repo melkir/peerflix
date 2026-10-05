@@ -102,8 +102,9 @@ impl Listing {
             bail!("the torrent is already playing");
         }
         let lock = lock_torrent(&lock_path(&self.info_hash()), LOCK_WAIT).await?;
+        // The video, then its subtitles.
         let subs = subtitles(files, id, episodes.len() <= 1);
-        let wanted: Vec<usize> = std::iter::once(id).chain(subs.iter().copied()).collect();
+        let wanted: Vec<usize> = std::iter::once(id).chain(subs).collect();
         let storage = PartStorage::new(meta.output_folder.clone());
         let torrent = add_torrent(session, meta, &storage, &wanted).await?;
         let control = Control {
@@ -116,8 +117,7 @@ impl Listing {
             server,
             &control.torrent,
             files,
-            id,
-            &subs,
+            &wanted,
             Arc::new(control.clone()),
         );
         Ok(Playing {
@@ -166,34 +166,27 @@ async fn add_torrent(
         .context("torrent was not added")
 }
 
-/// Starts streaming file id of torrent and its subtitles subs on server,
-/// with download for its control.
+/// Starts streaming files ids of torrent on server, the first the video and
+/// the rest its subtitles, with download for its control.
 fn serve_files(
     server: &Server,
     torrent: &Arc<ManagedTorrent>,
     files: &[TorrentFile],
-    id: usize,
-    subs: &[usize],
+    ids: &[usize],
     download: Arc<dyn Download>,
 ) -> Stream {
-    let name = served_name(&files[id].path, &[]);
-    let mut served = vec![torrent_file(
-        torrent.clone(),
-        id,
-        name.clone(),
-        files[id].len,
-    )];
-    for &i in subs {
-        let sub_name = served_name(&files[i].path, &served);
-        served.push(torrent_file(torrent.clone(), i, sub_name, files[i].len));
+    let mut served = Vec::with_capacity(ids.len());
+    for &i in ids {
+        let name = served_name(&files[i].path, &served);
+        served.push(torrent_file(torrent.clone(), i, name, files[i].len));
     }
-    let at = |name: &str| Served {
-        name: name.to_owned(),
-        url: server.url(name),
+    let at = |f: &http::File| Served {
+        name: f.name.clone(),
+        url: server.url(&f.name),
     };
     let stream = Stream {
-        video: at(&name),
-        subtitles: served[1..].iter().map(|f| at(&f.name)).collect(),
+        video: at(&served[0]),
+        subtitles: served[1..].iter().map(at).collect(),
     };
     server.stream(served, download);
     stream

@@ -1,9 +1,9 @@
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow};
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
 
 use crate::{
-    providers::{Provider, Query, Torrent},
+    providers::{Provider, Query, Torrent, get_ok},
     util::parse_bytes,
 };
 
@@ -106,19 +106,12 @@ impl Provider for Nyaa {
             if !user.is_empty() {
                 params.push(("u", user));
             }
-            let resp = client
-                .get(format!("{}/", self.base))
-                .query(&params)
-                .send()
-                .await
-                .context("searching nyaa")?;
-            let status = resp.status();
-            if status == reqwest::StatusCode::NOT_FOUND && !user.is_empty() {
-                bail!("nyaa user {user:?} not found");
-            }
-            if status != reqwest::StatusCode::OK {
-                bail!("searching nyaa: {status}");
-            }
+            let req = client.get(format!("{}/", self.base)).query(&params);
+            let resp = get_ok(req, "nyaa", |status| {
+                (status == reqwest::StatusCode::NOT_FOUND && !user.is_empty())
+                    .then(|| anyhow!("nyaa user {user:?} not found"))
+            })
+            .await?;
             let body = resp.text().await.context("searching nyaa")?;
             let rss: Rss = quick_xml::de::from_str(&body).context("parsing nyaa results")?;
             Ok(rss.channel.item.into_iter().map(Torrent::from).collect())

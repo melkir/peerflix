@@ -60,17 +60,13 @@ impl PartStorage {
     /// Renames file id from NAME.part to NAME, for once it's downloaded.
     pub fn complete(&self, id: usize) -> anyhow::Result<()> {
         let slot = self.slot(id)?;
-        match slot.lock().as_mut() {
-            Some(o) if o.at_path => Ok(()),
-            // The handle stays valid across the rename.
-            Some(o) => {
-                std::fs::rename(slot.part_path(), &slot.path)
-                    .with_context(|| format!("renaming {:?}", slot.part_path()))?;
-                o.at_path = true;
-                Ok(())
-            }
-            None => Ok(()),
+        // The handle stays valid across the rename.
+        if let Some(o) = slot.lock().as_mut().filter(|o| !o.at_path) {
+            std::fs::rename(slot.part_path(), &slot.path)
+                .with_context(|| format!("renaming {:?}", slot.part_path()))?;
+            o.at_path = true;
         }
+        Ok(())
     }
 
     fn slot(&self, id: usize) -> anyhow::Result<&Slot> {

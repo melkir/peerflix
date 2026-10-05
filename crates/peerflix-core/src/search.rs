@@ -39,8 +39,7 @@ impl Category {
 
     /// The other two categories, in Tab order from this one.
     pub fn others(self) -> [Category; 2] {
-        let i = self.index();
-        [1, 2].map(|k| Self::ALL[(i + k) % Self::ALL.len()])
+        [self.shifted(1), self.shifted(2)]
     }
 
     /// The category k tabs after this one, or before when negative.

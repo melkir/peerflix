@@ -1,4 +1,5 @@
-//! Helpers the rest share: formatting and reading sizes, formatting dates,
+//! Helpers the rest share: formatting and reading sizes and numbers,
+//! formatting dates,
 //! building magnets, raising the open file limit, and stopping a child
 //! process.
 
@@ -32,6 +33,15 @@ pub fn parse_bytes(s: &str) -> Option<u64> {
         unit => UNITS.iter().position(|&u| u == unit)?,
     };
     (n >= 0.).then(|| (n * 1024f64.powi(exp as i32)) as u64)
+}
+
+/// Parses s written in ASCII digits alone, which str::parse also takes with a
+/// leading +. None if it isn't, or overflows T.
+pub fn parse_digits<T: std::str::FromStr>(s: &str) -> Option<T> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
 }
 
 /// Raises the soft limit on open files as far as the system allows. Peer
@@ -151,6 +161,14 @@ mod tests {
         }
         for n in [0, 1023, 1536, 5 << 30] {
             assert_eq!(parse_bytes(&human_bytes(n)), Some(n));
+        }
+    }
+
+    #[test]
+    fn parses_digits() {
+        assert_eq!(parse_digits::<u32>("007"), Some(7));
+        for s in ["", "+1", "-1", "1.0", " 1", "4294967296"] {
+            assert_eq!(parse_digits::<u32>(s), None, "{s:?}");
         }
     }
 

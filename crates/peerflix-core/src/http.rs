@@ -33,6 +33,8 @@ use tokio::{
 };
 use tokio_util::{io::ReaderStream, sync::CancellationToken, task::AbortOnDropHandle};
 
+use crate::util::parse_digits;
+
 pub trait ReadSeek: AsyncRead + AsyncSeek + Send {}
 impl<T: AsyncRead + AsyncSeek + Send> ReadSeek for T {}
 
@@ -517,11 +519,7 @@ fn parse_range(header: Option<&str>, len: u64) -> Range {
     let Some((first, last)) = spec.trim().split_once('-') else {
         return Range::Full;
     };
-    let num = |s: &str| {
-        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| s.parse::<u64>().ok())
-            .flatten()
-    };
+    let num = parse_digits::<u64>;
     match (num(first), num(last), first.is_empty()) {
         // bytes=-N: the last N bytes.
         (None, Some(n), true) => match n {

@@ -6,11 +6,11 @@ pub mod nyaa;
 pub mod tpb;
 pub mod yts;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow};
 use futures_util::future::BoxFuture;
 use serde::{Serialize, Serializer, de::DeserializeOwned};
 
-use crate::util::human_bytes;
+use crate::util::{human_bytes, parse_digits};
 
 /// A site that can be searched for torrents.
 pub trait Provider: Send + Sync {
@@ -101,12 +101,7 @@ impl Episode {
 /// Parses S01E02, S01 or 1x02, in any case.
 fn parse_episode(s: &str) -> Option<Episode> {
     let s = s.to_ascii_lowercase();
-    let num = |t: &str| {
-        if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        t.parse().ok()
-    };
+    let num = parse_digits::<u32>;
     if let Some(rest) = s.strip_prefix('s') {
         let (season, episode) = match rest.split_once('e') {
             Some((s, e)) => (s, Some(num(e)?)),
@@ -153,17 +148,29 @@ pub async fn get_json<T: DeserializeOwned>(
     req: reqwest::RequestBuilder,
     site: &str,
 ) -> anyhow::Result<T> {
+    get_ok(req, site, |_| None)
+        .await?
+        .json()
+        .await
+        .with_context(|| format!("parsing {site} results"))
+}
+
+/// Sends req to site and returns its answer, failing unless the site
+/// answered 200 OK, with the error explain gives for a status, if any.
+pub async fn get_ok(
+    req: reqwest::RequestBuilder,
+    site: &str,
+    explain: impl FnOnce(reqwest::StatusCode) -> Option<anyhow::Error>,
+) -> anyhow::Result<reqwest::Response> {
     let resp = req
         .send()
         .await
         .with_context(|| format!("searching {site}"))?;
     let status = resp.status();
     if status != reqwest::StatusCode::OK {
-        bail!("searching {site}: {status}");
+        return Err(explain(status).unwrap_or_else(|| anyhow!("searching {site}: {status}")));
     }
-    resp.json()
-        .await
-        .with_context(|| format!("parsing {site} results"))
+    Ok(resp)
 }
 
 #[cfg(test)]

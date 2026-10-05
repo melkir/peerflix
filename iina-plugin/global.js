@@ -344,14 +344,14 @@ async function togglePause(id) {
   showStreams();
 }
 
-// Stops the stream player id plays, from the search window, closing the
-// player.
-function stopStream(id) {
+// Stops the stream player id plays, closing the player unless it's closing
+// already.
+function stopStream(id, closing = false) {
   const stream = streams.get(id);
   if (!stream) return;
   streams.delete(id);
   stopPeerflix(stream.control);
-  global.postMessage(id, "stop", null);
+  if (!closing) global.postMessage(id, "stop", null);
   showStreams();
 }
 
@@ -361,10 +361,4 @@ global.onMessage("pause", (_, player) => togglePause(parseInt(player, 10)));
 // peerflix still stops on its own once no player has been connected for 30
 // seconds. IINA names the players it opens for plugins "<id>-<plugin
 // identifier>".
-global.onMessage("closed", (_, player) => {
-  const id = parseInt(player, 10);
-  const stream = streams.get(id);
-  if (!stream) return;
-  streams.delete(id);
-  stopPeerflix(stream.control);
-});
+global.onMessage("closed", (_, player) => stopStream(parseInt(player, 10), true));

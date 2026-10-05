@@ -87,10 +87,12 @@ pub async fn search_interactive(
     // chained after change-prompt still sees the old prompt. The search
     // command comes from PEERFLIX_SEARCH so that fzf fills in its {q} at
     // reload time, quoted, rather than inside the transform's own command.
-    let cycle = |order: [&str; 3]| {
+    let cycle = |k: isize| {
+        let cases: String = Category::ALL
+            .map(|c| format!("{}*) n={};; ", c.name(), c.shifted(k).name()))
+            .concat();
         format!(
-            r#"transform:case $FZF_PROMPT in {0}*) n={1};; {1}*) n={2};; *) n={0};; esac; echo "change-prompt($n> )+reload:$PEERFLIX_SEARCH""#,
-            order[0], order[1], order[2]
+            r#"transform:case $FZF_PROMPT in {cases}esac; echo "change-prompt($n> )+reload:$PEERFLIX_SEARCH""#
         )
     };
     let status = std::env::temp_dir().join(format!("peerflix-{}.status", std::process::id()));
@@ -102,14 +104,8 @@ pub async fn search_interactive(
         .args(["--prompt", &format!("{}> ", category.name())])
         .args(["--with-shell", "sh -c"])
         .args(["--bind", "enter:accept-non-empty"])
-        .args([
-            "--bind",
-            &format!("tab:{}", cycle(["anime", "movies", "series"])),
-        ])
-        .args([
-            "--bind",
-            &format!("shift-tab:{}", cycle(["series", "movies", "anime"])),
-        ])
+        .args(["--bind", &format!("tab:{}", cycle(1))])
+        .args(["--bind", &format!("shift-tab:{}", cycle(-1))])
         .args(["--bind", &format!("start:reload:{search}")])
         .args(["--bind", &format!("change:reload:sleep 0.25; {search}")])
         .args([

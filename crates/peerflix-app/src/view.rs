@@ -127,7 +127,8 @@ impl Peerflix {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Light or dark as the system is, following it when it changes.
         Theme::sync_system_appearance(Some(window), cx);
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search anime"));
+        let category = Category::Anime;
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder(category)));
         // A header click sorts the results rather than selecting its column.
         let results =
             cx.new(|cx| TableState::new(Results::new(), window, cx).col_selectable(false));
@@ -157,7 +158,6 @@ impl Peerflix {
             }),
         ];
         query.update(cx, |query, cx| query.focus(window, cx));
-        let category = Category::Anime;
         let endpoints = Endpoints::from_env();
         let mut this = Peerflix {
             category,
@@ -189,9 +189,8 @@ impl Peerflix {
         self.category = category;
         self.providers = self.category.providers(&self.endpoints, "", false);
         self.fit_columns(cx);
-        let placeholder = format!("Search {}", self.category.name());
         self.query.update(cx, |query, cx| {
-            query.set_placeholder(placeholder, window, cx);
+            query.set_placeholder(placeholder(category), window, cx);
             query.focus(window, cx);
         });
         self.back(window, cx);
@@ -798,6 +797,11 @@ fn nothing_icon(failed: &Failed, sites: usize) -> AssetIcon {
 /// Whether query has no search terms, which lists what's new or popular.
 fn is_browse(query: &Query) -> bool {
     query.text.trim().is_empty()
+}
+
+/// What the search box shows while it's empty.
+fn placeholder(category: Category) -> String {
+    format!("Search {}", category.name())
 }
 
 fn capitalized(s: &str) -> String {
