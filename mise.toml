@@ -1,5 +1,5 @@
 [tools]
-rust = { version = "1.99.1", components = "clippy,rustfmt" }
+rust = { version = "1.100.0", components = "clippy,rustfmt" }
 cargo-release = "1.1.7"
 
 [tasks.build]
